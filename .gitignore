@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDEs
+.idea/
+.vscode/
+
+# Project specific
+uploads/
+output/
+tmp/
+
+# Media files
+*.mp4
+*.wav
+*.avi
+*.mkv
+
+# (Note: src/models/face_detection_yunet.onnx is kept because it's only 1.7MB and required for the app)

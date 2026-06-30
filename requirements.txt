@@ -1,0 +1,8 @@
+opencv-python-headless>=4.8.0
+opencv-contrib-python-headless>=4.8.0
+ffmpeg-python>=0.2.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+pedalboard>=0.7.7
+soundfile>=0.12.1

@@ -1,0 +1,285 @@
+:root {
+    /* Light Theme */
+    --bg-color: #f1f5f9;
+    --text-primary: #0f172a;
+    --text-secondary: #475569;
+    --accent: #3b82f6;
+    
+    /* Clay Panel - High Contrast */
+    --clay-bg: #ffffff;
+    --clay-out-1: #cbd5e1;
+    --clay-out-2: #ffffff;
+    --clay-in-1: rgba(255, 255, 255, 1);
+    --clay-in-2: rgba(203, 213, 225, 0.5);
+    
+    /* Clay Primary Button */
+    --btn-bg: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    --btn-text: #ffffff;
+    --btn-out-1: #94a3b8;
+    --btn-out-2: #ffffff;
+    --btn-in-1: rgba(255, 255, 255, 0.4);
+    --btn-in-2: rgba(0, 0, 0, 0.1);
+    
+    /* Clay Secondary Button / Upload Zone */
+    --sec-bg: #f8fafc;
+    --sec-out-1: #e2e8f0;
+    --sec-out-2: #ffffff;
+    --sec-in-1: rgba(255, 255, 255, 0.8);
+    --sec-in-2: rgba(203, 213, 225, 0.3);
+    
+    --debug-bg: #e2e8f0;
+}
+
+[data-theme="dark"] {
+    /* Dark Theme */
+    --bg-color: #0b0f19;
+    --text-primary: #f8fafc;
+    --text-secondary: #94a3b8;
+    
+    /* Clay Panel - High Contrast */
+    --clay-bg: #151d2e;
+    --clay-out-1: #07090e;
+    --clay-out-2: #111827;
+    --clay-in-1: rgba(43, 60, 95, 0.5);
+    --clay-in-2: rgba(7, 9, 14, 0.8);
+    
+    /* Clay Primary Button */
+    --btn-bg: linear-gradient(135deg, #3b82f6, #8b5cf6);
+    --btn-out-1: #07090e;
+    --btn-out-2: #151d2e;
+    --btn-in-1: rgba(255, 255, 255, 0.2);
+    --btn-in-2: rgba(0, 0, 0, 0.3);
+    
+    /* Clay Secondary Button / Upload Zone */
+    --sec-bg: #101623;
+    --sec-out-1: #07090e;
+    --sec-out-2: #111827;
+    
+    --debug-bg: #07090f;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text-primary);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    position: relative;
+}
+
+/* Background Blobs removed for Claymorphism to focus on physical volume */
+
+.container {
+    width: 100%;
+    max-width: 600px;
+    padding: 2rem;
+    z-index: 1;
+}
+
+.header-top {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 1rem;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+header h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 0.5rem;
+}
+
+header p {
+    color: var(--text-secondary);
+    font-size: 1.1rem;
+}
+
+/* Clay Panel */
+.clay-panel {
+    background: var(--clay-bg);
+    border-radius: 36px;
+    padding: 2.5rem;
+    box-shadow: 
+        18px 18px 36px var(--clay-out-1),
+        -18px -18px 36px var(--clay-out-2),
+        inset 6px 6px 15px var(--clay-in-1),
+        inset -6px -6px 15px var(--clay-in-2);
+    transition: transform 0.3s ease, opacity 0.3s ease;
+}
+
+.hidden {
+    display: none !important;
+}
+
+/* Upload Zone (Inset Clay) */
+.upload-zone {
+    background: var(--sec-bg);
+    border-radius: 24px;
+    padding: 4rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    box-shadow: 
+        inset 8px 8px 16px var(--clay-out-1),
+        inset -8px -8px 16px var(--clay-out-2);
+    transition: all 0.3s ease;
+}
+
+.upload-zone:hover, .upload-zone.dragover {
+    box-shadow: 
+        inset 12px 12px 20px var(--clay-out-1),
+        inset -12px -12px 20px var(--clay-out-2);
+}
+
+.upload-zone svg {
+    color: var(--accent);
+    margin-bottom: 1rem;
+    transition: transform 0.3s ease;
+}
+
+.upload-zone:hover svg {
+    transform: translateY(-5px);
+}
+
+.upload-zone h2 {
+    font-size: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.upload-zone p {
+    color: var(--text-secondary);
+}
+
+/* Status Panel */
+.status-content {
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.5rem;
+}
+
+.spinner {
+    width: 60px;
+    height: 60px;
+    border: 4px solid var(--clay-out-2);
+    border-left-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    box-shadow: 
+        6px 6px 12px var(--clay-out-1),
+        -6px -6px 12px var(--clay-out-2);
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Buttons */
+.clay-btn {
+    background: var(--btn-bg);
+    color: var(--btn-text);
+    border: none;
+    padding: 1rem 2rem;
+    border-radius: 20px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    width: 100%;
+    box-shadow: 
+        8px 8px 16px var(--btn-out-1),
+        -8px -8px 16px var(--btn-out-2),
+        inset 3px 3px 6px var(--btn-in-1),
+        inset -3px -3px 6px var(--btn-in-2);
+}
+
+.clay-btn:active {
+    box-shadow: 
+        2px 2px 4px var(--btn-out-1),
+        -2px -2px 4px var(--btn-out-2),
+        inset 5px 5px 10px var(--btn-in-2),
+        inset -5px -5px 10px var(--btn-in-1);
+    transform: translateY(2px);
+}
+
+.clay-btn-secondary {
+    background: var(--sec-bg);
+    color: var(--text-primary);
+    box-shadow: 
+        8px 8px 16px var(--sec-out-1),
+        -8px -8px 16px var(--sec-out-2),
+        inset 3px 3px 6px var(--sec-in-1),
+        inset -3px -3px 6px var(--sec-in-2);
+}
+
+.clay-btn-secondary:active {
+    box-shadow: 
+        2px 2px 4px var(--sec-out-1),
+        -2px -2px 4px var(--sec-out-2),
+        inset 5px 5px 10px var(--sec-in-2),
+        inset -5px -5px 10px var(--sec-in-1);
+}
+
+.icon-btn {
+    width: 48px;
+    height: 48px;
+    padding: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    border-radius: 16px;
+    background: var(--sec-bg);
+    color: var(--text-primary);
+    box-shadow: 
+        6px 6px 12px var(--sec-out-1),
+        -6px -6px 12px var(--sec-out-2),
+        inset 2px 2px 4px var(--sec-in-1),
+        inset -2px -2px 4px var(--sec-in-2);
+}
+
+.icon-btn:active {
+    box-shadow: 
+        2px 2px 4px var(--sec-out-1),
+        -2px -2px 4px var(--sec-out-2),
+        inset 4px 4px 8px var(--sec-in-2),
+        inset -4px -4px 8px var(--sec-in-1);
+}
+
+/* Debug Log */
+.debug-log {
+    width: 100%;
+    margin-top: 1rem;
+    padding: 1.5rem;
+    background: var(--debug-bg);
+    border-radius: 20px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    text-align: left;
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: monospace;
+    box-shadow: 
+        inset 6px 6px 12px var(--clay-out-1),
+        inset -6px -6px 12px var(--clay-out-2);
+}
+
+.debug-log p {
+    margin: 4px 0;
+    color: var(--accent);
+    font-weight: 500;
+}

@@ -1,0 +1,21 @@
+import os
+import multiprocessing
+
+# Base paths
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
+
+# Video Processing Settings
+FACE_PADDING_PERCENT_X = 0.35
+FACE_PADDING_PERCENT_Y = 0.35
+YUNET_MIN_CONFIDENCE = 0.3
+DETECT_EVERY_N_FRAMES = 24
+
+# Parallelization and Chunking Settings
+# Break video into 1-minute chunks for MAXIMUM parallel processing
+CHUNK_DURATION_SECONDS = 60 
+# Задействуем ядра с запасом для стабильности системы
+MAX_WORKERS = max(1, multiprocessing.cpu_count() - 3)
+
+# Audio Settings
+PITCH_SHIFT_SEMITONES = -2.0
