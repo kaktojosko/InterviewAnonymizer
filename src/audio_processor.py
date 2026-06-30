@@ -1,48 +1,45 @@
 import os
-import soundfile as sf
-from pedalboard import Pedalboard, PitchShift
+import ffmpeg
 from src.config import PITCH_SHIFT_SEMITONES
 
 class AudioProcessor:
     @staticmethod
     def process(input_audio_path: str, output_audio_path: str) -> bool:
         """
-        Applies pitch shifting to the audio file using Pedalboard (Spotify) 
-        to anonymize the voice with high quality.
-        Returns True if successful.
+        Applies pitch shifting to the audio file using FFmpeg's native filters.
+        Extremely fast (does not load full file into RAM).
         """
         if not os.path.exists(input_audio_path):
             return False
             
         try:
-            # Read audio data
-            # Pedalboard works well with numpy arrays provided by soundfile
-            audio_data, sample_rate = sf.read(input_audio_path)
+            # Probe sample rate
+            probe = ffmpeg.probe(input_audio_path)
+            audio_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
             
-            # soundfile returns (frames, channels) or (frames,) for mono.
-            # Pedalboard expects (channels, frames).
-            if len(audio_data.shape) == 1:
-                # Mono
-                audio_data = audio_data.reshape(1, -1)
-            else:
-                # Stereo or multi-channel
-                audio_data = audio_data.T
+            sample_rate = 44100
+            if audio_stream and 'sample_rate' in audio_stream:
+                sample_rate = int(audio_stream['sample_rate'])
                 
-            # Create Pedalboard with PitchShift
-            board = Pedalboard([
-                PitchShift(semitones=PITCH_SHIFT_SEMITONES)
-            ])
+            # Calculate pitch shift multipliers
+            rate_multiplier = 2 ** (PITCH_SHIFT_SEMITONES / 12.0)
             
-            # Process audio
-            processed_audio = board(audio_data, sample_rate)
+            new_rate = int(sample_rate * rate_multiplier)
+            atempo = 1.0 / rate_multiplier
             
-            # Convert back to (frames, channels) for saving
-            processed_audio = processed_audio.T
+            # asetrate changes sample rate (pitch + speed)
+            # aresample restores standard sample rate
+            # atempo fixes the speed
+            af_filter = f"asetrate={new_rate},aresample={sample_rate},atempo={atempo:.4f}"
             
-            # Save the result
-            sf.write(output_audio_path, processed_audio, sample_rate)
-            
+            (
+                ffmpeg
+                .input(input_audio_path)
+                .output(output_audio_path, af=af_filter)
+                .run(overwrite_output=True, quiet=True)
+            )
             return True
-        except Exception as e:
-            print(f"Error processing audio with Pedalboard: {e}")
+        except ffmpeg.Error as e:
+            err_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
+            print(f"Error processing audio with FFmpeg: {err_msg}")
             return False

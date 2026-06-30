@@ -1,4 +1,5 @@
 import os
+import time
 import glob
 from concurrent.futures import ProcessPoolExecutor
 from src.io_manager import IOManager
@@ -7,9 +8,11 @@ from src.audio_processor import AudioProcessor
 from src.video_processor import VideoProcessor
 from src.config import MAX_WORKERS, CHUNK_DURATION_SECONDS
 
-def process_chunk(input_chunk: str, output_chunk: str) -> bool:
+def process_chunk(input_chunk: str, output_chunk: str) -> tuple[bool, float]:
+    start_time = time.time()
     vp = VideoProcessor()
-    return vp.process(input_chunk, output_chunk)
+    success = vp.process(input_chunk, output_chunk)
+    return success, time.time() - start_time
 
 class Orchestrator:
     @staticmethod
@@ -20,6 +23,7 @@ class Orchestrator:
                 status_cb(msg)
                 
         update(f"Starting processing for: {input_path}")
+        total_start_time = time.time()
         
         video_mute_path = os.path.join(job_dir, "video_mute.mp4")
         audio_raw_path = os.path.join(job_dir, "audio_raw.wav")
@@ -27,21 +31,36 @@ class Orchestrator:
         
         # 1. Demux
         update("Извлечение аудио и видео...")
+        t0 = time.time()
         has_audio = FFmpegUtils.demux(input_path, video_mute_path, audio_raw_path)
+        update(f"[Profile] Demux finished in {time.time() - t0:.2f}s")
         
         # 2. Process Audio
         if has_audio:
             update("Анонимизация голоса...")
+            t0 = time.time()
             audio_success = AudioProcessor.process(audio_raw_path, audio_pitched_path)
+            update(f"[Profile] Audio processing finished in {time.time() - t0:.2f}s")
             if not audio_success:
                 audio_pitched_path = audio_raw_path
         
         # 3. Split video into chunks
         update("Разделение видео для параллельной обработки...")
+        t0 = time.time()
+        
+        duration = FFmpegUtils.get_video_duration(video_mute_path)
+        if duration > 0:
+            adaptive_chunk_time = max(10, min(60, int(duration / (MAX_WORKERS * 2))))
+        else:
+            adaptive_chunk_time = CHUNK_DURATION_SECONDS
+            
+        update(f"Оптимальный размер чанка: {adaptive_chunk_time}с (Длительность: {duration:.1f}с)")
+        
         chunks_dir = os.path.join(job_dir, "chunks")
         os.makedirs(chunks_dir, exist_ok=True)
         chunk_pattern = os.path.join(chunks_dir, "chunk_%04d.mp4")
-        FFmpegUtils.split_video(video_mute_path, chunk_pattern, CHUNK_DURATION_SECONDS)
+        FFmpegUtils.split_video(video_mute_path, chunk_pattern, adaptive_chunk_time)
+        update(f"[Profile] Split video finished in {time.time() - t0:.2f}s")
         
         input_chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
         
@@ -54,6 +73,7 @@ class Orchestrator:
         else:
             # 4. Process chunks in parallel
             update(f"Распознавание лиц и блюр (Потоков: {MAX_WORKERS})...")
+            t0 = time.time()
             processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
             os.makedirs(processed_chunks_dir, exist_ok=True)
             
@@ -65,11 +85,14 @@ class Orchestrator:
             
             output_chunks = []
             for future, out_chunk in futures:
-                future.result() # wait for completion
+                _, duration = future.result() # wait for completion
+                update(f"[Profile] Chunk {os.path.basename(out_chunk)} processed in {duration:.2f}s")
                 output_chunks.append(out_chunk)
+            update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
                 
             # 5. Concat processed chunks
             update("Склейка обработанных кусков...")
+            t0 = time.time()
             list_file_path = os.path.join(job_dir, "concat_list.txt")
             with open(list_file_path, "w") as f:
                 for out_chunk in sorted(output_chunks):
@@ -78,10 +101,13 @@ class Orchestrator:
                     
             video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
             FFmpegUtils.concat_videos(list_file_path, video_blurred_path)
+            update(f"[Profile] Concat chunks finished in {time.time() - t0:.2f}s")
         
         # 6. Mux final result
-        update("Сборка финального видео (Сжатие в H.264)...")
+        update("Сборка финального видео...")
+        t0 = time.time()
         final_audio_path = audio_pitched_path if has_audio else None
         FFmpegUtils.mux(video_blurred_path, final_audio_path, output_path)
+        update(f"[Profile] Mux finished in {time.time() - t0:.2f}s")
         
-        update(f"Success! Output saved to: {output_path}")
+        update(f"Success! Output saved to: {output_path}. Total time: {time.time() - total_start_time:.2f}s")

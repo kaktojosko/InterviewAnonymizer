@@ -1,5 +1,6 @@
 import cv2
 import os
+import subprocess
 from src.config import FACE_PADDING_PERCENT_X, FACE_PADDING_PERCENT_Y, YUNET_MIN_CONFIDENCE
 
 class VideoProcessor:
@@ -146,8 +147,29 @@ class VideoProcessor:
         # Initialize YuNet with the exact video dimensions
         self._init_detector(width, height)
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'bgr24',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-an',
+            '-threads', '1',
+            output_video_path
+        ]
+        
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
         
         from src.config import DETECT_EVERY_N_FRAMES
         
@@ -175,7 +197,7 @@ class VideoProcessor:
                             w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                             h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                             self._apply_blur(b_frame, x, y, w, h)
-                        out.write(b_frame)
+                        ffmpeg_process.stdin.write(b_frame.tobytes())
                 break
                 
             buffer.append(frame)
@@ -202,7 +224,7 @@ class VideoProcessor:
                         w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                         h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                         self._apply_blur(b_frame, x, y, w, h)
-                    out.write(b_frame)
+                    ffmpeg_process.stdin.write(b_frame.tobytes())
                     
                 is_first_chunk = False
                 
@@ -210,5 +232,6 @@ class VideoProcessor:
                 buffer = []
                 
         cap.release()
-        out.release()
+        ffmpeg_process.stdin.close()
+        ffmpeg_process.wait()
         return True

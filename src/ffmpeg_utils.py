@@ -16,6 +16,16 @@ class FFmpegUtils:
         return None, None
 
     @staticmethod
+    def get_video_duration(input_path: str):
+        try:
+            probe = ffmpeg.probe(input_path)
+            if 'format' in probe and 'duration' in probe['format']:
+                return float(probe['format']['duration'])
+        except ffmpeg.Error:
+            pass
+        return 0.0
+
+    @staticmethod
     def demux(input_path: str, output_video_path: str, output_audio_path: str) -> bool:
         v = ffmpeg.input(input_path)
         
@@ -40,14 +50,10 @@ class FFmpegUtils:
     def mux(video_path: str, audio_path: str, output_path: str):
         v = ffmpeg.input(video_path)
         
-        # Оптимизация H.264:
-        # preset='faster' - отличный баланс между скоростью и размером
-        # crf=23 - визуально без потерь (visually lossless)
-        # faststart - оптимизация для веб-плееров
+        # Отказ от перекодирования! Чанки уже сжаты в H.264 через pipe.
+        # Делаем быстрый stream copy.
         video_args = {
-            'vcodec': 'libx264',
-            'preset': 'faster',
-            'crf': 23,
+            'c:v': 'copy',
             'movflags': '+faststart'
         }
         
