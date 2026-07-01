@@ -161,8 +161,8 @@ class VideoProcessor:
             '-r', fps,
             '-i', '-',
             '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-crf', '23',
+            '-preset', 'ultrafast',
+            '-crf', '28',
             '-pix_fmt', 'yuv420p',
             '-r', fps,
             '-video_track_timescale', '90000',
@@ -182,17 +182,23 @@ class VideoProcessor:
             '-an', '-'
         ]
         
+        # ОГРОМНЫЙ ПРИРОСТ ПРОИЗВОДИТЕЛЬНОСТИ:
+        # По умолчанию bufsize=8192 байт. Один 1080p кадр = 6.2 МБ.
+        # Это вызывало тысячи переключений контекста ОС (sys calls) на КАЖДЫЙ кадр.
+        # Ставим bufsize 100 МБ для гладкого потока байтов.
         ffmpeg_write_process = subprocess.Popen(
             ffmpeg_cmd_write,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            bufsize=10**8
         )
         
         ffmpeg_read_process = subprocess.Popen(
             ffmpeg_cmd_read,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            bufsize=10**8
         )
         
         from src.config import DETECT_EVERY_N_FRAMES
