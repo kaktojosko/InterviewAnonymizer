@@ -15,8 +15,10 @@ def init_worker():
     global _worker_vp
     _worker_vp = VideoProcessor()
 
-def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int, height: int) -> tuple[bool, float]:
+def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int, height: int, log_queue=None) -> tuple[bool, float]:
     global _worker_vp
+    if log_queue:
+        log_queue.put(f"[Worker] Started: {os.path.basename(input_chunk)}")
     start_time = time.time()
     if _worker_vp is None:
         _worker_vp = VideoProcessor()
@@ -81,11 +83,30 @@ class Orchestrator:
             os.makedirs(processed_chunks_dir, exist_ok=True)
             
             from concurrent.futures import as_completed
+            from multiprocessing import Manager
+            import threading
+            
+            manager = Manager()
+            log_queue = manager.Queue()
+            
+            def log_listener():
+                while True:
+                    try:
+                        msg = log_queue.get()
+                        if msg == "DONE":
+                            break
+                        update(msg)
+                    except:
+                        break
+
+            listener_thread = threading.Thread(target=log_listener)
+            listener_thread.start()
+
             futures_map = {}
             with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
                 for idx, chunk in enumerate(input_chunks):
                     out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                    f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
+                    f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height, log_queue)
                     futures_map[f] = out_chunk
             
             output_chunks = []
@@ -95,8 +116,12 @@ class Orchestrator:
                 out_chunk = futures_map[future]
                 _, chunk_duration = future.result() # wait for completion
                 completed_count += 1
-                update(f"[Profile] Chunk {completed_count}/{total_chunks} done in {chunk_duration:.2f}s ({os.path.basename(out_chunk)})")
+                update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
                 output_chunks.append(out_chunk)
+                
+            log_queue.put("DONE")
+            listener_thread.join()
+            
             update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
                 
             # 4. Concat processed chunks
