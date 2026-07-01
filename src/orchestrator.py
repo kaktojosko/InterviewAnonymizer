@@ -35,6 +35,8 @@ class Orchestrator:
         has_audio = FFmpegUtils.demux(input_path, video_mute_path, audio_raw_path)
         update(f"[Profile] Demux finished in {time.time() - t0:.2f}s")
         
+        width, height, fps_str = FFmpegUtils.get_video_info(video_mute_path)
+        
         # 2. Process Audio
         if has_audio:
             update("Анонимизация голоса...")
@@ -66,18 +68,16 @@ class Orchestrator:
         
         if not input_chunks:
             # Fallback
-            update("Распознавание лиц и блюр...")
+            update("Распознавание лиц и блюр (Быстрый режим для короткого видео)...")
             video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
             vp = VideoProcessor()
-            vp.process(video_mute_path, video_blurred_path)
+            vp.process(video_mute_path, video_blurred_path, fps=fps_str, orig_width=width, orig_height=height)
         else:
             # 4. Process chunks in parallel
             update(f"Распознавание лиц и блюр (Потоков: {MAX_WORKERS})...")
             t0 = time.time()
             processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
             os.makedirs(processed_chunks_dir, exist_ok=True)
-            
-            _, _, fps_str = FFmpegUtils.get_video_info(video_mute_path)
             
             futures = []
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
