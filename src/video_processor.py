@@ -159,16 +159,34 @@ class VideoProcessor:
         except:
             target_fps = 30.0
             
-        # Try H.264 (avc1) first to avoid re-encoding in mux step
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        out = cv2.VideoWriter(output_video_path, fourcc, target_fps, (target_width, target_height))
-        if not out.isOpened():
-            # Fallback to mp4v if avc1 is missing in OpenCV headless
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_video_path, fourcc, target_fps, (target_width, target_height))
+        # Инициализируем FFmpeg для прямой записи в H.264
+        ffmpeg_cmd_write = [
+            'ffmpeg',
+            '-y',
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f"{target_width}x{target_height}",
+            '-pix_fmt', 'bgr24',
+            '-r', str(target_fps),
+            '-i', '-',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            output_video_path
+        ]
         
-        if not out.isOpened():
-            print(f"ERROR: Could not open VideoWriter for {output_video_path}")
+        try:
+            write_process = subprocess.Popen(
+                ffmpeg_cmd_write,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=10**8
+            )
+        except Exception as e:
+            print(f"ERROR: Could not open FFmpeg write pipe for {output_video_path}: {e}")
             return False
             
         ffmpeg_cmd_read = [
@@ -236,7 +254,10 @@ class VideoProcessor:
                                 w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                                 h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                                 self._apply_blur(b_frame, x, y, w, h)
-                            out.write(b_frame)
+                            try:
+                                write_process.stdin.write(memoryview(b_frame))
+                            except Exception:
+                                pass
                     break
                     
                 if target_width != orig_width or target_height != orig_height:
@@ -269,7 +290,10 @@ class VideoProcessor:
                             w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                             h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                             self._apply_blur(b_frame, x, y, w, h)
-                        out.write(b_frame)
+                        try:
+                            write_process.stdin.write(memoryview(b_frame))
+                        except Exception:
+                            pass
                         
                     is_first_chunk = False
                     
@@ -278,6 +302,9 @@ class VideoProcessor:
         finally:
             ffmpeg_read_process.stdout.close()
             ffmpeg_read_process.wait()
-            out.release()
+            if 'write_process' in locals() and write_process:
+                if write_process.stdin:
+                    write_process.stdin.close()
+                write_process.wait()
             
         return True
