@@ -32,14 +32,29 @@ class FFmpegUtils:
 
     @staticmethod
     def mux(video_path: str, audio_path: str, output_path: str):
+        is_h264 = False
+        try:
+            probe = ffmpeg.probe(video_path)
+            video_stream = next((s for s in probe.get('streams', []) if s['codec_type'] == 'video'), None)
+            if video_stream and video_stream.get('codec_name') == 'h264':
+                is_h264 = True
+        except:
+            pass
+
         v = ffmpeg.input(video_path)
         
-        video_args = {
-            'c:v': 'libx264',
-            'preset': 'ultrafast',
-            'crf': '23',
-            'movflags': '+faststart'
-        }
+        if is_h264:
+            video_args = {
+                'c:v': 'copy',
+                'movflags': '+faststart'
+            }
+        else:
+            video_args = {
+                'c:v': 'libx264',
+                'preset': 'ultrafast',
+                'crf': '23',
+                'movflags': '+faststart'
+            }
         
         if audio_path and os.path.exists(audio_path):
             a = ffmpeg.input(audio_path)

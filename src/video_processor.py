@@ -155,12 +155,17 @@ class VideoProcessor:
         # Парсим FPS
         from fractions import Fraction
         try:
-            fps_float = float(Fraction(fps))
+            target_fps = float(Fraction(fps))
         except:
-            fps_float = 30.0
+            target_fps = 30.0
             
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_video_path, fourcc, fps_float, (target_width, target_height))
+        # Try H.264 (avc1) first to avoid re-encoding in mux step
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        out = cv2.VideoWriter(output_video_path, fourcc, target_fps, (target_width, target_height))
+        if not out.isOpened():
+            # Fallback to mp4v if avc1 is missing in OpenCV headless
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(output_video_path, fourcc, target_fps, (target_width, target_height))
         
         if not out.isOpened():
             print(f"ERROR: Could not open VideoWriter for {output_video_path}")
