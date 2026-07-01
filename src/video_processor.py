@@ -142,19 +142,33 @@ class VideoProcessor:
             
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        target_width = width
+        target_height = height
+        
+        # Если разрешение выше 1080p/2K (макс. сторона > 1920), делаем ресайз на лету!
+        # Это сэкономит гигабайты ОЗУ и распараллелит нагрузку по всем ядрам.
+        if max(width, height) > 1920:
+            scale = 1920 / max(width, height)
+            target_width = int(width * scale)
+            target_height = int(height * scale)
+            # Убедимся, что размеры четные (обязательно для H.264)
+            target_width = target_width - (target_width % 2)
+            target_height = target_height - (target_height % 2)
+            
         cap_fps = cap.get(cv2.CAP_PROP_FPS)
         
         if fps is None:
             fps = str(cap_fps) if cap_fps > 0 else '30/1'
             
         # Initialize YuNet with the exact video dimensions
-        self._init_detector(width, height)
+        self._init_detector(target_width, target_height)
         
         ffmpeg_cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
-            '-s', f'{width}x{height}',
+            '-s', f'{target_width}x{target_height}',
             '-pix_fmt', 'bgr24',
             '-r', fps,
             '-i', '-',
@@ -192,7 +206,7 @@ class VideoProcessor:
                     if is_first_chunk:
                         faces_start = self._detect_faces(buffer[0])
                         
-                    matched_pairs = self._match_faces(faces_start, faces_end, width, height)
+                    matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
                     
                     for i, b_frame in enumerate(buffer):
                         alpha = i / max(1, len(buffer) - 1) if len(buffer) > 1 else 0
@@ -205,6 +219,9 @@ class VideoProcessor:
                         ffmpeg_process.stdin.write(b_frame.tobytes())
                 break
                 
+            if target_width != width or target_height != height:
+                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                
             buffer.append(frame)
             
             if len(buffer) >= DETECT_EVERY_N_FRAMES:
@@ -215,7 +232,7 @@ class VideoProcessor:
                     faces_start = self._detect_faces(buffer[0])
                     is_first_chunk = False
                     
-                matched_pairs = self._match_faces(faces_start, faces_end, width, height)
+                matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
                 
                 for i, b_frame in enumerate(buffer):
                     if is_first_chunk:

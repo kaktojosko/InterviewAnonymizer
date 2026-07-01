@@ -32,15 +32,9 @@ class FFmpegUtils:
     def demux(input_path: str, output_video_path: str, output_audio_path: str) -> bool:
         v = ffmpeg.input(input_path)
         
-        # Optimization: Check if we actually need to downscale
-        width, height, _ = FFmpegUtils.get_video_info(input_path)
-        
-        # If it's 1080p or smaller, DO NOT RE-ENCODE! Just copy the stream (takes ~1 second)
-        if height and height <= 1080:
-            ffmpeg.output(v.video, output_video_path, c='copy').run(overwrite_output=True, quiet=True)
-        else:
-            # If it's 4K+, scale it but use 'ultrafast' since it's just an intermediate file
-            ffmpeg.output(v.video, output_video_path, vf="scale=-2:'min(1080,ih)'", vcodec='libx264', preset='ultrafast', crf=18).run(overwrite_output=True, quiet=True)
+        # Больше никаких последовательных перекодировок! 
+        # Делаем мгновенный stream copy. Ресайз 2K/4K будет распараллелен в VideoProcessor.
+        ffmpeg.output(v.video, output_video_path, c='copy').run(overwrite_output=True, quiet=True)
             
         try:
             # Extract audio quickly (no heavy compression needed here)
