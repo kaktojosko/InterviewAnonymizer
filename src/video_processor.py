@@ -17,8 +17,8 @@ class VideoProcessor:
         self.scale = 1.0
 
     def _init_detector(self, original_width, original_height):
-        # Даунскейл до 480p ТОЛЬКО для нейросети (ускорение инференса в 5 раз!)
-        target_height = 480
+        # Даунскейл до 360p ТОЛЬКО для нейросети (гигантское ускорение инференса!)
+        target_height = 360
         if original_height > target_height:
             self.scale = target_height / original_height
             self.ml_width = int(original_width * self.scale)
