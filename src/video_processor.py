@@ -132,39 +132,27 @@ class VideoProcessor:
         
         frame[y1:y2, x1:x2] = pixelated_roi
 
-    def process(self, input_video_path: str, output_video_path: str, fps: str = None) -> bool:
+    def process(self, input_video_path: str, output_video_path: str, fps: str = '30/1', orig_width: int = 1920, orig_height: int = 1080) -> bool:
         if not os.path.exists(input_video_path):
             return False
             
-        cap = cv2.VideoCapture(input_video_path)
-        if not cap.isOpened():
-            return False
-            
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        target_width = width
-        target_height = height
+        target_width = orig_width
+        target_height = orig_height
         
         # Если разрешение выше 1080p/2K (макс. сторона > 1920), делаем ресайз на лету!
         # Это сэкономит гигабайты ОЗУ и распараллелит нагрузку по всем ядрам.
-        if max(width, height) > 1920:
-            scale = 1920 / max(width, height)
-            target_width = int(width * scale)
-            target_height = int(height * scale)
+        if max(orig_width, orig_height) > 1920:
+            scale = 1920 / max(orig_width, orig_height)
+            target_width = int(orig_width * scale)
+            target_height = int(orig_height * scale)
             # Убедимся, что размеры четные (обязательно для H.264)
             target_width = target_width - (target_width % 2)
             target_height = target_height - (target_height % 2)
             
-        cap_fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        if fps is None:
-            fps = str(cap_fps) if cap_fps > 0 else '30/1'
-            
         # Initialize YuNet with the exact video dimensions
         self._init_detector(target_width, target_height)
         
-        ffmpeg_cmd = [
+        ffmpeg_cmd_write = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
@@ -183,10 +171,27 @@ class VideoProcessor:
             output_video_path
         ]
         
-        ffmpeg_process = subprocess.Popen(
-            ffmpeg_cmd,
+        ffmpeg_cmd_read = [
+            'ffmpeg',
+            '-i', input_video_path,
+            '-r', fps,
+            '-vsync', '1',
+            '-f', 'image2pipe',
+            '-pix_fmt', 'bgr24',
+            '-vcodec', 'rawvideo',
+            '-an', '-'
+        ]
+        
+        ffmpeg_write_process = subprocess.Popen(
+            ffmpeg_cmd_write,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        ffmpeg_read_process = subprocess.Popen(
+            ffmpeg_cmd_read,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL
         )
         
@@ -196,10 +201,13 @@ class VideoProcessor:
         faces_start = []
         is_first_chunk = True
         
+        frame_size = orig_width * orig_height * 3
+        import numpy as np
+        
         while True:
-            ret, frame = cap.read()
+            raw_bytes = ffmpeg_read_process.stdout.read(frame_size)
             
-            if not ret:
+            if not raw_bytes or len(raw_bytes) != frame_size:
                 if buffer:
                     last_frame = buffer[-1]
                     faces_end = self._detect_faces(last_frame)
@@ -216,10 +224,12 @@ class VideoProcessor:
                             w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                             h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                             self._apply_blur(b_frame, x, y, w, h)
-                        ffmpeg_process.stdin.write(b_frame.tobytes())
+                        ffmpeg_write_process.stdin.write(b_frame.tobytes())
                 break
                 
-            if target_width != width or target_height != height:
+            frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((orig_height, orig_width, 3))
+            
+            if target_width != orig_width or target_height != orig_height:
                 frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
                 
             buffer.append(frame)
@@ -246,14 +256,15 @@ class VideoProcessor:
                         w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                         h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                         self._apply_blur(b_frame, x, y, w, h)
-                    ffmpeg_process.stdin.write(b_frame.tobytes())
+                    ffmpeg_write_process.stdin.write(b_frame.tobytes())
                     
                 is_first_chunk = False
                 
                 faces_start = faces_end
                 buffer = []
                 
-        cap.release()
-        ffmpeg_process.stdin.close()
-        ffmpeg_process.wait()
+        ffmpeg_read_process.stdout.close()
+        ffmpeg_read_process.wait()
+        ffmpeg_write_process.stdin.close()
+        ffmpeg_write_process.wait()
         return True
