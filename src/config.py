@@ -12,7 +12,7 @@ YUNET_MIN_CONFIDENCE = 0.3
 
 # Detect faces every N frames. In between, use interpolation.
 # Higher = faster, but less accurate tracking for fast movements.
-DETECT_EVERY_N_FRAMES = 30
+DETECT_EVERY_N_FRAMES = 24
 
 # Parallelization and Chunking Settings
 # Break video into 1-minute chunks for MAXIMUM parallel processing
