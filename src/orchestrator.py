@@ -8,10 +8,10 @@ from src.audio_processor import AudioProcessor
 from src.video_processor import VideoProcessor
 from src.config import MAX_WORKERS, CHUNK_DURATION_SECONDS
 
-def process_chunk(input_chunk: str, output_chunk: str) -> tuple[bool, float]:
+def process_chunk(input_chunk: str, output_chunk: str, fps_str: str) -> tuple[bool, float]:
     start_time = time.time()
     vp = VideoProcessor()
-    success = vp.process(input_chunk, output_chunk)
+    success = vp.process(input_chunk, output_chunk, fps=fps_str)
     return success, time.time() - start_time
 
 class Orchestrator:
@@ -77,11 +77,13 @@ class Orchestrator:
             processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
             os.makedirs(processed_chunks_dir, exist_ok=True)
             
+            _, _, fps_str = FFmpegUtils.get_video_info(video_mute_path)
+            
             futures = []
             with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 for idx, chunk in enumerate(input_chunks):
                     out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                    futures.append((executor.submit(process_chunk, chunk, out_chunk), out_chunk))
+                    futures.append((executor.submit(process_chunk, chunk, out_chunk, fps_str), out_chunk))
             
             output_chunks = []
             for future, out_chunk in futures:

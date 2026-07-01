@@ -10,10 +10,13 @@ class FFmpegUtils:
             if video_stream:
                 width = int(video_stream['width'])
                 height = int(video_stream['height'])
-                return width, height
+                fps = video_stream.get('r_frame_rate', '30/1')
+                if fps == '0/0':
+                    fps = '30/1'
+                return width, height, fps
         except ffmpeg.Error:
             pass
-        return None, None
+        return None, None, '30/1'
 
     @staticmethod
     def get_video_duration(input_path: str):
@@ -30,7 +33,7 @@ class FFmpegUtils:
         v = ffmpeg.input(input_path)
         
         # Optimization: Check if we actually need to downscale
-        width, height = FFmpegUtils.get_video_info(input_path)
+        width, height, _ = FFmpegUtils.get_video_info(input_path)
         
         # If it's 1080p or smaller, DO NOT RE-ENCODE! Just copy the stream (takes ~1 second)
         if height and height <= 1080:

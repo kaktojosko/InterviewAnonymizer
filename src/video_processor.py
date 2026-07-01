@@ -132,7 +132,7 @@ class VideoProcessor:
         
         frame[y1:y2, x1:x2] = pixelated_roi
 
-    def process(self, input_video_path: str, output_video_path: str) -> bool:
+    def process(self, input_video_path: str, output_video_path: str, fps: str = None) -> bool:
         if not os.path.exists(input_video_path):
             return False
             
@@ -142,8 +142,11 @@ class VideoProcessor:
             
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
+        cap_fps = cap.get(cv2.CAP_PROP_FPS)
         
+        if fps is None:
+            fps = str(cap_fps) if cap_fps > 0 else '30/1'
+            
         # Initialize YuNet with the exact video dimensions
         self._init_detector(width, height)
         
@@ -153,12 +156,14 @@ class VideoProcessor:
             '-vcodec', 'rawvideo',
             '-s', f'{width}x{height}',
             '-pix_fmt', 'bgr24',
-            '-r', str(fps),
+            '-r', fps,
             '-i', '-',
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-crf', '23',
             '-pix_fmt', 'yuv420p',
+            '-r', fps,
+            '-video_track_timescale', '90000',
             '-an',
             '-threads', '1',
             output_video_path
