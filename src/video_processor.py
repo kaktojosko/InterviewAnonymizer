@@ -152,23 +152,20 @@ class VideoProcessor:
         # Initialize YuNet with the exact video dimensions
         self._init_detector(target_width, target_height)
         
-        ffmpeg_cmd_write = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-s', f'{target_width}x{target_height}',
-            '-pix_fmt', 'bgr24',
-            '-r', fps,
-            '-i', '-',
-            '-c:v', 'mpeg4',
-            '-q:v', '2',
-            '-r', fps,
-            '-video_track_timescale', '90000',
-            '-an',
-            '-threads', '1',
-            output_video_path
-        ]
+        # Парсим FPS
+        from fractions import Fraction
+        try:
+            fps_float = float(Fraction(fps))
+        except:
+            fps_float = 30.0
+            
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_video_path, fourcc, fps_float, (target_width, target_height))
         
+        if not out.isOpened():
+            print(f"ERROR: Could not open VideoWriter for {output_video_path}")
+            return False
+            
         ffmpeg_cmd_read = [
             'ffmpeg',
             '-threads', '1',
@@ -181,22 +178,10 @@ class VideoProcessor:
             '-an', '-'
         ]
         
-        # ОГРОМНЫЙ ПРИРОСТ ПРОИЗВОДИТЕЛЬНОСТИ:
-        # По умолчанию bufsize=8192 байт. Один 1080p кадр = 6.2 МБ.
-        # Это вызывало тысячи переключений контекста ОС (sys calls) на КАЖДЫЙ кадр.
-        # Ставим bufsize 100 МБ для гладкого потока байтов.
-        ffmpeg_write_process = subprocess.Popen(
-            ffmpeg_cmd_write,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            bufsize=10**8
-        )
-        
         ffmpeg_read_process = subprocess.Popen(
             ffmpeg_cmd_read,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=open('ffmpeg_read_err.log', 'a'),
             bufsize=10**8
         )
         
@@ -209,67 +194,76 @@ class VideoProcessor:
         frame_size = orig_width * orig_height * 3
         import numpy as np
         
-        while True:
-            raw_bytes = ffmpeg_read_process.stdout.read(frame_size)
-            
-            if not raw_bytes or len(raw_bytes) != frame_size:
-                if buffer:
+        try:
+            while True:
+                frame_array = np.empty((orig_height, orig_width, 3), dtype=np.uint8)
+                frame_view = memoryview(frame_array).cast('B')
+                
+                bytes_read = 0
+                while bytes_read < frame_size:
+                    chunk = ffmpeg_read_process.stdout.readinto(frame_view[bytes_read:])
+                    if not chunk:
+                        break
+                    bytes_read += chunk
+                
+                if bytes_read != frame_size:
+                    if buffer:
+                        last_frame = buffer[-1]
+                        faces_end = self._detect_faces(last_frame)
+                        if is_first_chunk:
+                            faces_start = self._detect_faces(buffer[0])
+                            
+                        matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
+                        
+                        for i, b_frame in enumerate(buffer):
+                            alpha = i / max(1, len(buffer) - 1) if len(buffer) > 1 else 0
+                            for (sf, ef) in matched_pairs:
+                                x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
+                                y = int(sf[1] * (1 - alpha) + ef[1] * alpha)
+                                w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
+                                h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
+                                self._apply_blur(b_frame, x, y, w, h)
+                            out.write(b_frame)
+                    break
+                    
+                if target_width != orig_width or target_height != orig_height:
+                    frame = cv2.resize(frame_array, (target_width, target_height), interpolation=cv2.INTER_AREA)
+                else:
+                    frame = frame_array
+                    
+                buffer.append(frame)
+                
+                if len(buffer) >= DETECT_EVERY_N_FRAMES:
                     last_frame = buffer[-1]
                     faces_end = self._detect_faces(last_frame)
+                    
                     if is_first_chunk:
                         faces_start = self._detect_faces(buffer[0])
+                        is_first_chunk = False
                         
                     matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
                     
                     for i, b_frame in enumerate(buffer):
-                        alpha = i / max(1, len(buffer) - 1) if len(buffer) > 1 else 0
+                        if is_first_chunk:
+                            alpha = i / max(1, len(buffer) - 1)
+                        else:
+                            alpha = (i + 1) / len(buffer)
+                            
                         for (sf, ef) in matched_pairs:
                             x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
                             y = int(sf[1] * (1 - alpha) + ef[1] * alpha)
                             w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
                             h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
                             self._apply_blur(b_frame, x, y, w, h)
-                        ffmpeg_write_process.stdin.write(b_frame.tobytes())
-                break
-                
-            frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((orig_height, orig_width, 3)).copy()
-            
-            if target_width != orig_width or target_height != orig_height:
-                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
-                
-            buffer.append(frame)
-            
-            if len(buffer) >= DETECT_EVERY_N_FRAMES:
-                last_frame = buffer[-1]
-                faces_end = self._detect_faces(last_frame)
-                
-                if is_first_chunk:
-                    faces_start = self._detect_faces(buffer[0])
+                        out.write(b_frame)
+                        
                     is_first_chunk = False
                     
-                matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
-                
-                for i, b_frame in enumerate(buffer):
-                    if is_first_chunk:
-                        alpha = i / max(1, len(buffer) - 1)
-                    else:
-                        alpha = (i + 1) / len(buffer)
-                        
-                    for (sf, ef) in matched_pairs:
-                        x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
-                        y = int(sf[1] * (1 - alpha) + ef[1] * alpha)
-                        w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
-                        h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
-                        self._apply_blur(b_frame, x, y, w, h)
-                    ffmpeg_write_process.stdin.write(b_frame.tobytes())
-                    
-                is_first_chunk = False
-                
-                faces_start = faces_end
-                buffer = []
-                
-        ffmpeg_read_process.stdout.close()
-        ffmpeg_read_process.wait()
-        ffmpeg_write_process.stdin.close()
-        ffmpeg_write_process.wait()
+                    faces_start = faces_end
+                    buffer = []
+        finally:
+            ffmpeg_read_process.stdout.close()
+            ffmpeg_read_process.wait()
+            out.release()
+            
         return True
