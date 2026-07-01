@@ -17,9 +17,8 @@ DETECT_EVERY_N_FRAMES = 28
 # Parallelization and Chunking Settings
 # Break video into 1-minute chunks for MAXIMUM parallel processing
 CHUNK_DURATION_SECONDS = 60 
-# Limit to 7 workers maximum to avoid memory bandwidth bottleneck,
-# while leaving at least 2 cores for OS and UI responsiveness.
-MAX_WORKERS = min(7, max(1, os.cpu_count() - 2))
+# Use maximum cores minus 1 for highest parallel throughput.
+MAX_WORKERS = max(1, os.cpu_count() - 1)
 
 # Audio Settings
 PITCH_SHIFT_SEMITONES = -2.0
