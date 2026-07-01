@@ -108,7 +108,8 @@ async function uploadFile(file) {
         currentTaskId = data.task_id;
         
         // Reset and show debug log
-        debugLog.innerHTML = '';
+        const time = new Date().toLocaleTimeString('ru-RU');
+        debugLog.innerHTML = `<p>[${time}] Видео загружено на сервер. Начало обработки...</p>`;
         debugLog.classList.remove('hidden');
         lastMessage = '';
         
@@ -166,6 +167,10 @@ function showSuccess() {
     statusSubText.textContent = 'Ваше видео успешно анонимизировано.';
     downloadBtn.classList.remove('hidden');
     resetBtn.classList.remove('hidden');
+    
+    const time = new Date().toLocaleTimeString('ru-RU');
+    debugLog.innerHTML += `<p style="color: #4ade80;">[${time}] Видео готово и доступно к скачиванию!</p>`;
+    debugLog.scrollTop = debugLog.scrollHeight;
     
     downloadBtn.onclick = () => {
         window.location.href = `/api/download/${currentTaskId}`;
