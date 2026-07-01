@@ -227,7 +227,7 @@ class VideoProcessor:
                         ffmpeg_write_process.stdin.write(b_frame.tobytes())
                 break
                 
-            frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((orig_height, orig_width, 3))
+            frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((orig_height, orig_width, 3)).copy()
             
             if target_width != orig_width or target_height != orig_height:
                 frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
