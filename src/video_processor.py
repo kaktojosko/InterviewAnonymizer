@@ -184,7 +184,7 @@ class VideoProcessor:
                 ffmpeg_cmd_write,
                 stdin=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                bufsize=32 * 1024 * 1024
+                bufsize=8 * 1024 * 1024
             )
         except Exception as e:
             print(f"ERROR: Could not open FFmpeg write pipe for {output_video_path}: {e}")
@@ -197,6 +197,7 @@ class VideoProcessor:
             '-nostats',
             '-threads', '1',
             '-i', input_video_path,
+            '-s', f"{target_width}x{target_height}",
             '-r', fps,
             '-vsync', '1',
             '-f', 'image2pipe',
@@ -209,7 +210,7 @@ class VideoProcessor:
             ffmpeg_cmd_read,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=10**8
+            bufsize=8 * 1024 * 1024
         )
         
         from src.config import DETECT_EVERY_N_FRAMES
@@ -217,14 +218,14 @@ class VideoProcessor:
         
         # Пул предсозданных кадров для zero-allocation чтения!
         pool_size = DETECT_EVERY_N_FRAMES + 1
-        frame_pool = [np.empty((orig_height, orig_width, 3), dtype=np.uint8) for _ in range(pool_size)]
+        frame_pool = [np.empty((target_height, target_width, 3), dtype=np.uint8) for _ in range(pool_size)]
         pool_idx = 0
         
         buffer = []
         faces_start = []
         is_first_chunk = True
         
-        frame_size = orig_width * orig_height * 3
+        frame_size = target_width * target_height * 3
         
         try:
             while True:
@@ -261,11 +262,7 @@ class VideoProcessor:
                                 pass
                     break
                     
-                if target_width != orig_width or target_height != orig_height:
-                    frame = cv2.resize(frame_array, (target_width, target_height), interpolation=cv2.INTER_AREA)
-                else:
-                    frame = frame_array
-                    
+                frame = frame_array
                 buffer.append(frame)
                 pool_idx = (pool_idx + 1) % pool_size
                 
@@ -301,11 +298,20 @@ class VideoProcessor:
                     faces_start = faces_end
                     buffer = []
         finally:
-            ffmpeg_read_process.stdout.close()
+            try:
+                ffmpeg_read_process.stdout.close()
+            except:
+                pass
+            ffmpeg_read_process.terminate()
             ffmpeg_read_process.wait()
+            
             if 'write_process' in locals() and write_process:
-                if write_process.stdin:
-                    write_process.stdin.close()
+                try:
+                    if write_process.stdin:
+                        write_process.stdin.close()
+                except:
+                    pass
+                write_process.terminate()
                 write_process.wait()
             
         return True
