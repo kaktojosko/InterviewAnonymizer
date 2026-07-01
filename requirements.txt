@@ -4,5 +4,3 @@ ffmpeg-python>=0.2.0
 fastapi==0.100.0
 uvicorn==0.23.1
 python-multipart==0.0.6
-opencv-python==4.8.0.76
-ffmpeg-python>=0.2.0

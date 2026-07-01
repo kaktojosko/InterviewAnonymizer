@@ -1,0 +1,15 @@
+venv/
+.venv/
+.git/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+uploads/
+processed/
+jobs/
+*.mp4
+*.wav
+*.mov
+*.mkv
+*.avi
