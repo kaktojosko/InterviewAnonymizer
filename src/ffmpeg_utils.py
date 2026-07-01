@@ -47,10 +47,10 @@ class FFmpegUtils:
     def mux(video_path: str, audio_path: str, output_path: str):
         v = ffmpeg.input(video_path)
         
-        # Отказ от перекодирования! Чанки уже сжаты в H.264 через pipe.
-        # Делаем быстрый stream copy.
         video_args = {
-            'c:v': 'copy',
+            'c:v': 'libx264',
+            'preset': 'veryfast',
+            'crf': '23',
             'movflags': '+faststart'
         }
         

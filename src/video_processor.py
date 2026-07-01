@@ -160,10 +160,8 @@ class VideoProcessor:
             '-pix_fmt', 'bgr24',
             '-r', fps,
             '-i', '-',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '28',
-            '-pix_fmt', 'yuv420p',
+            '-c:v', 'mpeg4',
+            '-q:v', '2',
             '-r', fps,
             '-video_track_timescale', '90000',
             '-an',
@@ -173,6 +171,7 @@ class VideoProcessor:
         
         ffmpeg_cmd_read = [
             'ffmpeg',
+            '-threads', '1',
             '-i', input_video_path,
             '-r', fps,
             '-vsync', '1',
