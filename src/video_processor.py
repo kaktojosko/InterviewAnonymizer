@@ -168,6 +168,9 @@ class VideoProcessor:
             
         ffmpeg_cmd_read = [
             'ffmpeg',
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-nostats',
             '-threads', '1',
             '-i', input_video_path,
             '-r', fps,
@@ -181,22 +184,27 @@ class VideoProcessor:
         ffmpeg_read_process = subprocess.Popen(
             ffmpeg_cmd_read,
             stdout=subprocess.PIPE,
-            stderr=open('ffmpeg_read_err.log', 'a'),
+            stderr=subprocess.DEVNULL,
             bufsize=10**8
         )
         
         from src.config import DETECT_EVERY_N_FRAMES
+        import numpy as np
+        
+        # Пул предсозданных кадров для zero-allocation чтения!
+        pool_size = DETECT_EVERY_N_FRAMES + 1
+        frame_pool = [np.empty((orig_height, orig_width, 3), dtype=np.uint8) for _ in range(pool_size)]
+        pool_idx = 0
         
         buffer = []
         faces_start = []
         is_first_chunk = True
         
         frame_size = orig_width * orig_height * 3
-        import numpy as np
         
         try:
             while True:
-                frame_array = np.empty((orig_height, orig_width, 3), dtype=np.uint8)
+                frame_array = frame_pool[pool_idx]
                 frame_view = memoryview(frame_array).cast('B')
                 
                 bytes_read = 0
@@ -232,6 +240,7 @@ class VideoProcessor:
                     frame = frame_array
                     
                 buffer.append(frame)
+                pool_idx = (pool_idx + 1) % pool_size
                 
                 if len(buffer) >= DETECT_EVERY_N_FRAMES:
                     last_frame = buffer[-1]

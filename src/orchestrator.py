@@ -8,10 +8,19 @@ from src.audio_processor import AudioProcessor
 from src.video_processor import VideoProcessor
 from src.config import MAX_WORKERS, CHUNK_DURATION_SECONDS
 
+# Глобальная переменная для воркера, чтобы не пересоздавать модель
+_worker_vp = None
+
+def init_worker():
+    global _worker_vp
+    _worker_vp = VideoProcessor()
+
 def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int, height: int) -> tuple[bool, float]:
+    global _worker_vp
     start_time = time.time()
-    vp = VideoProcessor()
-    success = vp.process(input_chunk, output_chunk, fps=fps_str, orig_width=width, orig_height=height)
+    if _worker_vp is None:
+        _worker_vp = VideoProcessor()
+    success = _worker_vp.process(input_chunk, output_chunk, fps=fps_str, orig_width=width, orig_height=height)
     return success, time.time() - start_time
 
 class Orchestrator:
@@ -52,9 +61,9 @@ class Orchestrator:
         
         duration = FFmpegUtils.get_video_duration(video_mute_path)
         if duration > 0:
-            adaptive_chunk_time = max(10, min(60, int(duration / (MAX_WORKERS * 2))))
+            adaptive_chunk_time = max(30, min(90, int(duration / MAX_WORKERS)))
         else:
-            adaptive_chunk_time = CHUNK_DURATION_SECONDS
+            adaptive_chunk_time = max(30, CHUNK_DURATION_SECONDS)
             
         update(f"Оптимальный размер чанка: {adaptive_chunk_time}с (Длительность: {duration:.1f}с)")
         
@@ -80,7 +89,7 @@ class Orchestrator:
             os.makedirs(processed_chunks_dir, exist_ok=True)
             
             futures = []
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
                 for idx, chunk in enumerate(input_chunks):
                     out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
                     futures.append((executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height), out_chunk))

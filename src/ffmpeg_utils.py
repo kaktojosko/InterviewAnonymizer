@@ -49,7 +49,7 @@ class FFmpegUtils:
         
         video_args = {
             'c:v': 'libx264',
-            'preset': 'veryfast',
+            'preset': 'ultrafast',
             'crf': '23',
             'movflags': '+faststart'
         }

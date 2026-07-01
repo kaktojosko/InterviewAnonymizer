@@ -9,7 +9,10 @@ TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
 FACE_PADDING_PERCENT_X = 0.35
 FACE_PADDING_PERCENT_Y = 0.35
 YUNET_MIN_CONFIDENCE = 0.3
-DETECT_EVERY_N_FRAMES = 24
+
+# Detect faces every N frames. In between, use interpolation.
+# Higher = faster, but less accurate tracking for fast movements.
+DETECT_EVERY_N_FRAMES = 30
 
 # Parallelization and Chunking Settings
 # Break video into 1-minute chunks for MAXIMUM parallel processing
