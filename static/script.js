@@ -129,6 +129,9 @@ async function checkStatus() {
     
     try {
         const response = await fetch(`/api/status/${currentTaskId}`);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
         const data = await response.json();
         
         if (data.status === 'completed') {
@@ -158,6 +161,8 @@ async function checkStatus() {
         }
     } catch (error) {
         console.error('Error polling status:', error);
+        clearInterval(pollInterval);
+        showError('Связь с сервером потеряна (ошибка сети/сервера). Возможно, задача отменена или сервер перезапущен.');
     }
 }
 

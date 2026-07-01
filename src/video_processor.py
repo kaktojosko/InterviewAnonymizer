@@ -165,6 +165,7 @@ class VideoProcessor:
             '-y',
             '-hide_banner',
             '-loglevel', 'error',
+            '-threads', '1',
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
             '-s', f"{target_width}x{target_height}",
@@ -183,7 +184,7 @@ class VideoProcessor:
                 ffmpeg_cmd_write,
                 stdin=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                bufsize=10**8
+                bufsize=32 * 1024 * 1024
             )
         except Exception as e:
             print(f"ERROR: Could not open FFmpeg write pipe for {output_video_path}: {e}")

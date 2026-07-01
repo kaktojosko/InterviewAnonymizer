@@ -80,16 +80,22 @@ class Orchestrator:
             processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
             os.makedirs(processed_chunks_dir, exist_ok=True)
             
-            futures = []
+            from concurrent.futures import as_completed
+            futures_map = {}
             with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
                 for idx, chunk in enumerate(input_chunks):
                     out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                    futures.append((executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height), out_chunk))
+                    f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
+                    futures_map[f] = out_chunk
             
             output_chunks = []
-            for future, out_chunk in futures:
+            completed_count = 0
+            total_chunks = len(futures_map)
+            for future in as_completed(futures_map):
+                out_chunk = futures_map[future]
                 _, chunk_duration = future.result() # wait for completion
-                update(f"[Profile] Chunk {os.path.basename(out_chunk)} processed in {chunk_duration:.2f}s")
+                completed_count += 1
+                update(f"[Profile] Chunk {completed_count}/{total_chunks} done in {chunk_duration:.2f}s ({os.path.basename(out_chunk)})")
                 output_chunks.append(out_chunk)
             update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
                 
