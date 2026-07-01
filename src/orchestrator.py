@@ -109,15 +109,15 @@ class Orchestrator:
                     f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height, log_queue)
                     futures_map[f] = out_chunk
             
-            output_chunks = []
-            completed_count = 0
-            total_chunks = len(futures_map)
-            for future in as_completed(futures_map):
-                out_chunk = futures_map[future]
-                _, chunk_duration = future.result() # wait for completion
-                completed_count += 1
-                update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
-                output_chunks.append(out_chunk)
+                output_chunks = []
+                completed_count = 0
+                total_chunks = len(futures_map)
+                for future in as_completed(futures_map):
+                    out_chunk = futures_map[future]
+                    _, chunk_duration = future.result() # wait for completion
+                    completed_count += 1
+                    update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
+                    output_chunks.append(out_chunk)
                 
             log_queue.put("DONE")
             listener_thread.join()
