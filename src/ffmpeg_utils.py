@@ -3,45 +3,32 @@ import ffmpeg
 
 class FFmpegUtils:
     @staticmethod
-    def get_video_info(input_path: str):
-        try:
-            probe = ffmpeg.probe(input_path)
-            video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
-            if video_stream:
-                width = int(video_stream['width'])
-                height = int(video_stream['height'])
-                fps = video_stream.get('r_frame_rate', '30/1')
-                if fps == '0/0':
-                    fps = '30/1'
-                return width, height, fps
-        except ffmpeg.Error:
-            pass
-        return None, None, '30/1'
-
-    @staticmethod
-    def get_video_duration(input_path: str):
-        try:
-            probe = ffmpeg.probe(input_path)
-            if 'format' in probe and 'duration' in probe['format']:
-                return float(probe['format']['duration'])
-        except ffmpeg.Error:
-            pass
-        return 0.0
-
-    @staticmethod
-    def demux(input_path: str, output_video_path: str, output_audio_path: str) -> bool:
-        v = ffmpeg.input(input_path)
+    def get_video_metadata(input_path: str):
+        width, height, fps = None, None, '30/1'
+        duration = 0.0
+        has_audio = False
+        sample_rate = 44100
         
-        # Больше никаких последовательных перекодировок! 
-        # Делаем мгновенный stream copy. Ресайз 2K/4K будет распараллелен в VideoProcessor.
-        ffmpeg.output(v.video, output_video_path, c='copy').run(overwrite_output=True, quiet=True)
-            
         try:
-            # Extract audio quickly (no heavy compression needed here)
-            ffmpeg.output(v.audio, output_audio_path, acodec='pcm_s16le').run(overwrite_output=True, quiet=True)
-            return True
+            probe = ffmpeg.probe(input_path)
+            
+            if 'format' in probe and 'duration' in probe['format']:
+                duration = float(probe['format']['duration'])
+                
+            for stream in probe.get('streams', []):
+                if stream['codec_type'] == 'video' and width is None:
+                    width = int(stream.get('width', 0))
+                    height = int(stream.get('height', 0))
+                    fps = stream.get('r_frame_rate', '30/1')
+                    if fps == '0/0': fps = '30/1'
+                elif stream['codec_type'] == 'audio' and not has_audio:
+                    has_audio = True
+                    sample_rate = int(stream.get('sample_rate', 44100))
+                    
         except ffmpeg.Error:
-            return False
+            pass
+            
+        return width, height, fps, duration, has_audio, sample_rate
 
     @staticmethod
     def mux(video_path: str, audio_path: str, output_path: str):
@@ -67,7 +54,7 @@ class FFmpegUtils:
         (
             ffmpeg
             .input(input_path)
-            .output(output_pattern, c='copy', f='segment', segment_time=chunk_time, reset_timestamps=1)
+            .output(output_pattern, map='0:v:0', c='copy', an=None, f='segment', segment_time=chunk_time, reset_timestamps=1)
             .run(overwrite_output=True, quiet=True)
         )
         

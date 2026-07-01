@@ -116,7 +116,8 @@ async function uploadFile(file) {
         // Start polling
         statusText.textContent = 'Обработка...';
         statusSubText.textContent = 'Подготовка к анонимизации.';
-        pollInterval = setInterval(checkStatus, 5000);
+        checkStatus();
+        pollInterval = setInterval(checkStatus, 1000);
         
     } catch (error) {
         showError('Ошибка загрузки. Попробуйте еще раз.');

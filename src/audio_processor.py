@@ -4,7 +4,7 @@ from src.config import PITCH_SHIFT_SEMITONES
 
 class AudioProcessor:
     @staticmethod
-    def process(input_audio_path: str, output_audio_path: str) -> bool:
+    def process(input_audio_path: str, output_audio_path: str, sample_rate: int = 44100) -> bool:
         """
         Applies pitch shifting to the audio file using FFmpeg's native filters.
         Extremely fast (does not load full file into RAM).
@@ -13,14 +13,6 @@ class AudioProcessor:
             return False
             
         try:
-            # Probe sample rate
-            probe = ffmpeg.probe(input_audio_path)
-            audio_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
-            
-            sample_rate = 44100
-            if audio_stream and 'sample_rate' in audio_stream:
-                sample_rate = int(audio_stream['sample_rate'])
-                
             # Calculate pitch shift multipliers
             rate_multiplier = 2 ** (PITCH_SHIFT_SEMITONES / 12.0)
             
@@ -35,7 +27,7 @@ class AudioProcessor:
             (
                 ffmpeg
                 .input(input_audio_path)
-                .output(output_audio_path, af=af_filter)
+                .output(output_audio_path, map='0:a:0', af=af_filter)
                 .run(overwrite_output=True, quiet=True)
             )
             return True
