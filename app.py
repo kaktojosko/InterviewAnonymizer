@@ -19,20 +19,25 @@ os.makedirs("uploads", exist_ok=True)
 os.makedirs("output", exist_ok=True)
 
 def background_process(task_id: str, input_path: str, output_path: str):
-    tasks[task_id] = {"status": "processing", "message": "Initializing..."}
+    tasks[task_id] = {"status": "processing", "message": "Initializing...", "logs": ["Initializing..."]}
     
     def status_callback(msg: str):
-        tasks[task_id] = {"status": "processing", "message": msg}
+        tasks[task_id]["message"] = msg
+        tasks[task_id]["logs"].append(msg)
         
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
     
     try:
         Orchestrator.process_video_job(input_path, output_path, job_dir, status_cb=status_callback)
-        tasks[task_id] = {"status": "completed", "message": "Done!"}
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["message"] = "Done!"
+        tasks[task_id]["logs"].append("Done!")
     except Exception as e:
         print(f"Error in background_process: {e}")
-        tasks[task_id] = {"status": "error", "message": str(e)}
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["message"] = str(e)
+        tasks[task_id]["logs"].append(str(e))
     finally:
         io_manager.cleanup_job_dir(job_dir)
         # Cleanup input file
@@ -55,7 +60,7 @@ async def upload_video(background_tasks: BackgroundTasks, file: UploadFile = Fil
     with open(input_path, "wb") as buffer:
         buffer.write(await file.read())
         
-    tasks[task_id] = {"status": "queued", "message": "Waiting in queue..."}
+    tasks[task_id] = {"status": "queued", "message": "Waiting in queue...", "logs": ["Waiting in queue..."]}
     
     background_tasks.add_task(background_process, task_id, input_path, output_path)
     

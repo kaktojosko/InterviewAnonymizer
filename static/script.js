@@ -112,6 +112,7 @@ async function uploadFile(file) {
         debugLog.innerHTML = `<p>[${time}] Видео загружено на сервер. Начало обработки...</p>`;
         debugLog.classList.remove('hidden');
         lastMessage = '';
+        logCursor = 0;
         
         // Start polling
         statusText.textContent = 'Обработка...';
@@ -124,6 +125,8 @@ async function uploadFile(file) {
     }
 }
 
+let logCursor = 0;
+
 async function checkStatus() {
     if (!currentTaskId) return;
     
@@ -134,6 +137,16 @@ async function checkStatus() {
         }
         const data = await response.json();
         
+        // Отрисовка всех непрочитанных логов
+        if (data.logs && data.logs.length > logCursor) {
+            const time = new Date().toLocaleTimeString('ru-RU');
+            for (let i = logCursor; i < data.logs.length; i++) {
+                debugLog.innerHTML += `<p>[${time}] ${data.logs[i]}</p>`;
+            }
+            debugLog.scrollTop = debugLog.scrollHeight;
+            logCursor = data.logs.length;
+        }
+
         if (data.status === 'completed') {
             clearInterval(pollInterval);
             showSuccess();
@@ -143,21 +156,9 @@ async function checkStatus() {
         } else if (data.status === 'processing') {
             statusText.textContent = 'Обработка...';
             statusSubText.textContent = data.message || 'Пожалуйста, подождите...';
-            if (data.message && data.message !== lastMessage) {
-                lastMessage = data.message;
-                const time = new Date().toLocaleTimeString('ru-RU');
-                debugLog.innerHTML += `<p>[${time}] ${data.message}</p>`;
-                debugLog.scrollTop = debugLog.scrollHeight;
-            }
         } else if (data.status === 'queued') {
             statusText.textContent = 'В очереди...';
             statusSubText.textContent = data.message || 'Ожидание своей очереди...';
-            if (data.message && data.message !== lastMessage) {
-                lastMessage = data.message;
-                const time = new Date().toLocaleTimeString('ru-RU');
-                debugLog.innerHTML += `<p>[${time}] ${data.message}</p>`;
-                debugLog.scrollTop = debugLog.scrollHeight;
-            }
         }
     } catch (error) {
         console.error('Error polling status:', error);
