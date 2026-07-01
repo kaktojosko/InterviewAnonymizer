@@ -14,6 +14,11 @@ YUNET_MIN_CONFIDENCE = 0.3
 # Higher = faster, but less accurate tracking for fast movements.
 DETECT_EVERY_N_FRAMES = 28
 
+# Cap the normalized output stream used by the processor.
+# 60 FPS doubles CPU work for little benefit on interview/webcam footage.
+# Set to 0 to preserve the source frame rate.
+MAX_PROCESSING_FPS = 30.0
+
 # Parallelization and Chunking Settings
 # Break video into 1-minute chunks for MAXIMUM parallel processing
 CHUNK_DURATION_SECONDS = 60 

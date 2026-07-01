@@ -1,7 +1,38 @@
 import os
+from fractions import Fraction
 import ffmpeg
+from src.config import MAX_PROCESSING_FPS
 
 class FFmpegUtils:
+    @staticmethod
+    def _normalize_fps(video_stream) -> str:
+        rates = [
+            video_stream.get('avg_frame_rate'),
+            video_stream.get('r_frame_rate'),
+        ]
+        
+        selected_rate = None
+        selected_value = 0.0
+        for rate in rates:
+            if not rate or rate == '0/0':
+                continue
+            try:
+                value = float(Fraction(rate))
+            except (ValueError, ZeroDivisionError):
+                continue
+            if value > 0:
+                selected_rate = rate
+                selected_value = value
+                break
+                
+        if selected_rate is None:
+            return '30/1'
+            
+        if MAX_PROCESSING_FPS and selected_value > MAX_PROCESSING_FPS:
+            return f"{int(MAX_PROCESSING_FPS)}/1"
+            
+        return selected_rate
+
     @staticmethod
     def get_video_metadata(input_path: str):
         width, height, fps = None, None, '30/1'
@@ -19,8 +50,7 @@ class FFmpegUtils:
                 if stream['codec_type'] == 'video' and width is None:
                     width = int(stream.get('width', 0))
                     height = int(stream.get('height', 0))
-                    fps = stream.get('r_frame_rate', '30/1')
-                    if fps == '0/0': fps = '30/1'
+                    fps = FFmpegUtils._normalize_fps(stream)
                 elif stream['codec_type'] == 'audio' and not has_audio:
                     has_audio = True
                     sample_rate = int(stream.get('sample_rate', 44100))

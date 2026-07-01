@@ -43,6 +43,7 @@ class Orchestrator:
         t0 = time.time()
         width, height, fps_str, duration, has_audio, sample_rate = FFmpegUtils.get_video_metadata(input_path)
         update(f"[Profile] Probe finished in {time.time() - t0:.2f}s")
+        update(f"Целевой FPS обработки: {fps_str}")
         
         # 2. Parallel Audio & Split Video
         audio_future = None
