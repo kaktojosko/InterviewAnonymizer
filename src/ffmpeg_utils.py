@@ -6,32 +6,39 @@ from src.config import MAX_PROCESSING_FPS
 class FFmpegUtils:
     @staticmethod
     def _normalize_fps(video_stream) -> str:
+        def parse_rate(rate):
+            if not rate or rate == '0/0':
+                return None
+            try:
+                value = Fraction(rate)
+            except (ValueError, ZeroDivisionError):
+                return None
+            return value if value > 0 else None
+
+        # Prefer the nominal stream rate for processing. On VFR files
+        # avg_frame_rate can be a long, low precision fraction that reflects
+        # the whole file average rather than a useful CFR target.
         rates = [
-            video_stream.get('avg_frame_rate'),
             video_stream.get('r_frame_rate'),
+            video_stream.get('avg_frame_rate'),
         ]
         
         selected_rate = None
-        selected_value = 0.0
         for rate in rates:
-            if not rate or rate == '0/0':
-                continue
-            try:
-                value = float(Fraction(rate))
-            except (ValueError, ZeroDivisionError):
-                continue
-            if value > 0:
-                selected_rate = rate
-                selected_value = value
+            selected_rate = parse_rate(rate)
+            if selected_rate is not None:
                 break
                 
         if selected_rate is None:
-            return '30/1'
+            selected_rate = Fraction(30, 1)
             
-        if MAX_PROCESSING_FPS and selected_value > MAX_PROCESSING_FPS:
-            return f"{int(MAX_PROCESSING_FPS)}/1"
+        if MAX_PROCESSING_FPS:
+            fps_limit = Fraction(str(MAX_PROCESSING_FPS)).limit_denominator(1001)
+            if selected_rate > fps_limit:
+                selected_rate = fps_limit
             
-        return selected_rate
+        selected_rate = selected_rate.limit_denominator(1001)
+        return f"{selected_rate.numerator}/{selected_rate.denominator}"
 
     @staticmethod
     def get_video_metadata(input_path: str):
