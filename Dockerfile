@@ -11,8 +11,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source code
-COPY . .
+# Copy only runtime files. Runtime data directories are bind-mounted by compose.
+COPY app.py main.py ./
+COPY src ./src
+COPY static ./static
 
 # Expose port
 EXPOSE 8000

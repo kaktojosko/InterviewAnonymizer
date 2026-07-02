@@ -1,7 +1,7 @@
 import os
 from fractions import Fraction
 import ffmpeg
-from src.config import MAX_PROCESSING_FPS
+from src.config import MAX_PROCESSING_FPS, OUTPUT_VIDEO_CRF, OUTPUT_VIDEO_PRESET
 
 class FFmpegUtils:
     @staticmethod
@@ -82,15 +82,13 @@ class FFmpegUtils:
         
         if is_h264:
             video_args = {
-                'c:v': 'copy',
-                'movflags': '+faststart'
+                'c:v': 'copy'
             }
         else:
             video_args = {
                 'c:v': 'libx264',
-                'preset': 'ultrafast',
-                'crf': '23',
-                'movflags': '+faststart'
+                'preset': OUTPUT_VIDEO_PRESET,
+                'crf': str(OUTPUT_VIDEO_CRF)
             }
         
         if audio_path and os.path.exists(audio_path):

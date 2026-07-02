@@ -27,7 +27,7 @@ def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int,
 
 class Orchestrator:
     @staticmethod
-    def process_video_job(input_path: str, output_path: str, job_dir: str, status_cb=None):
+    def process_video_job(input_path: str, output_path: str, job_dir: str, status_cb=None, worker_count: int | None = None):
         def update(msg):
             print(msg)
             if status_cb:
@@ -35,6 +35,7 @@ class Orchestrator:
                 
         update(f"Starting processing for: {input_path}")
         total_start_time = time.time()
+        workers = max(1, worker_count or MAX_WORKERS)
         
         audio_pitched_path = os.path.join(job_dir, "audio_pitched.wav")
         
@@ -56,7 +57,7 @@ class Orchestrator:
         t0 = time.time()
         
         if duration > 0:
-            adaptive_chunk_time = max(30, min(90, int(duration / MAX_WORKERS)))
+            adaptive_chunk_time = max(30, min(90, int(duration / workers)))
         else:
             adaptive_chunk_time = max(30, CHUNK_DURATION_SECONDS)
             
@@ -78,7 +79,8 @@ class Orchestrator:
             vp.process(input_path, video_blurred_path, fps=fps_str, orig_width=width, orig_height=height)
         else:
             # 3. Process chunks in parallel
-            update(f"Распознавание лиц и блюр (Потоков: {MAX_WORKERS})...")
+            active_workers = max(1, min(workers, len(input_chunks)))
+            update(f"Распознавание лиц и блюр (Потоков: {active_workers})...")
             t0 = time.time()
             processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
             os.makedirs(processed_chunks_dir, exist_ok=True)
@@ -104,7 +106,7 @@ class Orchestrator:
             listener_thread.start()
 
             futures_map = {}
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS, initializer=init_worker) as executor:
+            with ProcessPoolExecutor(max_workers=active_workers, initializer=init_worker) as executor:
                 for idx, chunk in enumerate(input_chunks):
                     out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
                     f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height, log_queue)

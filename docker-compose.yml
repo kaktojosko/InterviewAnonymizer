@@ -8,6 +8,7 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./output:/app/output
+      - ./tmp:/app/tmp
       # Optional: mount src for hot-reloading in dev
       # - ./src:/app/src
     restart: unless-stopped

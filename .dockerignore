@@ -6,6 +6,8 @@ __pycache__/
 .idea/
 .vscode/
 uploads/
+output/
+tmp/
 processed/
 jobs/
 *.mp4

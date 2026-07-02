@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=6">
+    <link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
     <div class="container">
@@ -34,6 +34,27 @@
                     <p>или кликните для выбора (.mp4)</p>
                     <input type="file" id="fileInput" accept=".mp4" hidden>
                 </div>
+                <div class="worker-settings" aria-label="Настройка количества воркеров">
+                    <div class="worker-settings-header">
+                        <label class="worker-settings-title" for="workerSelect">Потоки обработки</label>
+                        <span class="worker-settings-value" id="workerValue">4</span>
+                    </div>
+                    <select id="workerSelect" class="worker-select">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="4" selected>4</option>
+                        <option value="6">6</option>
+                        <option value="12">12</option>
+                        <option value="16">16</option>
+                        <option value="custom">Другое</option>
+                    </select>
+                    <div class="custom-worker-wrap hidden" id="customWorkerWrap">
+                        <label class="custom-worker-label" for="customWorkerInput">Своё значение</label>
+                        <input id="customWorkerInput" class="worker-custom-input" type="number" min="1" step="1" inputmode="numeric" placeholder="Например, 5">
+                    </div>
+                    <p class="worker-warning" id="workerLimitText">Количество обработчиков не может превышать (количество ядер * потоки) - 1, чтобы компьютер не выключился от перегрузки.</p>
+                    <p class="worker-settings-hint">Максимум воркеров не означает максимальную производительность, учитывайте особенности своей системы.</p>
+                </div>
             </div>
 
             <div class="clay-panel hidden" id="statusPanel">
@@ -53,9 +74,9 @@
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-color); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v2.9.1-fps-cap (30 FPS Stable Edition)
+            v3.0.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=5"></script>
+    <script src="/static/script.js?v=8"></script>
 </body>
 </html>

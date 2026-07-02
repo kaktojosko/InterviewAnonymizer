@@ -1,7 +1,13 @@
 import cv2
 import os
 import subprocess
-from src.config import FACE_PADDING_PERCENT_X, FACE_PADDING_PERCENT_Y, YUNET_MIN_CONFIDENCE
+from src.config import (
+    FACE_PADDING_PERCENT_X,
+    FACE_PADDING_PERCENT_Y,
+    OUTPUT_VIDEO_CRF,
+    OUTPUT_VIDEO_PRESET,
+    YUNET_MIN_CONFIDENCE,
+)
 
 class VideoProcessor:
     def __init__(self):
@@ -173,8 +179,8 @@ class VideoProcessor:
             '-r', str(target_fps),
             '-i', '-',
             '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '23',
+            '-preset', OUTPUT_VIDEO_PRESET,
+            '-crf', str(OUTPUT_VIDEO_CRF),
             '-pix_fmt', 'yuv420p',
             output_video_path
         ]
