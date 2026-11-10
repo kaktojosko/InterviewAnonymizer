@@ -8,8 +8,10 @@ from src.orchestrator import Orchestrator
 from src.io_manager import IOManager
 from src.config import (
     ASR_MODEL_PROFILES,
+    COMPUTE_DEVICE_OPTIONS,
     CPU_COUNT,
     DEFAULT_ASR_MODEL,
+    DEFAULT_COMPUTE_DEVICE,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     MODELS_DIR,
@@ -17,8 +19,9 @@ from src.config import (
     TMP_BASE_DIR,
     TRANSCRIPTION_ENABLED_DEFAULT,
 )
+from src.transcriber import probe_cuda_available
 
-app = FastAPI(title="Interview Anonymizer", version="4.0.0")
+app = FastAPI(title="Interview Anonymizer", version="4.1.0")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -90,6 +93,13 @@ def parse_speaker_count(raw_speakers: str | None) -> str:
         raise HTTPException(status_code=400, detail=f"Unsupported speaker count '{mode}'. Valid options: {valid}.")
     return mode
 
+def parse_compute_device(raw_device: str | None) -> str:
+    device = (raw_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
+    if device not in COMPUTE_DEVICE_OPTIONS:
+        valid = ", ".join(COMPUTE_DEVICE_OPTIONS)
+        raise HTTPException(status_code=400, detail=f"Unsupported compute device '{device}'. Valid options: {valid}.")
+    return device
+
 def background_process(
     task_id: str,
     input_path: str,
@@ -99,10 +109,13 @@ def background_process(
     transcript_path: str | None,
     asr_model: str,
     speakers: str,
+    compute_device: str = DEFAULT_COMPUTE_DEVICE,
 ):
     init_logs = ["Initializing...", f"Worker count: {worker_count}"]
     if transcribe_enabled:
-        init_logs.append(f"Auto-transcription: ON (model={asr_model}, speakers={speakers})")
+        init_logs.append(
+            f"Auto-transcription: ON (model={asr_model}, device={compute_device}, speakers={speakers})"
+        )
     else:
         init_logs.append("Auto-transcription: OFF")
 
@@ -115,6 +128,7 @@ def background_process(
         "transcript_ready": False,
         "asr_model": asr_model,
         "speakers": speakers,
+        "compute_device": compute_device,
     }
     
     def status_callback(msg: str):
@@ -135,6 +149,7 @@ def background_process(
             transcript_path=transcript_path,
             asr_model=asr_model,
             speaker_count=speakers,
+            compute_device=compute_device,
         )
         tasks[task_id]["transcript_ready"] = bool(result.get("transcript_ready"))
         tasks[task_id]["status"] = "completed"
@@ -158,7 +173,7 @@ async def root():
 @app.get("/api/config")
 async def get_config():
     return {
-        "version": "4.0.0",
+        "version": "4.1.0",
         "cpu_count": CPU_COUNT,
         "default_workers": MAX_WORKERS,
         "max_workers": MAX_ALLOWED_WORKERS,
@@ -170,6 +185,12 @@ async def get_config():
             for p in ASR_MODEL_PROFILES.values()
         ],
         "speaker_options": SPEAKER_COUNT_OPTIONS,
+        "cuda_available": probe_cuda_available(),
+        "default_compute_device": DEFAULT_COMPUTE_DEVICE,
+        "compute_devices": [
+            {"id": "cpu", "label": "CPU"},
+            {"id": "cuda", "label": "GPU (CUDA)"},
+        ],
     }
 
 @app.post("/api/upload")
@@ -180,6 +201,7 @@ async def upload_video(
     transcribe: str = Form("true" if TRANSCRIPTION_ENABLED_DEFAULT else "false"),
     asr_model: str = Form(DEFAULT_ASR_MODEL),
     speakers: str = Form("auto"),
+    compute_device: str = Form(DEFAULT_COMPUTE_DEVICE),
 ):
     if not file.filename or not file.filename.lower().endswith(".mp4"):
         raise HTTPException(status_code=400, detail="Only .mp4 files are supported.")
@@ -188,6 +210,7 @@ async def upload_video(
     transcribe_enabled = parse_bool_form(transcribe, default=TRANSCRIPTION_ENABLED_DEFAULT)
     asr_model_id = parse_asr_model(asr_model)
     speaker_mode = parse_speaker_count(speakers)
+    device_mode = parse_compute_device(compute_device)
         
     task_id = str(uuid.uuid4())
     input_path = os.path.join("uploads", f"{task_id}.mp4")
@@ -212,6 +235,7 @@ async def upload_video(
         "transcript_ready": False,
         "asr_model": asr_model_id,
         "speakers": speaker_mode,
+        "compute_device": device_mode,
     }
     
     background_tasks.add_task(
@@ -224,6 +248,7 @@ async def upload_video(
         transcript_path,
         asr_model_id,
         speaker_mode,
+        device_mode,
     )
     
     return {
@@ -234,6 +259,7 @@ async def upload_video(
         "transcribe_enabled": transcribe_enabled,
         "asr_model": asr_model_id,
         "speakers": speaker_mode,
+        "compute_device": device_mode,
     }
 
 @app.get("/api/status/{task_id}")

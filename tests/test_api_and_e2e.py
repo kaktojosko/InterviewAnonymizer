@@ -77,6 +77,7 @@ def test_cli_arg_parser():
     assert args_default.no_transcribe is False
     assert args_default.asr_model == "turbo"
     assert args_default.speakers == "auto"
+    assert args_default.device == "cpu"
     assert args_default.transcript_output is None
 
     args_custom = parser.parse_args(
@@ -92,6 +93,8 @@ def test_cli_arg_parser():
             "parakeet",
             "--speakers",
             "2",
+            "--device",
+            "cuda",
             "-w",
             "1",
         ]
@@ -99,6 +102,7 @@ def test_cli_arg_parser():
     assert args_custom.no_transcribe is True
     assert args_custom.asr_model == "parakeet"
     assert args_custom.speakers == "2"
+    assert args_custom.device == "cuda"
     assert args_custom.transcript_output == "dialog.txt"
     assert args_custom.workers == 1
 
@@ -108,14 +112,18 @@ def test_api_root_and_config():
     root_resp = client.get("/")
     assert root_resp.status_code == 200
     assert "transcribeToggle" in root_resp.text
+    assert "computeDeviceSelect" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
 
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.0.0"
+    assert data["version"] == "4.1.0"
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
+    assert data["default_compute_device"] == "cpu"
+    assert isinstance(data["cuda_available"], bool)
+    assert [d["id"] for d in data["compute_devices"]] == ["cpu", "cuda"]
     model_ids = [m["id"] for m in data["asr_models"]]
     assert model_ids == ["turbo", "parakeet", "small"]
     assert data["speaker_options"] == ["auto", "2", "3", "4+"]
@@ -143,6 +151,13 @@ def test_api_upload_validation_errors():
         data={"speakers": "99"},
     )
     assert r_spk.status_code == 400
+
+    r_dev = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"compute_device": "tpu"},
+    )
+    assert r_dev.status_code == 400
 
     r_bool = client.post(
         "/api/upload",
@@ -197,6 +212,59 @@ def test_orchestrator_silent_video_creates_note_transcript(tmp_path):
         iom.cleanup_job_dir(job_dir)
 
 
+def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
+    import src.transcriber as tr_mod
+
+    in_mp4 = str(tmp_path / "gpu_input.mp4")
+    out_mp4 = str(tmp_path / "gpu_output.mp4")
+    out_txt = str(tmp_path / "gpu_transcript.txt")
+    _generate_test_mp4(in_mp4, duration_sec=1.2, with_audio=True)
+
+    recorded_calls = []
+
+    def _mock_gpu_transcribe(
+        cls,
+        wav_path: str,
+        output_txt_path: str,
+        asr_model: str = "turbo",
+        speaker_count: str = "auto",
+        threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
+        status_cb=None,
+    ):
+        recorded_calls.append({"compute_device": compute_device, "diar_threads": diar_threads})
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write("[00:00:00 - 00:00:01] Спикер 1: GPU OK\n")
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01}
+
+    monkeypatch.setattr(tr_mod, "probe_cuda_available", lambda: True)
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_gpu_transcribe))
+
+    logs = []
+    iom = IOManager()
+    job_dir = iom.create_job_dir()
+    try:
+        res = Orchestrator.process_video_job(
+            input_path=in_mp4,
+            output_path=out_mp4,
+            job_dir=job_dir,
+            status_cb=logs.append,
+            worker_count=4,
+            transcribe=True,
+            transcript_path=out_txt,
+            asr_model="turbo",
+            speaker_count="auto",
+            compute_device="cuda",
+        )
+        assert res["video_ready"] is True
+        assert res["transcript_ready"] is True
+        assert recorded_calls == [{"compute_device": "cuda", "diar_threads": 2}]
+        assert any("Параллельная транскрибация на GPU" in m for m in logs)
+    finally:
+        iom.cleanup_job_dir(job_dir)
+
+
 def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
     mp4_path = str(tmp_path / "interview_clip.mp4")
     _generate_test_mp4(mp4_path, duration_sec=1.5, with_audio=True)
@@ -208,6 +276,8 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         asr_model: str = "turbo",
         speaker_count: str = "auto",
         threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
         status_cb=None,
     ):
         assert os.path.isfile(wav_path)
@@ -232,14 +302,21 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
     client = TestClient(app)
     created_task_ids = []
     try:
-        # Case 1: Auto-transcription ON (default)
+        # Case 1: Auto-transcription ON (default CPU)
         with open(mp4_path, "rb") as f:
             up1 = client.post(
                 "/api/upload",
                 files={"file": ("interview.mp4", f, "video/mp4")},
-                data={"workers": "1", "transcribe": "true", "asr_model": "turbo", "speakers": "2"},
+                data={
+                    "workers": "1",
+                    "transcribe": "true",
+                    "asr_model": "turbo",
+                    "speakers": "2",
+                    "compute_device": "cpu",
+                },
             )
         assert up1.status_code == 200
+        assert up1.json()["compute_device"] == "cpu"
         tid1 = up1.json()["task_id"]
         created_task_ids.append(tid1)
 
@@ -247,6 +324,7 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         assert st1["status"] == "completed"
         assert st1["transcribe_enabled"] is True
         assert st1["transcript_ready"] is True
+        assert st1["compute_device"] == "cpu"
 
         dl_vid1 = client.get(f"/api/download/{tid1}")
         assert dl_vid1.status_code == 200

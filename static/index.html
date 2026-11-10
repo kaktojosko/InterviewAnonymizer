@@ -1,13 +1,14 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Локальная анонимизация видео-интервью и транскрибация по ролям офлайн">
     <title>Interview Anonymizer</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=9">
+    <link rel="stylesheet" href="/static/style.css?v=12">
 </head>
 <body>
     <div class="container">
@@ -31,10 +32,11 @@
                         <line x1="12" y1="3" x2="12" y2="15"></line>
                     </svg>
                     <h2>Перетащите видео сюда</h2>
-                    <p>или кликните для выбора (.mp4)</p>
+                    <p>или выберите файл (.mp4)</p>
                     <input type="file" id="fileInput" accept=".mp4" hidden>
                 </div>
-                <div class="worker-settings" aria-label="Настройка количества воркеров">
+
+                <div class="worker-settings" aria-label="Настройка потоков обработки">
                     <div class="worker-settings-header">
                         <label class="worker-settings-title" for="workerSelect">Потоки обработки</label>
                         <span class="worker-settings-value" id="workerValue">4</span>
@@ -49,18 +51,17 @@
                         <option value="custom">Другое</option>
                     </select>
                     <div class="custom-worker-wrap hidden" id="customWorkerWrap">
-                        <label class="custom-worker-label" for="customWorkerInput">Своё значение</label>
+                        <label class="custom-worker-label" for="customWorkerInput">Своё число</label>
                         <input id="customWorkerInput" class="worker-custom-input" type="number" min="1" step="1" inputmode="numeric" placeholder="Например, 5">
                     </div>
-                    <p class="worker-warning" id="workerLimitText">Количество обработчиков не может превышать (количество ядер * потоки) - 1, чтобы компьютер не выключился от перегрузки.</p>
-                    <p class="worker-settings-hint">Максимум воркеров не означает максимальную производительность, учитывайте особенности своей системы.</p>
+                    <p class="worker-warning" id="workerLimitText">Лимит: потоки CPU − 1 (защита от перегрузки). Максимум не всегда быстрее.</p>
                 </div>
 
                 <div class="transcription-settings" aria-label="Настройки автотранскрибации">
                     <div class="transcribe-toggle-row">
                         <div class="transcribe-title-group">
-                            <label class="worker-settings-title" for="transcribeToggle">Автотранскрибация по ролям</label>
-                            <span class="transcribe-badge" id="transcribeStateBadge">Включена</span>
+                            <label class="worker-settings-title" for="transcribeToggle">Транскрибация по ролям</label>
+                            <span class="transcribe-badge" id="transcribeStateBadge">Вкл</span>
                         </div>
                         <label class="clay-switch" for="transcribeToggle">
                             <input type="checkbox" id="transcribeToggle" checked>
@@ -70,23 +71,32 @@
 
                     <div class="transcribe-options-wrap" id="transcribeOptionsWrap">
                         <div class="transcribe-field">
-                            <label class="custom-worker-label" for="asrModelSelect">Локальная модель распознавания</label>
+                            <label class="custom-worker-label" for="asrModelSelect">Модель распознавания</label>
                             <select id="asrModelSelect" class="worker-select">
-                                <option value="turbo" selected>Точная — Whisper Large v3 Turbo (99 языков, ~810 МБ)</option>
-                                <option value="parakeet">Быстрая CPU — Parakeet TDT 0.6B v3 (25 языков, ~600 МБ)</option>
-                                <option value="small">Лёгкая — Whisper Small (99 языков, ~245 МБ)</option>
+                                <option value="turbo" selected>Whisper Turbo — точная (99 яз., 810 МБ)</option>
+                                <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
+                                <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
                             </select>
                         </div>
-                        <div class="transcribe-field">
-                            <label class="custom-worker-label" for="speakerCountSelect">Количество говорящих</label>
-                            <select id="speakerCountSelect" class="worker-select">
-                                <option value="auto" selected>Автоопределение</option>
-                                <option value="2">2 спикера (интервью 1-на-1)</option>
-                                <option value="3">3 спикера</option>
-                                <option value="4+">4 и более спикеров</option>
-                            </select>
+                        <div class="transcribe-grid-2">
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="computeDeviceSelect">Ускорение</label>
+                                <select id="computeDeviceSelect" class="worker-select">
+                                    <option value="cpu" selected>CPU</option>
+                                    <option value="cuda">GPU (CUDA)</option>
+                                </select>
+                            </div>
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="speakerCountSelect">Число спикеров</label>
+                                <select id="speakerCountSelect" class="worker-select">
+                                    <option value="auto" selected>Авто</option>
+                                    <option value="2">2 спикера</option>
+                                    <option value="3">3 спикера</option>
+                                    <option value="4+">4+ спикеров</option>
+                                </select>
+                            </div>
                         </div>
-                        <p class="worker-settings-hint">Создаёт отдельный .txt файл с таймкодами и ролями. Распознаёт русскую речь с англицизмами и переключение языков полностью офлайн.</p>
+                        <p class="worker-settings-hint" id="transcribeHintText">Отдельный .txt с таймкодами и ролями. Мультиязычно (RU/EN и др.), офлайн.</p>
                     </div>
                 </div>
             </div>
@@ -102,18 +112,18 @@
                     <p id="statusSubText">Пожалуйста, подождите.</p>
                     <div id="debugLog" class="debug-log hidden"></div>
                     <div class="download-actions">
-                        <button id="downloadBtn" class="clay-btn hidden">Скачать готовое видео (.mp4)</button>
+                        <button id="downloadBtn" class="clay-btn hidden">Скачать видео (.mp4)</button>
                         <button id="downloadTranscriptBtn" class="clay-btn clay-btn-transcript hidden">Скачать транскрипт (.txt)</button>
-                        <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить еще</button>
+                        <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить ещё</button>
                     </div>
                 </div>
             </div>
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v4.0.0 (Stable Edition)
+            v4.1.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=9"></script>
+    <script src="/static/script.js?v=12"></script>
 </body>
 </html>

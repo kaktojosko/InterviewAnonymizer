@@ -7,9 +7,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies (includes lightweight cuBLAS runtime for optional NVIDIA GPU mode)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -c "import glob, site; paths = [p for sp in site.getsitepackages() for p in glob.glob(sp + '/nvidia/*/lib')]; open('/etc/ld.so.conf.d/nvidia-pip.conf', 'w').write('\n'.join(paths) + '\n') if paths else None" && \
+    ldconfig
 
 # Copy only runtime files. Runtime data directories are bind-mounted by compose.
 COPY app.py main.py ./

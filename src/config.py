@@ -45,7 +45,7 @@ DEFAULT_ASR_MODEL = os.environ.get("DEFAULT_ASR_MODEL", "turbo").strip().lower()
 ASR_MODEL_PROFILES = {
     "turbo": {
         "id": "turbo",
-        "label": "Точная — Whisper Large v3 Turbo (99 языков, ~810 МБ)",
+        "label": "Whisper Turbo — точная (99 яз., 810 МБ)",
         "short_name": "Whisper Large v3 Turbo (INT8)",
         "engine": "faster_whisper",
         "repo_id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
@@ -55,7 +55,7 @@ ASR_MODEL_PROFILES = {
     },
     "parakeet": {
         "id": "parakeet",
-        "label": "Быстрая CPU — Parakeet TDT 0.6B v3 (25 языков, ~600 МБ)",
+        "label": "Parakeet v3 — быстрая (25 яз., 600 МБ)",
         "short_name": "NVIDIA Parakeet TDT 0.6B v3 (INT8)",
         "engine": "sherpa_parakeet",
         "repo_id": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
@@ -65,7 +65,7 @@ ASR_MODEL_PROFILES = {
     },
     "small": {
         "id": "small",
-        "label": "Лёгкая — Whisper Small (99 языков, ~245 МБ)",
+        "label": "Whisper Small — лёгкая (99 яз., 245 МБ)",
         "short_name": "Whisper Small (INT8)",
         "engine": "faster_whisper",
         "repo_id": "Systran/faster-whisper-small",
@@ -77,6 +77,11 @@ ASR_MODEL_PROFILES = {
 
 if DEFAULT_ASR_MODEL not in ASR_MODEL_PROFILES:
     DEFAULT_ASR_MODEL = "turbo"
+
+COMPUTE_DEVICE_OPTIONS = ["cpu", "cuda"]
+DEFAULT_COMPUTE_DEVICE = os.environ.get("DEFAULT_COMPUTE_DEVICE", "cpu").strip().lower()
+if DEFAULT_COMPUTE_DEVICE not in COMPUTE_DEVICE_OPTIONS:
+    DEFAULT_COMPUTE_DEVICE = "cpu"
 
 DIARIZATION_MODELS = {
     "segmentation": {
@@ -92,9 +97,15 @@ DIARIZATION_MODELS = {
 }
 
 SPEAKER_COUNT_OPTIONS = ["auto", "2", "3", "4+"]
-DIARIZATION_CLUSTER_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.65"))
-DIARIZATION_MULTI_SPEAKER_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_THRESHOLD", "0.58"))
+# Fine-grained turn boundary threshold for initial pyannote segmentation pass
+DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.50"))
+# Cosine similarity thresholds for Anchor-Centroid voiceprint clustering (CAM++)
+DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.54"))
+DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.58"))
+# Backwards-compatible alias
+DIARIZATION_CLUSTER_THRESHOLD = DIARIZATION_CENTROID_SIM_THRESHOLD
 DIARIZATION_MERGE_GAP_SEC = 0.8
-DIARIZATION_MIN_SEGMENT_SEC = 0.2
+DIARIZATION_MIN_SEGMENT_SEC = 0.25
 TRANSCRIPT_PAUSE_BREAK_SEC = 2.5
+
 

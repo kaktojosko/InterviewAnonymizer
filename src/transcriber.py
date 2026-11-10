@@ -1,8 +1,13 @@
 import bisect
+import ctypes
 from dataclasses import dataclass
 import gc
+import glob
 import math
 import os
+import re
+import site
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -15,11 +20,14 @@ from faster_whisper import WhisperModel
 
 from src.config import (
     ASR_MODEL_PROFILES,
+    COMPUTE_DEVICE_OPTIONS,
     DEFAULT_ASR_MODEL,
-    DIARIZATION_CLUSTER_THRESHOLD,
+    DEFAULT_COMPUTE_DEVICE,
+    DIARIZATION_CENTROID_SIM_THRESHOLD,
     DIARIZATION_MERGE_GAP_SEC,
     DIARIZATION_MIN_SEGMENT_SEC,
-    DIARIZATION_MULTI_SPEAKER_THRESHOLD,
+    DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
+    DIARIZATION_SEGMENTATION_THRESHOLD,
     TRANSCRIPT_PAUSE_BREAK_SEC,
 )
 from src.model_manager import ModelManager
@@ -90,6 +98,117 @@ def load_wav_16k_mono(wav_path: str, normalize_gain: bool = True) -> tuple[np.nd
     return np.ascontiguousarray(pcm, dtype=np.float32), sample_rate
 
 
+def is_narrowband_tone(seg_samples: np.ndarray, sample_rate: int = 16000) -> bool:
+    """
+    Detects synthetic single- or dual-frequency call-waiting / ringback / busy
+    tones (e.g. Zoom, Teams, Telemost, telephony 425 Hz / 440+480 Hz beeps) so
+    they are excluded before speaker clustering and ASR.
+    """
+    win = 512
+    hop = 256
+    if sample_rate <= 0 or seg_samples.size < max(win, int(0.18 * sample_rate)):
+        return False
+
+    freqs = np.fft.rfftfreq(win, d=1.0 / float(sample_rate))
+    band_mask = (freqs >= 150.0) & (freqs <= 3800.0)
+    if int(np.count_nonzero(band_mask)) < 6:
+        return False
+
+    hann = np.hanning(win).astype(np.float32)
+    top3_ratios: list[float] = []
+    flatnesses: list[float] = []
+
+    for pos in range(0, len(seg_samples) - win + 1, hop):
+        frame = seg_samples[pos : pos + win]
+        if float(np.mean(frame * frame)) < 1e-6:
+            continue
+        spec = (np.abs(np.fft.rfft(frame * hann)) ** 2)[band_mask]
+        band_sum = float(np.sum(spec))
+        if band_sum <= 1e-10:
+            continue
+        top3 = float(np.sum(np.partition(spec, -3)[-3:]))
+        top3_ratios.append(top3 / band_sum)
+        geom_mean = float(np.exp(np.mean(np.log(spec + 1e-12))))
+        arith_mean = float(np.mean(spec)) + 1e-12
+        flatnesses.append(geom_mean / arith_mean)
+
+    if len(top3_ratios) < 4:
+        return False
+
+    return bool(np.median(top3_ratios) > 0.78 and np.median(flatnesses) < 0.02)
+
+
+_WORD_CHARS_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё가-힣]")
+_SYLLABLE_STUTTER_RE = re.compile(
+    r"(?<!\w)(?:[A-Za-zА-Яа-яЁё가-힣]{1,3})(?:[\s,\-\.]+[A-Za-zА-Яа-яЁё가-힣]{1,3}){4,}(?!\w)"
+)
+_SYLLABLE_SPLIT_RE = re.compile(r"[\s,\-\.]+")
+
+
+def is_repetitive_noise_token(token: str) -> bool:
+    """
+    Returns True for single-token Whisper tone/noise repetition loops such as
+    '뚜루뚜뚜뚜뚜뚜뚜뚜뚜뚜뚜', 'Dootototototototo', or 'Дудудудудудуду'.
+    """
+    letters = "".join(_WORD_CHARS_RE.findall(token)).lower()
+    if len(letters) >= 10 and len(set(letters)) <= 3:
+        return True
+    if len(letters) >= 12 and re.search(r"(.{1,3})\1{4,}", letters):
+        return True
+    return False
+
+
+def clean_hallucinated_text(text: str) -> str:
+    """
+    Strips dial-tone / ringback repetition loops (e.g. 'Ту -ру -ту -ту -ту -ту...')
+    while preserving real speech that may follow in the same segment and keeping
+    natural expressions and punctuation ('Да, да, да!', 'Mm -hmm.') intact.
+    """
+    if not text or not text.strip():
+        return ""
+
+    t = text.strip()
+    modified = False
+
+    # 1. Remove 5+ syllable repetitive tone stutters (<=4 unique chars & <=3 distinct syllables)
+    def _strip_stutter(match: re.Match) -> str:
+        nonlocal modified
+        chunk = match.group(0)
+        parts = [p.lower() for p in _SYLLABLE_SPLIT_RE.split(chunk) if p]
+        letters = "".join(parts)
+        if len(parts) >= 5 and len(set(letters)) <= 4 and len(set(parts)) <= 3:
+            modified = True
+            return " "
+        return chunk
+
+    t = _SYLLABLE_STUTTER_RE.sub(_strip_stutter, t)
+
+    # 2. Drop individual noise-loop tokens inside multi-word strings
+    words = t.split()
+    kept_words = [w for w in words if not is_repetitive_noise_token(w)]
+    if len(kept_words) != len(words):
+        modified = True
+    if not kept_words:
+        return ""
+
+    if modified:
+        t = " ".join(kept_words)
+        t = re.sub(r"^[\s,\-\.:;!?]+", "", t)
+        t = re.sub(r"[\s,\-:;]+$", "", t)
+        if t in (".", "!", "?", "..."):
+            return ""
+
+    letters = "".join(_WORD_CHARS_RE.findall(t)).lower()
+    if not letters:
+        return ""
+    if is_repetitive_noise_token(letters):
+        return ""
+    if len(letters) >= 16 and (len(set(letters)) / float(len(letters))) <= 0.16:
+        return ""
+
+    return t.strip()
+
+
 def smooth_diarization_segments(
     segments: list[DiarizationSegment],
     merge_gap_sec: float = DIARIZATION_MERGE_GAP_SEC,
@@ -142,6 +261,245 @@ def smooth_diarization_segments(
         cleaned.append(seg)
 
     return _merge_same_speaker(cleaned)
+
+
+def consolidate_minor_speakers(
+    segments: list[DiarizationSegment],
+    merge_gap_sec: float = DIARIZATION_MERGE_GAP_SEC,
+) -> list[DiarizationSegment]:
+    """
+    Absorbs transient noise/laugh/interjection micro-clusters on long recordings
+    (speakers accounting for <1% of speech and <6s total) into the temporally
+    nearest primary speaker, preventing false speaker explosions in auto mode.
+    """
+    if len(segments) <= 2:
+        return segments
+
+    dur_by_spk: dict[int, float] = {}
+    for s in segments:
+        dur_by_spk[s.speaker] = dur_by_spk.get(s.speaker, 0.0) + max(0.0, s.end - s.start)
+
+    total_speech = sum(dur_by_spk.values())
+    if total_speech < 20.0 or len(dur_by_spk) <= 2:
+        return segments
+
+    min_major_dur = min(6.0, max(2.5, 0.01 * total_speech))
+    major_spks = {spk for spk, dur in dur_by_spk.items() if dur >= min_major_dur}
+    if not major_spks or len(major_spks) == len(dur_by_spk):
+        return segments
+
+    major_segments = [s for s in segments if s.speaker in major_spks]
+    reassigned: list[DiarizationSegment] = []
+    for s in segments:
+        if s.speaker in major_spks:
+            reassigned.append(s)
+        else:
+            nearest = min(
+                major_segments,
+                key=lambda m: min(abs(s.start - m.end), abs(m.start - s.end)),
+            )
+            reassigned.append(DiarizationSegment(s.start, s.end, nearest.speaker))
+
+    return smooth_diarization_segments(reassigned, merge_gap_sec=merge_gap_sec)
+
+
+def cluster_anchor_embeddings(
+    segments: list[DiarizationSegment],
+    embeddings: list[Optional[np.ndarray]],
+    speaker_count: str = "auto",
+    sim_threshold: float = DIARIZATION_CENTROID_SIM_THRESHOLD,
+    multi_sim_threshold: float = DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
+    merge_gap_sec: float = DIARIZATION_MERGE_GAP_SEC,
+) -> list[DiarizationSegment]:
+    """
+    Two-stage Anchor-Centroid speaker clustering:
+      1. Discovers true speaker voiceprint centroids exclusively from reliable
+         anchor utterances (>=2.0s) via duration-weighted cosine centroid
+         agglomeration (immune to Complete-Linkage outlier shattering on long
+         45-90 min interviews).
+      2. Assigns all segments — including <2.0s backchannels ('Mm-hmm',
+         'Добрый день', 'Пожалуйста') — to the closest anchor speaker centroid
+         with a light temporal continuity prior, followed by one centroid
+         refinement pass.
+    """
+    if not segments:
+        return []
+    if len(segments) != len(embeddings):
+        raise ValueError("segments and embeddings must have identical length")
+
+    mode = (speaker_count or "auto").strip().lower()
+    if mode.isdigit() and int(mode) >= 1:
+        target_k: Optional[int] = int(mode)
+        eff_sim_thr = float(sim_threshold)
+    elif mode == "4+":
+        target_k = None
+        eff_sim_thr = float(multi_sim_threshold)
+    else:
+        target_k = None
+        eff_sim_thr = float(sim_threshold)
+
+    if target_k == 1:
+        return smooth_diarization_segments(
+            [DiarizationSegment(s.start, s.end, 0) for s in segments],
+            merge_gap_sec=merge_gap_sec,
+        )
+
+    durations = [max(0.0, float(s.end - s.start)) for s in segments]
+    norm_embs: list[Optional[np.ndarray]] = []
+    valid_indices: list[int] = []
+    for idx, emb in enumerate(embeddings):
+        if emb is None or emb.size == 0:
+            norm_embs.append(None)
+            continue
+        vec = np.asarray(emb, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1e-8 or not np.isfinite(norm):
+            norm_embs.append(None)
+            continue
+        norm_embs.append(vec / norm)
+        valid_indices.append(idx)
+
+    if not valid_indices:
+        return smooth_diarization_segments(
+            [DiarizationSegment(s.start, s.end, 0) for s in segments],
+            merge_gap_sec=merge_gap_sec,
+        )
+
+    min_needed = max(2, target_k or 2)
+    anchor_idx = [i for i in valid_indices if durations[i] >= 2.0]
+    if len(anchor_idx) < min_needed:
+        anchor_idx = [i for i in valid_indices if durations[i] >= 1.2]
+    if not anchor_idx:
+        anchor_idx = list(valid_indices)
+
+    def _compute_centroid(member_ids: list[int]) -> np.ndarray:
+        acc = np.zeros_like(norm_embs[member_ids[0]])
+        for m_idx in member_ids:
+            emb_vec = norm_embs[m_idx]
+            if emb_vec is not None:
+                acc += min(max(durations[m_idx], 0.25), 8.0) * emb_vec
+        nrm = float(np.linalg.norm(acc))
+        return acc / max(nrm, 1e-12)
+
+    clusters: list[list[int]] = [[i] for i in anchor_idx]
+
+    while len(clusters) > 1:
+        if target_k is not None and len(clusters) <= target_k:
+            break
+
+        cent_mat = np.stack([_compute_centroid(c) for c in clusters], axis=0)
+        sim_mat = cent_mat @ cent_mat.T
+        np.fill_diagonal(sim_mat, -2.0)
+
+        flat_best = int(np.argmax(sim_mat))
+        bi, bj = divmod(flat_best, sim_mat.shape[1])
+        best_sim = float(sim_mat[bi, bj])
+
+        if target_k is None:
+            if mode == "4+" and len(clusters) <= 4 and best_sim < max(eff_sim_thr, 0.64):
+                break
+            if best_sim < eff_sim_thr:
+                break
+
+        if bi > bj:
+            bi, bj = bj, bi
+        clusters[bi].extend(clusters[bj])
+        clusters.pop(bj)
+
+    # Absorb isolated 1-segment overlap/laugh outlier anchors on longer recordings
+    if target_k is None and len(clusters) > 1:
+        cluster_durs = [sum(durations[i] for i in c) for c in clusters]
+        total_anchor_dur = sum(cluster_durs)
+        if total_anchor_dur >= 25.0:
+            min_keep_dur = min(6.0, max(2.5, 0.012 * total_anchor_dur))
+            major_ids = [
+                ci
+                for ci, c_dur in enumerate(cluster_durs)
+                if c_dur >= min_keep_dur or len(clusters[ci]) >= 2
+            ]
+            if major_ids and len(major_ids) < len(clusters):
+                major_cents = {ci: _compute_centroid(clusters[ci]) for ci in major_ids}
+                to_drop: set[int] = set()
+                for ci in range(len(clusters)):
+                    if ci in major_cents:
+                        continue
+                    c_vec = _compute_centroid(clusters[ci])
+                    best_m = max(major_ids, key=lambda m: float(np.dot(c_vec, major_cents[m])))
+                    best_m_sim = float(np.dot(c_vec, major_cents[best_m]))
+                    if best_m_sim >= 0.36 or cluster_durs[ci] < 3.0:
+                        clusters[best_m].extend(clusters[ci])
+                        to_drop.add(ci)
+                if to_drop:
+                    clusters = [c for ci, c in enumerate(clusters) if ci not in to_drop]
+
+    def _assign_to_centroids(cent_mat: np.ndarray) -> list[int]:
+        assigned_ids: list[int] = []
+        prev_spk: Optional[int] = None
+        for idx, emb_vec in enumerate(norm_embs):
+            if emb_vec is None:
+                spk = prev_spk if prev_spk is not None else 0
+            else:
+                sims = cent_mat @ emb_vec
+                if (
+                    prev_spk is not None
+                    and prev_spk < len(sims)
+                    and durations[idx] < 1.5
+                    and (segments[idx].start - segments[idx - 1].end) <= 1.0
+                ):
+                    sims = sims.copy()
+                    sims[prev_spk] += 0.04
+                spk = int(np.argmax(sims))
+            assigned_ids.append(spk)
+            prev_spk = spk
+        return assigned_ids
+
+    cent_mat = np.stack([_compute_centroid(c) for c in clusters], axis=0)
+    assigned = _assign_to_centroids(cent_mat)
+
+    # Refinement pass: recompute centroids from >=1.5s assigned segments & re-check merges
+    if len(clusters) > 1:
+        refined_groups: list[list[int]] = []
+        for k in range(len(clusters)):
+            strong_members = [
+                i
+                for i, spk in enumerate(assigned)
+                if spk == k and norm_embs[i] is not None and durations[i] >= 1.5
+            ]
+            if not strong_members:
+                strong_members = [
+                    i for i, spk in enumerate(assigned) if spk == k and norm_embs[i] is not None
+                ]
+            if strong_members:
+                refined_groups.append(strong_members)
+
+        if len(refined_groups) >= 2:
+            while target_k is None and len(refined_groups) > 1:
+                if mode == "4+" and len(refined_groups) <= 4:
+                    break
+                r_mat = np.stack([_compute_centroid(g) for g in refined_groups], axis=0)
+                r_sim = r_mat @ r_mat.T
+                np.fill_diagonal(r_sim, -2.0)
+                flat_best = int(np.argmax(r_sim))
+                bi, bj = divmod(flat_best, r_sim.shape[1])
+                if float(r_sim[bi, bj]) < eff_sim_thr:
+                    break
+                if bi > bj:
+                    bi, bj = bj, bi
+                refined_groups[bi].extend(refined_groups[bj])
+                refined_groups.pop(bj)
+
+            cent_mat = np.stack([_compute_centroid(g) for g in refined_groups], axis=0)
+            assigned = _assign_to_centroids(cent_mat)
+
+    out_segments = [
+        DiarizationSegment(start=s.start, end=s.end, speaker=assigned[i])
+        for i, s in enumerate(segments)
+    ]
+    smoothed = smooth_diarization_segments(out_segments, merge_gap_sec=merge_gap_sec)
+    if target_k is None:
+        smoothed = consolidate_minor_speakers(smoothed, merge_gap_sec=merge_gap_sec)
+    return smoothed
+
 
 
 def split_audio_ranges_at_silence(
@@ -223,15 +581,16 @@ def split_audio_ranges_at_silence(
 def build_speaker_asr_windows(
     diar_segments: list[DiarizationSegment],
     total_dur: float,
-    max_same_speaker_sec: float = 28.0,
-    merge_gap_sec: float = 1.2,
+    max_same_speaker_sec: float = 27.0,
+    merge_gap_sec: float = 1.8,
     pad_sec: float = 0.2,
 ) -> list[tuple[float, float]]:
     """
-    Groups consecutive same-speaker diarization segments into non-overlapping
-    ASR windows without ever merging across speaker changes. Ensures Whisper
-    performs fresh language detection per speaker turn when interlocutors speak
-    different languages inside the same 30-second interval.
+    Packs diarization segments into efficient <=27s Whisper windows while still
+    splitting substantial multi-sentence turns across different speakers (>=6s
+    followed by >=2.5s) for independent per-speaker language detection. Short
+    backchannels ('угу', 'да') are packed together to avoid wasting full 30s
+    Whisper Encoder passes on 1-second remarks.
     """
     if not diar_segments or total_dur <= 0.0:
         return []
@@ -246,12 +605,22 @@ def build_speaker_asr_windows(
     grouped: list[list[float | int]] = [[ordered[0].start, ordered[0].end, ordered[0].speaker]]
     for seg in ordered[1:]:
         prev_start, prev_end, prev_spk = grouped[-1]
+        gap = seg.start - prev_end
+        combined_span = seg.end - prev_start
+        cur_group_dur = prev_end - prev_start
+        next_seg_dur = seg.end - seg.start
+
+        same_speaker_ok = seg.speaker == prev_spk
+        short_exchange_ok = (cur_group_dur < 6.0) or (next_seg_dur < 2.5)
+
         if (
-            seg.speaker == prev_spk
-            and (seg.start - prev_end) <= merge_gap_sec
-            and (seg.end - prev_start) <= max_same_speaker_sec
+            gap <= merge_gap_sec
+            and combined_span <= max_same_speaker_sec
+            and (same_speaker_ok or short_exchange_ok)
         ):
             grouped[-1][1] = max(prev_end, seg.end)
+            if not same_speaker_ok and next_seg_dur > cur_group_dur:
+                grouped[-1][2] = seg.speaker
         else:
             grouped.append([seg.start, seg.end, seg.speaker])
 
@@ -331,7 +700,7 @@ def _join_unit_texts(pieces: list[str]) -> str:
     compact = " ".join(raw.split())
     for punct in (".", ",", "!", "?", ":", ";"):
         compact = compact.replace(f" {punct}", punct)
-    return compact.strip()
+    return clean_hallucinated_text(compact.strip())
 
 
 def align_units_to_speakers(
@@ -357,9 +726,9 @@ def align_units_to_speakers(
         t_end = non_empty_units[0].end
         for u in non_empty_units:
             if buf_texts and (u.start - t_end) > pause_break_sec:
-                merged_turns.append(
-                    SpeakerTurn(t_start, t_end, "Спикер 1", _join_unit_texts(buf_texts))
-                )
+                joined = _join_unit_texts(buf_texts)
+                if joined:
+                    merged_turns.append(SpeakerTurn(t_start, t_end, "Спикер 1", joined))
                 buf_texts = [u.text]
                 t_start = u.start
                 t_end = u.end
@@ -367,10 +736,10 @@ def align_units_to_speakers(
                 buf_texts.append(u.text)
                 t_end = max(t_end, u.end)
         if buf_texts:
-            merged_turns.append(
-                SpeakerTurn(t_start, t_end, "Спикер 1", _join_unit_texts(buf_texts))
-            )
-        return merged_turns, 1
+            joined = _join_unit_texts(buf_texts)
+            if joined:
+                merged_turns.append(SpeakerTurn(t_start, t_end, "Спикер 1", joined))
+        return merged_turns, (1 if merged_turns else 0)
 
     seg_ends = [s.end for s in diar_segments]
     prev_spk: Optional[int] = None
@@ -422,13 +791,7 @@ def align_units_to_speakers(
         prev_spk = chosen_spk
         assigned.append((u, chosen_spk))
 
-    # Chronological speaker mapping: first speaker heard -> Спикер 1, etc.
-    speaker_map: dict[int, str] = {}
-    for _, raw_spk in assigned:
-        if raw_spk not in speaker_map:
-            speaker_map[raw_spk] = f"Спикер {len(speaker_map) + 1}"
-
-    turns: list[SpeakerTurn] = []
+    raw_turns: list[tuple[float, float, int, str]] = []
     cur_spk_raw = assigned[0][1]
     cur_start = assigned[0][0].start
     cur_end = assigned[0][0].end
@@ -439,14 +802,7 @@ def align_units_to_speakers(
         if raw_spk != cur_spk_raw or gap > pause_break_sec:
             text_out = _join_unit_texts(cur_pieces)
             if text_out:
-                turns.append(
-                    SpeakerTurn(
-                        start=cur_start,
-                        end=cur_end,
-                        speaker_label=speaker_map[cur_spk_raw],
-                        text=text_out,
-                    )
-                )
+                raw_turns.append((cur_start, cur_end, cur_spk_raw, text_out))
             cur_spk_raw = raw_spk
             cur_start = u.start
             cur_end = max(u.start, u.end)
@@ -457,12 +813,23 @@ def align_units_to_speakers(
 
     last_text = _join_unit_texts(cur_pieces)
     if last_text:
+        raw_turns.append((cur_start, cur_end, cur_spk_raw, last_text))
+
+    if not raw_turns:
+        return [], 0
+
+    # Chronological speaker mapping over real speech turns: first speaker heard -> Спикер 1
+    speaker_map: dict[int, str] = {}
+    turns: list[SpeakerTurn] = []
+    for t_start, t_end, raw_spk, text_out in raw_turns:
+        if raw_spk not in speaker_map:
+            speaker_map[raw_spk] = f"Спикер {len(speaker_map) + 1}"
         turns.append(
             SpeakerTurn(
-                start=cur_start,
-                end=cur_end,
-                speaker_label=speaker_map[cur_spk_raw],
-                text=last_text,
+                start=t_start,
+                end=t_end,
+                speaker_label=speaker_map[raw_spk],
+                text=text_out,
             )
         )
 
@@ -477,7 +844,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.0.0)",
+        "# Транскрибация интервью (Interview Anonymizer v4.1.0)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -522,18 +889,98 @@ class _ModelCache:
             return cls.active_engine
 
 
-def _detect_ct2_device() -> tuple[str, str]:
-    forced_device = os.environ.get("ASR_DEVICE", "").strip().lower()
-    if forced_device in ("cpu", "cuda"):
-        device = forced_device
-    else:
-        try:
-            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
-        except Exception:
-            device = "cpu"
+_nvidia_libs_loaded = False
 
-    compute_type = "int8_float16" if device == "cuda" else "int8"
-    return device, compute_type
+
+def _preload_nvidia_pip_libs() -> None:
+    """
+    Ensures pip-installed NVIDIA cuBLAS shared libraries (nvidia-cublas-cu12)
+    are visible to CTranslate2's dynamic dlopen() both in local virtualenvs and
+    inside Docker containers without requiring manual LD_LIBRARY_PATH exports.
+    """
+    global _nvidia_libs_loaded
+    if _nvidia_libs_loaded:
+        return
+    _nvidia_libs_loaded = True
+
+    search_roots = list(site.getsitepackages())
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str):
+        search_roots.append(user_site)
+    # Also include active virtualenv site-packages relative to sys.prefix
+    for pattern in ("lib/python*/site-packages", "Lib/site-packages"):
+        search_roots.extend(glob.glob(os.path.join(sys.prefix, pattern)))
+
+    for root in search_roots:
+        for sub in ("cublas", "cuda_nvrtc"):
+            lib_dir = os.path.join(root, "nvidia", sub, "lib")
+            bin_dir = os.path.join(root, "nvidia", sub, "bin")
+            for cand_dir in (lib_dir, bin_dir):
+                if not os.path.isdir(cand_dir):
+                    continue
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(cand_dir)
+                    except OSError:
+                        pass
+                else:
+                    # Load cublasLt before cublas with RTLD_GLOBAL so soname lookup succeeds
+                    for pat in ("libcublasLt.so*", "libcublas.so*", "libnvrtc.so*"):
+                        for so_path in sorted(glob.glob(os.path.join(cand_dir, pat))):
+                            try:
+                                ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+                            except OSError:
+                                pass
+
+
+def probe_cuda_available() -> bool:
+    """
+    Returns True if at least one NVIDIA CUDA GPU and a compatible cuBLAS 12
+    runtime are usable by CTranslate2 in the current process.
+    """
+    _preload_nvidia_pip_libs()
+    try:
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False
+        supported = ctranslate2.get_supported_compute_types("cuda")
+        if not supported:
+            return False
+        if sys.platform.startswith("linux"):
+            ctypes.CDLL("libcublas.so.12")
+        return True
+    except Exception:
+        return False
+
+
+def resolve_compute_device(
+    requested_device: Optional[str] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[str, str]:
+    """
+    Resolves user-selected compute device ('cpu' or 'cuda') into a concrete
+    (device, compute_type) pair for CTranslate2, falling back safely to CPU if
+    CUDA is unavailable.
+    """
+    req = (requested_device or os.environ.get("ASR_DEVICE") or DEFAULT_COMPUTE_DEVICE).strip().lower()
+    if req not in COMPUTE_DEVICE_OPTIONS and req != "auto":
+        req = DEFAULT_COMPUTE_DEVICE
+
+    if req == "cpu":
+        return "cpu", "int8"
+
+    if probe_cuda_available():
+        try:
+            supported = ctranslate2.get_supported_compute_types("cuda")
+        except Exception:
+            supported = set()
+        for preferred in ("int8_float16", "float16", "int8", "float32"):
+            if preferred in supported:
+                return "cuda", preferred
+        return "cuda", "float16"
+
+    if req == "cuda" and status_cb:
+        status_cb("Видеокарта CUDA недоступна в текущем окружении — переключение на CPU...")
+    return "cpu", "int8"
 
 
 class Transcriber:
@@ -542,7 +989,53 @@ class Transcriber:
     """
 
     @staticmethod
+    def _extract_segment_embedding(
+        extractor: sherpa_onnx.SpeakerEmbeddingExtractor,
+        samples: np.ndarray,
+        start_sec: float,
+        end_sec: float,
+        sample_rate: int = 16000,
+    ) -> Optional[np.ndarray]:
+        dur = end_sec - start_sec
+        pad = 0.06 if dur < 1.2 else 0.0
+        s_idx = max(0, int((start_sec - pad) * sample_rate))
+        e_idx = min(len(samples), int((end_sec + pad) * sample_rate))
+        seg_wav = samples[s_idx:e_idx]
+        if seg_wav.size < int(0.18 * sample_rate):
+            return None
+
+        def _embed_slice(wav_slice: np.ndarray) -> Optional[np.ndarray]:
+            stream = extractor.create_stream()
+            stream.accept_waveform(sample_rate, wav_slice)
+            stream.input_finished()
+            if not extractor.is_ready(stream):
+                return None
+            raw_vec = np.asarray(extractor.compute(stream), dtype=np.float32).reshape(-1)
+            nrm = float(np.linalg.norm(raw_vec))
+            if nrm <= 1e-8 or not np.isfinite(nrm):
+                return None
+            return raw_vec / nrm
+
+        max_win = 5 * sample_rate
+        if seg_wav.size <= 8 * sample_rate:
+            return _embed_slice(seg_wav)
+
+        # Average up to 3 evenly spaced 5s windows on long monologues
+        starts = np.linspace(0, seg_wav.size - max_win, num=3, dtype=int)
+        sub_vecs = []
+        for st in starts:
+            v = _embed_slice(seg_wav[st : st + max_win])
+            if v is not None:
+                sub_vecs.append(v)
+        if not sub_vecs:
+            return None
+        mean_vec = np.mean(sub_vecs, axis=0)
+        nrm = float(np.linalg.norm(mean_vec))
+        return mean_vec / max(nrm, 1e-12)
+
+    @classmethod
     def _run_diarization(
+        cls,
         samples: np.ndarray,
         seg_model_path: str,
         emb_model_path: str,
@@ -556,16 +1049,11 @@ class Transcriber:
         diar_threads = max(1, min(int(threads), 8))
         mode = (speaker_count or "auto").strip().lower()
 
-        if mode in ("2", "3"):
-            num_clusters = int(mode)
-            threshold = DIARIZATION_CLUSTER_THRESHOLD
-        elif mode == "4+":
-            num_clusters = -1
-            threshold = DIARIZATION_MULTI_SPEAKER_THRESHOLD
-        else:
-            num_clusters = -1
-            threshold = DIARIZATION_CLUSTER_THRESHOLD
-
+        # Pass 1: High-recall speaker-turn boundary detection via pyannote-segmentation-3.0.
+        # Note: sherpa-onnx's built-in FastClustering uses Complete Linkage, which shatters
+        # real speakers into 50+ clusters on long interviews; therefore we use a tight
+        # local threshold here ONLY to prevent cross-speaker turn merges, then extract clean
+        # full-turn CAM++ voiceprints and cluster via Anchor-Centroid clustering.
         config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
             segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
@@ -580,10 +1068,10 @@ class Transcriber:
                 provider="cpu",
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
-                num_clusters=num_clusters,
-                threshold=threshold,
+                num_clusters=-1,
+                threshold=DIARIZATION_SEGMENTATION_THRESHOLD,
             ),
-            min_duration_on=0.25,
+            min_duration_on=0.30,
             min_duration_off=0.45,
         )
 
@@ -594,9 +1082,9 @@ class Transcriber:
         def _progress_cb(done_chunks: int, total_chunks: int) -> int:
             nonlocal last_pct, last_log_t
             if status_cb and total_chunks > 0:
-                pct = int((done_chunks * 100) / total_chunks)
+                pct = int((done_chunks * 85) / total_chunks)
                 now = time.time()
-                if pct >= last_pct + 25 and (now - last_log_t) >= 2.0:
+                if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
                     last_pct = pct
                     last_log_t = now
                     status_cb(f"Диаризация спикеров: {pct}%...")
@@ -604,23 +1092,73 @@ class Transcriber:
 
         result = sd.process(samples, callback=_progress_cb)
         raw_objs = result.sort_by_start_time()
-        raw_segments = [
-            DiarizationSegment(start=float(s.start), end=float(s.end), speaker=int(s.speaker))
-            for s in raw_objs
+
+        # Filter out synthetic call-waiting / dial-tone ringback beeps before clustering
+        speech_segments: list[DiarizationSegment] = []
+        for s in raw_objs:
+            st = float(s.start)
+            en = float(s.end)
+            if en <= st:
+                continue
+            s_idx = max(0, int(st * 16000))
+            e_idx = min(len(samples), int(en * 16000))
+            if is_narrowband_tone(samples[s_idx:e_idx], sample_rate=16000):
+                continue
+            speech_segments.append(DiarizationSegment(start=st, end=en, speaker=int(s.speaker)))
+
+        if not speech_segments:
+            return []
+
+        # Merge micro-pauses (<=0.45s) within the same local turn up to 10s for cleaner embeddings
+        pre_merged: list[DiarizationSegment] = [
+            DiarizationSegment(
+                speech_segments[0].start, speech_segments[0].end, speech_segments[0].speaker
+            )
         ]
-        return smooth_diarization_segments(raw_segments)
+        for cur in speech_segments[1:]:
+            prev = pre_merged[-1]
+            if (
+                cur.speaker == prev.speaker
+                and (cur.start - prev.end) <= 0.45
+                and (cur.end - prev.start) <= 10.0
+            ):
+                prev.end = max(prev.end, cur.end)
+            else:
+                pre_merged.append(DiarizationSegment(cur.start, cur.end, cur.speaker))
+
+        if status_cb and len(pre_merged) > 30:
+            status_cb("Диаризация спикеров: 90% (сопоставление голосовых отпечатков)...")
+
+        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
+            sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                model=emb_model_path,
+                num_threads=diar_threads,
+                provider="cpu",
+            )
+        )
+        embeddings = [
+            cls._extract_segment_embedding(extractor, samples, seg.start, seg.end, sample_rate=16000)
+            for seg in pre_merged
+        ]
+
+        return cluster_anchor_embeddings(
+            segments=pre_merged,
+            embeddings=embeddings,
+            speaker_count=mode,
+        )
 
     @staticmethod
-    def _run_faster_whisper(
+    def _decode_whisper_windows(
         samples: np.ndarray,
         sample_rate: int,
         model_dir: str,
         profile_id: str,
-        diar_segments: Optional[list[DiarizationSegment]] = None,
-        threads: int = 4,
-        status_cb: Optional[Callable[[str], None]] = None,
+        device: str,
+        compute_type: str,
+        diar_segments: Optional[list[DiarizationSegment]],
+        threads: int,
+        status_cb: Optional[Callable[[str], None]],
     ) -> list[TimedUnit]:
-        device, compute_type = _detect_ct2_device()
         cpu_threads = max(1, int(threads)) if device == "cpu" else 2
         cache_key = ("faster_whisper", profile_id, model_dir, device, compute_type, cpu_threads)
 
@@ -643,6 +1181,7 @@ class Transcriber:
         else:
             used_diar_windows = True
 
+        beam_size = 4 if device == "cuda" else 2
         units: list[TimedUnit] = []
         last_pct = -15
         last_log_t = time.time()
@@ -663,7 +1202,9 @@ class Transcriber:
                 vad_filter=use_vad,
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
-                beam_size=5,
+                compression_ratio_threshold=2.2,
+                log_prob_threshold=-1.0,
+                beam_size=beam_size,
             )
             if use_vad:
                 transcribe_kwargs["vad_parameters"] = dict(
@@ -674,10 +1215,25 @@ class Transcriber:
             segments_iter, _ = model.transcribe(samples[s_idx:e_idx], **transcribe_kwargs)
 
             for seg in segments_iter:
+                abs_seg_start = w_start + float(seg.start)
                 abs_seg_end = min(w_end, w_start + float(seg.end))
+
+                if getattr(seg, "no_speech_prob", 0.0) > 0.75 and getattr(seg, "avg_logprob", 0.0) < -0.9:
+                    continue
+
+                if not used_diar_windows:
+                    seg_s = max(0, int(abs_seg_start * sample_rate))
+                    seg_e = min(len(samples), int(abs_seg_end * sample_rate))
+                    if is_narrowband_tone(samples[seg_s:seg_e], sample_rate=sample_rate):
+                        continue
+
+                cleaned_seg_text = clean_hallucinated_text(seg.text or "")
+                if not cleaned_seg_text:
+                    continue
+
                 if seg.words:
                     for w in seg.words:
-                        if w.word and w.word.strip():
+                        if w.word and w.word.strip() and not is_repetitive_noise_token(w.word):
                             units.append(
                                 TimedUnit(
                                     start=w_start + float(w.start),
@@ -685,12 +1241,12 @@ class Transcriber:
                                     text=w.word,
                                 )
                             )
-                elif seg.text and seg.text.strip():
+                else:
                     units.append(
                         TimedUnit(
-                            start=w_start + float(seg.start),
+                            start=abs_seg_start,
                             end=abs_seg_end,
-                            text=seg.text,
+                            text=cleaned_seg_text,
                         )
                     )
 
@@ -705,6 +1261,48 @@ class Transcriber:
                         )
 
         return units
+
+    @classmethod
+    def _run_faster_whisper(
+        cls,
+        samples: np.ndarray,
+        sample_rate: int,
+        model_dir: str,
+        profile_id: str,
+        diar_segments: Optional[list[DiarizationSegment]] = None,
+        threads: int = 4,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        status_cb: Optional[Callable[[str], None]] = None,
+    ) -> list[TimedUnit]:
+        device, compute_type = resolve_compute_device(compute_device, status_cb=status_cb)
+        try:
+            return cls._decode_whisper_windows(
+                samples=samples,
+                sample_rate=sample_rate,
+                model_dir=model_dir,
+                profile_id=profile_id,
+                device=device,
+                compute_type=compute_type,
+                diar_segments=diar_segments,
+                threads=threads,
+                status_cb=status_cb,
+            )
+        except RuntimeError as err:
+            if device == "cuda":
+                if status_cb:
+                    status_cb(f"Ошибка CUDA ({err}) — автоматический переход на CPU...")
+                return cls._decode_whisper_windows(
+                    samples=samples,
+                    sample_rate=sample_rate,
+                    model_dir=model_dir,
+                    profile_id=profile_id,
+                    device="cpu",
+                    compute_type="int8",
+                    diar_segments=diar_segments,
+                    threads=threads,
+                    status_cb=status_cb,
+                )
+            raise
 
     @staticmethod
     def _run_sherpa_parakeet(
@@ -783,6 +1381,8 @@ class Transcriber:
         asr_model: str = DEFAULT_ASR_MODEL,
         speaker_count: str = "auto",
         threads: int = 4,
+        diar_threads: Optional[int] = None,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
         status_cb: Optional[Callable[[str], None]] = None,
     ) -> dict:
         """
@@ -823,6 +1423,7 @@ class Transcriber:
         asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
 
         # 2. Speaker Diarization
+        eff_diar_threads = diar_threads if diar_threads is not None else threads
         update(f"Разделение говорящих по ролям (режим спикеров: {speaker_count})...")
         t_diar = time.time()
         diar_segments = cls._run_diarization(
@@ -830,7 +1431,7 @@ class Transcriber:
             seg_model_path=seg_onnx,
             emb_model_path=emb_onnx,
             speaker_count=speaker_count,
-            threads=threads,
+            threads=eff_diar_threads,
             status_cb=update,
         )
         detected_raw_speakers = len({s.speaker for s in diar_segments})
@@ -840,9 +1441,12 @@ class Transcriber:
         )
 
         # 3. Multilingual Speech Recognition
-        update(f"Локальная транскрибация речи ({profile['short_name']})...")
+        req_dev = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
         t_asr = time.time()
         if profile["engine"] == "faster_whisper":
+            eff_dev, _ = resolve_compute_device(req_dev)
+            dev_label = "GPU CUDA" if eff_dev == "cuda" else "CPU"
+            update(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
             units = cls._run_faster_whisper(
                 samples=samples,
                 sample_rate=sample_rate,
@@ -850,9 +1454,15 @@ class Transcriber:
                 profile_id=profile_id,
                 diar_segments=diar_segments,
                 threads=threads,
+                compute_device=req_dev,
                 status_cb=update,
             )
         elif profile["engine"] == "sherpa_parakeet":
+            if req_dev == "cuda":
+                update(
+                    "Модель Parakeet оптимизирована под CPU (INT8); для GPU рекомендуется Whisper Turbo."
+                )
+            update(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
             units = cls._run_sherpa_parakeet(
                 samples=samples,
                 sample_rate=sample_rate,
@@ -888,3 +1498,4 @@ class Transcriber:
             "num_turns": len(turns),
             "elapsed": total_elapsed,
         }
+

@@ -4,7 +4,9 @@ import sys
 
 from src.config import (
     ASR_MODEL_PROFILES,
+    COMPUTE_DEVICE_OPTIONS,
     DEFAULT_ASR_MODEL,
+    DEFAULT_COMPUTE_DEVICE,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     SPEAKER_COUNT_OPTIONS,
@@ -16,7 +18,7 @@ from src.orchestrator import Orchestrator
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Interview Anonymizer v4.0.0 (Blur faces, pitch shift audio, and local role-split transcription)"
+        description="Interview Anonymizer v4.1.0 (Blur faces, pitch shift audio, and local role-split transcription)"
     )
     parser.add_argument("-i", "--input", required=True, help="Path to input video (.mp4)")
     parser.add_argument("-o", "--output", required=True, help="Path to output anonymized video (.mp4)")
@@ -44,6 +46,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Speaker count hint for diarization (default: auto)",
     )
     parser.add_argument(
+        "--device",
+        choices=COMPUTE_DEVICE_OPTIONS,
+        default=DEFAULT_COMPUTE_DEVICE,
+        help=f"Compute device for transcription: cpu or cuda (default: {DEFAULT_COMPUTE_DEVICE})",
+    )
+    parser.add_argument(
         "-w",
         "--workers",
         type=int,
@@ -60,6 +68,7 @@ def process_video(
     transcript_path: str | None = None,
     asr_model: str = DEFAULT_ASR_MODEL,
     speaker_count: str = "auto",
+    compute_device: str = DEFAULT_COMPUTE_DEVICE,
     workers: int = MAX_WORKERS,
 ) -> dict:
     io_manager = IOManager()
@@ -76,6 +85,7 @@ def process_video(
             transcript_path=transcript_path,
             asr_model=asr_model,
             speaker_count=speaker_count,
+            compute_device=compute_device,
         )
         if result.get("transcript_ready") and result.get("transcript_path"):
             print(f"Transcript saved to: {result['transcript_path']}")
@@ -105,6 +115,7 @@ def main():
         transcript_path=args.transcript_output,
         asr_model=args.asr_model,
         speaker_count=args.speakers,
+        compute_device=args.device,
         workers=args.workers,
     )
 
