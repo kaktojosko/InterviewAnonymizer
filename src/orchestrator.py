@@ -6,7 +6,13 @@ from src.io_manager import IOManager
 from src.ffmpeg_utils import FFmpegUtils
 from src.audio_processor import AudioProcessor
 from src.video_processor import VideoProcessor
-from src.config import MAX_WORKERS, CHUNK_DURATION_SECONDS
+from src.config import (
+    ASR_MODEL_PROFILES,
+    CHUNK_DURATION_SECONDS,
+    DEFAULT_ASR_MODEL,
+    MAX_WORKERS,
+    TRANSCRIPTION_ENABLED_DEFAULT,
+)
 
 # Глобальная переменная для воркера, чтобы не пересоздавать модель
 _worker_vp = None
@@ -27,7 +33,17 @@ def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int,
 
 class Orchestrator:
     @staticmethod
-    def process_video_job(input_path: str, output_path: str, job_dir: str, status_cb=None, worker_count: int | None = None):
+    def process_video_job(
+        input_path: str,
+        output_path: str,
+        job_dir: str,
+        status_cb=None,
+        worker_count: int | None = None,
+        transcribe: bool = TRANSCRIPTION_ENABLED_DEFAULT,
+        transcript_path: str | None = None,
+        asr_model: str = DEFAULT_ASR_MODEL,
+        speaker_count: str = "auto",
+    ) -> dict:
         def update(msg):
             print(msg)
             if status_cb:
@@ -38,6 +54,10 @@ class Orchestrator:
         workers = max(1, worker_count or MAX_WORKERS)
         
         audio_pitched_path = os.path.join(job_dir, "audio_pitched.wav")
+        audio_16k_path = os.path.join(job_dir, "audio_16k.wav")
+        if transcribe and not transcript_path:
+            stem, _ = os.path.splitext(output_path)
+            transcript_path = f"{stem}_transcript.txt"
         
         # 1. Probe (Metadata)
         update("Анализ видеофайла...")
@@ -48,10 +68,15 @@ class Orchestrator:
         
         # 2. Parallel Audio & Split Video
         audio_future = None
-        audio_executor = ThreadPoolExecutor(max_workers=1)
+        transcribe_extract_future = None
+        audio_executor = ThreadPoolExecutor(max_workers=2)
         if has_audio:
             update("Запуск обработки аудио (в фоне)...")
             audio_future = audio_executor.submit(AudioProcessor.process, input_path, audio_pitched_path, sample_rate)
+            if transcribe:
+                transcribe_extract_future = audio_executor.submit(
+                    FFmpegUtils.extract_transcription_audio, input_path, audio_16k_path
+                )
             
         update("Разделение видео для параллельной обработки...")
         t0 = time.time()
@@ -142,19 +167,61 @@ class Orchestrator:
         
         # 5. Wait for Audio
         final_audio_path = None
-        if has_audio and audio_future:
-            update("Ожидание завершения обработки аудио...")
-            t0 = time.time()
-            audio_success = audio_future.result()
-            update(f"[Profile] Audio wait finished in {time.time() - t0:.2f}s")
-            if audio_success:
-                final_audio_path = audio_pitched_path
-            audio_executor.shutdown()
+        raw_wav_ready = False
+        try:
+            if has_audio and audio_future:
+                update("Ожидание завершения обработки аудио...")
+                t0 = time.time()
+                audio_success = audio_future.result()
+                update(f"[Profile] Audio wait finished in {time.time() - t0:.2f}s")
+                if audio_success:
+                    final_audio_path = audio_pitched_path
+            if transcribe_extract_future is not None:
+                raw_wav_ready = bool(transcribe_extract_future.result())
+        finally:
+            audio_executor.shutdown(wait=True)
         
         # 6. Mux final result
         update("Сборка финального видео...")
         t0 = time.time()
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         FFmpegUtils.mux(video_blurred_path, final_audio_path, output_path)
         update(f"[Profile] Mux finished in {time.time() - t0:.2f}s")
+
+        # 7. Local Auto-Transcription with Speaker Diarization (if enabled)
+        transcript_ready = False
+        if transcribe and transcript_path:
+            from src.transcriber import Transcriber, format_transcript_txt
+
+            profile_info = ASR_MODEL_PROFILES.get(asr_model, ASR_MODEL_PROFILES[DEFAULT_ASR_MODEL])
+            if not has_audio or not raw_wav_ready:
+                update("Аудиодорожка отсутствует — формирование пустого файла транскрибации...")
+                os.makedirs(os.path.dirname(os.path.abspath(transcript_path)), exist_ok=True)
+                empty_txt = format_transcript_txt(
+                    turns=[],
+                    duration_sec=duration,
+                    model_name=profile_info["short_name"],
+                    num_speakers=0,
+                    note="[Аудиодорожка в исходном видео отсутствует]",
+                )
+                with open(transcript_path, "w", encoding="utf-8") as f:
+                    f.write(empty_txt)
+                transcript_ready = True
+            else:
+                update("Запуск локальной автотранскрибации по ролям...")
+                Transcriber.transcribe_audio_file(
+                    wav_path=audio_16k_path,
+                    output_txt_path=transcript_path,
+                    asr_model=asr_model,
+                    speaker_count=speaker_count,
+                    threads=workers,
+                    status_cb=update,
+                )
+                transcript_ready = os.path.isfile(transcript_path)
         
         update(f"Success! Output saved to: {output_path}. Total time: {time.time() - total_start_time:.2f}s")
+        return {
+            "video_ready": os.path.isfile(output_path),
+            "transcript_ready": transcript_ready,
+            "transcript_path": transcript_path if transcript_ready else None,
+        }

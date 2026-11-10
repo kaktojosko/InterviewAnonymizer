@@ -4,6 +4,8 @@ import multiprocessing
 # Base paths
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
+MODELS_DIR = os.environ.get("MODELS_DIR", os.path.join(BASE_DIR, "models"))
+PRELOADED_MODELS_DIR = os.environ.get("PRELOADED_MODELS_DIR", "/opt/preloaded_models")
 
 # Video Processing Settings
 FACE_PADDING_PERCENT_X = 0.35
@@ -35,3 +37,64 @@ MAX_WORKERS = max(1, min(MAX_ALLOWED_WORKERS, int(os.environ.get("VIDEO_MAX_WORK
 
 # Audio Settings
 PITCH_SHIFT_SEMITONES = -2.0
+
+# Local Auto-Transcription & Speaker Diarization Settings
+TRANSCRIPTION_ENABLED_DEFAULT = os.environ.get("TRANSCRIPTION_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+DEFAULT_ASR_MODEL = os.environ.get("DEFAULT_ASR_MODEL", "turbo").strip().lower()
+
+ASR_MODEL_PROFILES = {
+    "turbo": {
+        "id": "turbo",
+        "label": "Точная — Whisper Large v3 Turbo (99 языков, ~810 МБ)",
+        "short_name": "Whisper Large v3 Turbo (INT8)",
+        "engine": "faster_whisper",
+        "repo_id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
+        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
+        "min_total_bytes": 600_000_000,
+    },
+    "parakeet": {
+        "id": "parakeet",
+        "label": "Быстрая CPU — Parakeet TDT 0.6B v3 (25 языков, ~600 МБ)",
+        "short_name": "NVIDIA Parakeet TDT 0.6B v3 (INT8)",
+        "engine": "sherpa_parakeet",
+        "repo_id": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        "required_files": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
+        "allow_patterns": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
+        "min_total_bytes": 400_000_000,
+    },
+    "small": {
+        "id": "small",
+        "label": "Лёгкая — Whisper Small (99 языков, ~245 МБ)",
+        "short_name": "Whisper Small (INT8)",
+        "engine": "faster_whisper",
+        "repo_id": "Systran/faster-whisper-small",
+        "required_files": ["model.bin", "config.json", "tokenizer.json"],
+        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
+        "min_total_bytes": 180_000_000,
+    },
+}
+
+if DEFAULT_ASR_MODEL not in ASR_MODEL_PROFILES:
+    DEFAULT_ASR_MODEL = "turbo"
+
+DIARIZATION_MODELS = {
+    "segmentation": {
+        "repo_id": "csukuangfj/sherpa-onnx-pyannote-segmentation-3-0",
+        "filename": "model.onnx",
+        "min_bytes": 4_000_000,
+    },
+    "embedding": {
+        "repo_id": "csukuangfj/speaker-embedding-models",
+        "filename": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        "min_bytes": 20_000_000,
+    },
+}
+
+SPEAKER_COUNT_OPTIONS = ["auto", "2", "3", "4+"]
+DIARIZATION_CLUSTER_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.65"))
+DIARIZATION_MULTI_SPEAKER_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_THRESHOLD", "0.58"))
+DIARIZATION_MERGE_GAP_SEC = 0.8
+DIARIZATION_MIN_SEGMENT_SEC = 0.2
+TRANSCRIPT_PAUSE_BREAK_SEC = 2.5
+

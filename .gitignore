@@ -2,9 +2,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Virtual environments
 venv/
+.venv/
 env/
 .env
 
@@ -16,6 +18,7 @@ env/
 uploads/
 output/
 tmp/
+/models/
 
 # Media files
 *.mp4

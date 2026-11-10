@@ -9,6 +9,7 @@ services:
       - ./uploads:/app/uploads
       - ./output:/app/output
       - ./tmp:/app/tmp
+      - ./models:/app/models
       # Optional: mount src for hot-reloading in dev
       # - ./src:/app/src
     restart: unless-stopped

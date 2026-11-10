@@ -4,3 +4,6 @@ ffmpeg-python>=0.2.0
 fastapi==0.100.0
 uvicorn==0.23.1
 python-multipart==0.0.6
+faster-whisper>=1.1.0
+sherpa-onnx>=1.10.30
+huggingface-hub>=0.25.0

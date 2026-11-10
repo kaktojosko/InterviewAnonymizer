@@ -40,6 +40,7 @@ const statusSubText = document.getElementById('statusSubText');
 const spinner = document.getElementById('spinner');
 const successIcon = document.getElementById('successIcon');
 const downloadBtn = document.getElementById('downloadBtn');
+const downloadTranscriptBtn = document.getElementById('downloadTranscriptBtn');
 const resetBtn = document.getElementById('resetBtn');
 const debugLog = document.getElementById('debugLog');
 const workerValue = document.getElementById('workerValue');
@@ -47,6 +48,11 @@ const workerSelect = document.getElementById('workerSelect');
 const customWorkerWrap = document.getElementById('customWorkerWrap');
 const customWorkerInput = document.getElementById('customWorkerInput');
 const workerLimitText = document.getElementById('workerLimitText');
+const transcribeToggle = document.getElementById('transcribeToggle');
+const transcribeStateBadge = document.getElementById('transcribeStateBadge');
+const transcribeOptionsWrap = document.getElementById('transcribeOptionsWrap');
+const asrModelSelect = document.getElementById('asrModelSelect');
+const speakerCountSelect = document.getElementById('speakerCountSelect');
 
 let currentTaskId = null;
 let pollInterval = null;
@@ -56,6 +62,11 @@ let selectedWorkers = localStorage.getItem('selectedWorkers') || '4';
 let customWorkers = localStorage.getItem('customWorkers') || '';
 let serverCpuCount = null;
 let serverMaxWorkers = null;
+
+const savedTranscribe = localStorage.getItem('transcribeEnabled');
+let transcribeEnabled = savedTranscribe === null ? true : savedTranscribe !== 'false';
+let selectedAsrModel = localStorage.getItem('selectedAsrModel') || 'turbo';
+let selectedSpeakers = localStorage.getItem('selectedSpeakers') || 'auto';
 
 function stopPolling() {
     if (pollInterval) {
@@ -103,6 +114,27 @@ function renderWorkerControls() {
     const value = getSelectedWorkerValue();
     workerValue.textContent = selectedWorkers === 'custom' ? `Другое${value ? ` (${value})` : ''}` : value;
     validateWorkerSelection();
+}
+
+function renderTranscriptionControls() {
+    transcribeToggle.checked = transcribeEnabled;
+    transcribeOptionsWrap.classList.toggle('hidden', !transcribeEnabled);
+    transcribeStateBadge.textContent = transcribeEnabled ? 'Включена' : 'Выключена';
+    transcribeStateBadge.classList.toggle('off', !transcribeEnabled);
+
+    if (Array.from(asrModelSelect.options).some((opt) => opt.value === selectedAsrModel)) {
+        asrModelSelect.value = selectedAsrModel;
+    } else if (asrModelSelect.options.length > 0) {
+        selectedAsrModel = asrModelSelect.options[0].value;
+        asrModelSelect.value = selectedAsrModel;
+    }
+
+    if (Array.from(speakerCountSelect.options).some((opt) => opt.value === selectedSpeakers)) {
+        speakerCountSelect.value = selectedSpeakers;
+    } else {
+        selectedSpeakers = 'auto';
+        speakerCountSelect.value = 'auto';
+    }
 }
 
 function validateWorkerSelection() {
@@ -164,7 +196,26 @@ async function loadServerConfig() {
         const data = await response.json();
         serverCpuCount = Number(data.cpu_count) || null;
         serverMaxWorkers = Number(data.max_workers) || null;
+
+        if (Array.isArray(data.asr_models) && data.asr_models.length > 0) {
+            asrModelSelect.innerHTML = '';
+            data.asr_models.forEach((model) => {
+                const opt = document.createElement('option');
+                opt.value = model.id;
+                opt.textContent = model.label;
+                asrModelSelect.appendChild(opt);
+            });
+            if (!localStorage.getItem('selectedAsrModel') && data.default_asr_model) {
+                selectedAsrModel = data.default_asr_model;
+            }
+        }
+
+        if (savedTranscribe === null && typeof data.transcription_default === 'boolean') {
+            transcribeEnabled = data.transcription_default;
+        }
+
         applyWorkerAvailability();
+        renderTranscriptionControls();
     } catch (error) {
         console.warn('Could not load server config:', error);
     }
@@ -180,7 +231,24 @@ customWorkerInput.addEventListener('input', () => {
     renderWorkerControls();
 });
 
+transcribeToggle.addEventListener('change', () => {
+    transcribeEnabled = transcribeToggle.checked;
+    localStorage.setItem('transcribeEnabled', String(transcribeEnabled));
+    renderTranscriptionControls();
+});
+
+asrModelSelect.addEventListener('change', () => {
+    selectedAsrModel = asrModelSelect.value;
+    localStorage.setItem('selectedAsrModel', selectedAsrModel);
+});
+
+speakerCountSelect.addEventListener('change', () => {
+    selectedSpeakers = speakerCountSelect.value;
+    localStorage.setItem('selectedSpeakers', selectedSpeakers);
+});
+
 setSelectedWorkers(selectedWorkers);
+renderTranscriptionControls();
 loadServerConfig();
 
 // Drag and drop events
@@ -237,6 +305,9 @@ async function uploadFile(file) {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('workers', workersForUpload);
+    formData.append('transcribe', String(transcribeEnabled));
+    formData.append('asr_model', selectedAsrModel);
+    formData.append('speakers', selectedSpeakers);
 
     try {
         const response = await fetch('/api/upload', {
@@ -297,7 +368,7 @@ async function checkStatus() {
             if (taskFinished) return;
             taskFinished = true;
             stopPolling();
-            showSuccess();
+            showSuccess(data);
         } else if (data.status === 'error') {
             taskFinished = true;
             stopPolling();
@@ -317,21 +388,36 @@ async function checkStatus() {
     }
 }
 
-function showSuccess() {
+function showSuccess(data = {}) {
     spinner.classList.add('hidden');
     successIcon.classList.remove('hidden');
     statusText.textContent = 'Готово!';
-    statusSubText.textContent = 'Ваше видео успешно анонимизировано.';
+
+    const hasTranscript = Boolean(data.transcript_ready);
+    statusSubText.textContent = hasTranscript
+        ? 'Видео анонимизировано, текстовая расшифровка по ролям готова.'
+        : 'Ваше видео успешно анонимизировано.';
+
     downloadBtn.classList.remove('hidden');
+    downloadTranscriptBtn.classList.toggle('hidden', !hasTranscript);
     resetBtn.classList.remove('hidden');
     
     const time = new Date().toLocaleTimeString('ru-RU');
-    debugLog.innerHTML += `<p style="color: #4ade80;">[${time}] Видео готово и доступно к скачиванию!</p>`;
+    const readyNote = hasTranscript
+        ? 'Видео и файл транскрибации (.txt) готовы к скачиванию!'
+        : 'Видео готово и доступно к скачиванию!';
+    debugLog.innerHTML += `<p style="color: #4ade80;">[${time}] ${readyNote}</p>`;
     debugLog.scrollTop = debugLog.scrollHeight;
     
     downloadBtn.onclick = () => {
         window.location.href = `/api/download/${currentTaskId}`;
     };
+
+    if (hasTranscript) {
+        downloadTranscriptBtn.onclick = () => {
+            window.location.href = `/api/download-transcript/${currentTaskId}`;
+        };
+    }
 }
 
 function showError(msg) {
@@ -351,6 +437,7 @@ resetBtn.onclick = () => {
     spinner.classList.remove('hidden');
     successIcon.classList.add('hidden');
     downloadBtn.classList.add('hidden');
+    downloadTranscriptBtn.classList.add('hidden');
     resetBtn.classList.add('hidden');
     debugLog.classList.add('hidden');
     fileInput.value = '';

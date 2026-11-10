@@ -118,3 +118,29 @@ class FFmpegUtils:
             .output(output_path, c='copy')
             .run(overwrite_output=True, quiet=True)
         )
+
+    @staticmethod
+    def extract_transcription_audio(input_path: str, output_wav_path: str) -> bool:
+        """Extracts original 16 kHz mono 16-bit PCM WAV for speaker diarization and ASR."""
+        if not os.path.exists(input_path):
+            return False
+        try:
+            (
+                ffmpeg
+                .input(input_path)
+                .output(
+                    output_wav_path,
+                    map='0:a:0',
+                    vn=None,
+                    ac=1,
+                    ar=16000,
+                    acodec='pcm_s16le',
+                )
+                .run(overwrite_output=True, quiet=True)
+            )
+            return os.path.isfile(output_wav_path) and os.path.getsize(output_wav_path) > 44
+        except ffmpeg.Error as e:
+            err_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
+            print(f"Error extracting transcription audio with FFmpeg: {err_msg}")
+            return False
+

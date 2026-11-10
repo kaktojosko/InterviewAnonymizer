@@ -8,6 +8,7 @@ __pycache__/
 uploads/
 output/
 tmp/
+/models/
 processed/
 jobs/
 *.mp4

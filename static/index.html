@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=8">
+    <link rel="stylesheet" href="/static/style.css?v=9">
 </head>
 <body>
     <div class="container">
@@ -19,7 +19,7 @@
                 </button>
             </div>
             <h1>Анонимизатор</h1>
-            <p>100% Безопасно. 100% Анонимно.</p>
+            <p>100% Безопасно. 100% Локально.</p>
         </header>
 
         <main>
@@ -55,6 +55,40 @@
                     <p class="worker-warning" id="workerLimitText">Количество обработчиков не может превышать (количество ядер * потоки) - 1, чтобы компьютер не выключился от перегрузки.</p>
                     <p class="worker-settings-hint">Максимум воркеров не означает максимальную производительность, учитывайте особенности своей системы.</p>
                 </div>
+
+                <div class="transcription-settings" aria-label="Настройки автотранскрибации">
+                    <div class="transcribe-toggle-row">
+                        <div class="transcribe-title-group">
+                            <label class="worker-settings-title" for="transcribeToggle">Автотранскрибация по ролям</label>
+                            <span class="transcribe-badge" id="transcribeStateBadge">Включена</span>
+                        </div>
+                        <label class="clay-switch" for="transcribeToggle">
+                            <input type="checkbox" id="transcribeToggle" checked>
+                            <span class="clay-slider"></span>
+                        </label>
+                    </div>
+
+                    <div class="transcribe-options-wrap" id="transcribeOptionsWrap">
+                        <div class="transcribe-field">
+                            <label class="custom-worker-label" for="asrModelSelect">Локальная модель распознавания</label>
+                            <select id="asrModelSelect" class="worker-select">
+                                <option value="turbo" selected>Точная — Whisper Large v3 Turbo (99 языков, ~810 МБ)</option>
+                                <option value="parakeet">Быстрая CPU — Parakeet TDT 0.6B v3 (25 языков, ~600 МБ)</option>
+                                <option value="small">Лёгкая — Whisper Small (99 языков, ~245 МБ)</option>
+                            </select>
+                        </div>
+                        <div class="transcribe-field">
+                            <label class="custom-worker-label" for="speakerCountSelect">Количество говорящих</label>
+                            <select id="speakerCountSelect" class="worker-select">
+                                <option value="auto" selected>Автоопределение</option>
+                                <option value="2">2 спикера (интервью 1-на-1)</option>
+                                <option value="3">3 спикера</option>
+                                <option value="4+">4 и более спикеров</option>
+                            </select>
+                        </div>
+                        <p class="worker-settings-hint">Создаёт отдельный .txt файл с таймкодами и ролями. Распознаёт русскую речь с англицизмами и переключение языков полностью офлайн.</p>
+                    </div>
+                </div>
             </div>
 
             <div class="clay-panel hidden" id="statusPanel">
@@ -67,16 +101,19 @@
                     <h2 id="statusText">Загрузка...</h2>
                     <p id="statusSubText">Пожалуйста, подождите.</p>
                     <div id="debugLog" class="debug-log hidden"></div>
-                    <button id="downloadBtn" class="clay-btn hidden">Скачать готовое видео</button>
-                    <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить еще</button>
+                    <div class="download-actions">
+                        <button id="downloadBtn" class="clay-btn hidden">Скачать готовое видео (.mp4)</button>
+                        <button id="downloadTranscriptBtn" class="clay-btn clay-btn-transcript hidden">Скачать транскрипт (.txt)</button>
+                        <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить еще</button>
+                    </div>
                 </div>
             </div>
         </main>
         
-        <footer style="text-align: center; margin-top: 2rem; color: var(--text-color); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v3.0.0 (Stable Edition)
+        <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
+            v4.0.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=8"></script>
+    <script src="/static/script.js?v=9"></script>
 </body>
 </html>

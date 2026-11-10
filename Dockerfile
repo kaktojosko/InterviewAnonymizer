@@ -16,6 +16,18 @@ COPY app.py main.py ./
 COPY src ./src
 COPY static ./static
 
+ENV MODELS_DIR=/app/models \
+    PRELOADED_MODELS_DIR=/opt/preloaded_models
+
+RUN mkdir -p /app/models /opt/preloaded_models
+
+# Optional: pre-bake ASR + diarization models during build for air-gapped environments
+# Example: docker build --build-arg PRELOAD_MODELS=turbo .
+ARG PRELOAD_MODELS=""
+RUN if [ -n "$PRELOAD_MODELS" ]; then \
+        MODELS_DIR=/opt/preloaded_models python -m src.model_manager --preload "$PRELOAD_MODELS"; \
+    fi
+
 # Expose port
 EXPOSE 8000
 
