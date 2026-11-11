@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=13">
+    <link rel="stylesheet" href="/static/style.css?v=14">
 </head>
 <body>
     <div class="container">
@@ -108,10 +108,15 @@
                         <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
                         <polyline points="22 4 12 14.01 9 11.01"></polyline>
                     </svg>
+                    <svg id="cancelIcon" class="hidden" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <rect x="9" y="9" width="6" height="6" rx="1"></rect>
+                    </svg>
                     <h2 id="statusText">Загрузка...</h2>
                     <p id="statusSubText">Пожалуйста, подождите.</p>
                     <div id="debugLog" class="debug-log hidden"></div>
                     <div class="download-actions">
+                        <button id="cancelBtn" class="clay-btn clay-btn-danger hidden" type="button">Прервать</button>
                         <button id="downloadBtn" class="clay-btn hidden">Скачать видео (.mp4)</button>
                         <button id="downloadTranscriptBtn" class="clay-btn clay-btn-transcript hidden">Скачать транскрипт (.txt)</button>
                         <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить ещё</button>
@@ -121,9 +126,9 @@
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v4.1.1 (Stable Edition)
+            v4.2.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=13"></script>
+    <script src="/static/script.js?v=14"></script>
 </body>
 </html>

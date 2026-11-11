@@ -39,6 +39,8 @@ const statusText = document.getElementById('statusText');
 const statusSubText = document.getElementById('statusSubText');
 const spinner = document.getElementById('spinner');
 const successIcon = document.getElementById('successIcon');
+const cancelIcon = document.getElementById('cancelIcon');
+const cancelBtn = document.getElementById('cancelBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 const downloadTranscriptBtn = document.getElementById('downloadTranscriptBtn');
 const resetBtn = document.getElementById('resetBtn');
@@ -58,6 +60,8 @@ const speakerCountSelect = document.getElementById('speakerCountSelect');
 let currentTaskId = null;
 let pollInterval = null;
 let taskFinished = false;
+let uploadAbortController = null;
+let cancelRequested = false;
 let selectedWorkers = localStorage.getItem('selectedWorkers') || '4';
 let customWorkers = localStorage.getItem('customWorkers') || '';
 let serverCpuCount = null;
@@ -549,15 +553,30 @@ function handleFiles(files) {
 async function uploadFile(file) {
     stopPolling();
     taskFinished = false;
+    cancelRequested = false;
+    currentTaskId = null;
     closeAllClaySelects();
     const workersForUpload = getWorkersForUpload();
     if (!workersForUpload) return;
 
     uploadPanel.classList.add('hidden');
     statusPanel.classList.remove('hidden');
+    spinner.classList.remove('hidden');
+    successIcon.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.add('hidden');
+    downloadBtn.classList.add('hidden');
+    downloadTranscriptBtn.classList.add('hidden');
+    resetBtn.classList.add('hidden');
+    debugLog.classList.add('hidden');
+    debugLog.innerHTML = '';
+    if (cancelBtn) {
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = 'Прервать';
+        cancelBtn.classList.remove('hidden');
+    }
     statusText.textContent = 'Загрузка...';
     statusSubText.textContent = 'Отправка видео на сервер...';
-    
+
     const formData = new FormData();
     formData.append('file', file);
     formData.append('workers', workersForUpload);
@@ -566,22 +585,33 @@ async function uploadFile(file) {
     formData.append('compute_device', selectedComputeDevice);
     formData.append('speakers', selectedSpeakers);
 
+    uploadAbortController = new AbortController();
+
     try {
         const response = await fetch('/api/upload', {
             method: 'POST',
-            body: formData
+            body: formData,
+            signal: uploadAbortController.signal,
         });
-        
+        uploadAbortController = null;
+
         if (!response.ok) throw new Error('Upload failed');
-        
+
         const data = await response.json();
         currentTaskId = data.task_id;
-        
+
+        if (cancelRequested) {
+            fetch(`/api/cancel/${currentTaskId}`, { method: 'POST' }).catch(() => {});
+            taskFinished = true;
+            showCancelled('Обработка остановлена, временные файлы очищены.');
+            return;
+        }
+
         const time = new Date().toLocaleTimeString('ru-RU');
         debugLog.innerHTML = `<p>[${time}] Видео загружено. Старт обработки...</p>`;
         debugLog.classList.remove('hidden');
         logCursor = 0;
-        
+
         statusText.textContent = 'Обработка...';
         statusSubText.textContent = data.worker_count
             ? `Подготовка. Потоков: ${data.worker_count}.`
@@ -589,8 +619,13 @@ async function uploadFile(file) {
         checkStatus();
         stopPolling();
         pollInterval = setInterval(checkStatus, 1000);
-        
     } catch (error) {
+        uploadAbortController = null;
+        if (error && (error.name === 'AbortError' || cancelRequested)) {
+            taskFinished = true;
+            showCancelled('Загрузка видео отменена.');
+            return;
+        }
         showError('Ошибка загрузки файла. Попробуйте снова.');
     }
 }
@@ -598,15 +633,15 @@ async function uploadFile(file) {
 let logCursor = 0;
 
 async function checkStatus() {
-    if (!currentTaskId || taskFinished) return;
-    
+    if (!currentTaskId || taskFinished || cancelRequested) return;
+
     try {
         const response = await fetch(`/api/status/${currentTaskId}`);
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         const data = await response.json();
-        
+
         if (data.logs && data.logs.length > logCursor) {
             const time = new Date().toLocaleTimeString('ru-RU');
             for (let i = logCursor; i < data.logs.length; i++) {
@@ -621,6 +656,10 @@ async function checkStatus() {
             taskFinished = true;
             stopPolling();
             showSuccess(data);
+        } else if (data.status === 'cancelled') {
+            taskFinished = true;
+            stopPolling();
+            showCancelled('Обработка остановлена, временные файлы очищены.');
         } else if (data.status === 'error') {
             taskFinished = true;
             stopPolling();
@@ -633,6 +672,7 @@ async function checkStatus() {
             statusSubText.textContent = data.message || 'Ожидание очереди...';
         }
     } catch (error) {
+        if (cancelRequested) return;
         console.error('Error polling status:', error);
         taskFinished = true;
         stopPolling();
@@ -642,6 +682,8 @@ async function checkStatus() {
 
 function showSuccess(data = {}) {
     spinner.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.add('hidden');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
     successIcon.classList.remove('hidden');
     statusText.textContent = 'Готово!';
 
@@ -653,14 +695,14 @@ function showSuccess(data = {}) {
     downloadBtn.classList.remove('hidden');
     downloadTranscriptBtn.classList.toggle('hidden', !hasTranscript);
     resetBtn.classList.remove('hidden');
-    
+
     const time = new Date().toLocaleTimeString('ru-RU');
     const readyNote = hasTranscript
         ? 'Видео (.mp4) и транскрипт (.txt) готовы к скачиванию!'
         : 'Видео готово к скачиванию!';
     debugLog.innerHTML += `<p style="color: #4ade80;">[${time}] ${readyNote}</p>`;
     debugLog.scrollTop = debugLog.scrollHeight;
-    
+
     downloadBtn.onclick = () => {
         window.location.href = `/api/download/${currentTaskId}`;
     };
@@ -672,21 +714,75 @@ function showSuccess(data = {}) {
     }
 }
 
+function showCancelled(msg) {
+    spinner.classList.add('hidden');
+    successIcon.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.remove('hidden');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
+    downloadBtn.classList.add('hidden');
+    downloadTranscriptBtn.classList.add('hidden');
+    statusText.textContent = 'Прервано';
+    statusSubText.textContent = msg;
+    resetBtn.classList.remove('hidden');
+
+    if (!debugLog.classList.contains('hidden')) {
+        const time = new Date().toLocaleTimeString('ru-RU');
+        debugLog.innerHTML += `<p style="color: #f59e0b;">[${time}] Обработка прервана пользователем.</p>`;
+        debugLog.scrollTop = debugLog.scrollHeight;
+    }
+}
+
 function showError(msg) {
     spinner.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.add('hidden');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
     statusText.textContent = 'Ошибка';
     statusSubText.textContent = msg;
     resetBtn.classList.remove('hidden');
+}
+
+if (cancelBtn) {
+    cancelBtn.onclick = async () => {
+        if (taskFinished || cancelRequested) return;
+        cancelRequested = true;
+        cancelBtn.disabled = true;
+        cancelBtn.textContent = 'Остановка...';
+
+        if (uploadAbortController) {
+            uploadAbortController.abort();
+            return;
+        }
+
+        stopPolling();
+        const taskIdToCancel = currentTaskId;
+        if (taskIdToCancel) {
+            try {
+                await fetch(`/api/cancel/${taskIdToCancel}`, { method: 'POST' });
+            } catch (err) {
+                console.warn('Cancel request error:', err);
+            }
+        }
+        taskFinished = true;
+        showCancelled('Обработка остановлена, временные файлы очищены.');
+    };
 }
 
 resetBtn.onclick = () => {
     stopPolling();
     currentTaskId = null;
     taskFinished = false;
+    cancelRequested = false;
+    uploadAbortController = null;
     statusPanel.classList.add('hidden');
     uploadPanel.classList.remove('hidden');
     spinner.classList.remove('hidden');
     successIcon.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.add('hidden');
+    if (cancelBtn) {
+        cancelBtn.disabled = false;
+        cancelBtn.textContent = 'Прервать';
+        cancelBtn.classList.add('hidden');
+    }
     downloadBtn.classList.add('hidden');
     downloadTranscriptBtn.classList.add('hidden');
     resetBtn.classList.add('hidden');

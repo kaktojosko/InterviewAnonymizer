@@ -255,7 +255,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.1.1)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.2.0)" in txt
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
     assert "[00:00:10 - 00:00:15] Спикер 2: Всё отлично, PR уже в main." in txt
@@ -592,5 +592,47 @@ def test_decoupled_gpu_transcribe_units_and_diarize(tmp_path, monkeypatch):
     txt = open(out_txt, encoding="utf-8").read()
     assert "Спикер 1: Привет!" in txt
     assert "Спикер 2: Hello!" in txt
+
+
+def test_cancellation_token_terminates_subprocess_and_transcriber(tmp_path):
+    import subprocess
+    import sys
+    import time
+    from src.cancellation import CancellationToken, TaskCancelledError
+
+    token = CancellationToken()
+    cb_called = []
+    token.register_cancel_callback(lambda: cb_called.append(True))
+
+    proc1 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    token.register_proc(proc1)
+
+    t0 = time.time()
+    assert token.cancel() is True
+    assert token.cancel() is False  # idempotent
+    assert token.is_cancelled() is True
+    assert cb_called == [True]
+
+    proc1.wait(timeout=2.0)
+    assert (time.time() - t0) < 2.0
+    assert proc1.poll() is not None
+
+    # Registering a new subprocess onto an already-cancelled token immediately kills it & raises
+    proc2 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    with pytest.raises(TaskCancelledError):
+        token.register_proc(proc2)
+    proc2.wait(timeout=2.0)
+    assert proc2.poll() is not None
+
+    # Transcriber immediately raises TaskCancelledError when cancel_token is set
+    wav_path = str(tmp_path / "cancel.wav")
+    _write_pcm16_wav(wav_path, np.zeros(16000, dtype=np.int16))
+    with pytest.raises(TaskCancelledError):
+        Transcriber.transcribe_audio_file(
+            wav_path=wav_path,
+            output_txt_path=str(tmp_path / "cancel.txt"),
+            cancel_token=token,
+        )
+
 
 

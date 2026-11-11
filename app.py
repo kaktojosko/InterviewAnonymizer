@@ -19,15 +19,17 @@ from src.config import (
     TMP_BASE_DIR,
     TRANSCRIPTION_ENABLED_DEFAULT,
 )
+from src.cancellation import CancellationToken, TaskCancelledError
 from src.transcriber import probe_cuda_available
 
-app = FastAPI(title="Interview Anonymizer", version="4.1.1")
+app = FastAPI(title="Interview Anonymizer", version="4.2.0")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# In-memory status store
+# In-memory status store & cancellation tokens
 tasks = {}
+cancel_tokens: dict[str, CancellationToken] = {}
 
 # Ensure directories exist
 os.makedirs("uploads", exist_ok=True)
@@ -100,6 +102,13 @@ def parse_compute_device(raw_device: str | None) -> str:
         raise HTTPException(status_code=400, detail=f"Unsupported compute device '{device}'. Valid options: {valid}.")
     return device
 
+def _safe_remove(path: str | None) -> None:
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
 def background_process(
     task_id: str,
     input_path: str,
@@ -111,6 +120,16 @@ def background_process(
     speakers: str,
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
 ):
+    cancel_token = cancel_tokens.get(task_id)
+    if cancel_token is None:
+        cancel_token = CancellationToken()
+        cancel_tokens[task_id] = cancel_token
+
+    if cancel_token.is_cancelled():
+        cancel_tokens.pop(task_id, None)
+        _safe_remove(input_path)
+        return
+
     init_logs = ["Initializing...", f"Worker count: {worker_count}"]
     if transcribe_enabled:
         init_logs.append(
@@ -130,14 +149,19 @@ def background_process(
         "speakers": speakers,
         "compute_device": compute_device,
     }
-    
+
     def status_callback(msg: str):
-        tasks[task_id]["message"] = msg
-        tasks[task_id]["logs"].append(msg)
-        
+        if cancel_token.is_cancelled():
+            return
+        entry = tasks.get(task_id)
+        if entry is None or entry.get("status") == "cancelled":
+            return
+        entry["message"] = msg
+        entry["logs"].append(msg)
+
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
-    
+
     try:
         result = Orchestrator.process_video_job(
             input_path=input_path,
@@ -150,21 +174,41 @@ def background_process(
             asr_model=asr_model,
             speaker_count=speakers,
             compute_device=compute_device,
+            cancel_token=cancel_token,
         )
+        cancel_token.check()
         tasks[task_id]["transcript_ready"] = bool(result.get("transcript_ready"))
         tasks[task_id]["status"] = "completed"
         tasks[task_id]["message"] = "Done!"
         tasks[task_id]["logs"].append("Done!")
+    except TaskCancelledError:
+        entry = tasks.get(task_id)
+        if entry is not None:
+            entry["status"] = "cancelled"
+            entry["message"] = "Обработка прервана."
+            entry["transcript_ready"] = False
+            cancel_note = "Обработка прервана пользователем."
+            if not entry["logs"] or entry["logs"][-1] != cancel_note:
+                entry["logs"].append(cancel_note)
     except Exception as e:
-        print(f"Error in background_process: {e}")
-        tasks[task_id]["status"] = "error"
-        tasks[task_id]["message"] = str(e)
-        tasks[task_id]["logs"].append(str(e))
+        if cancel_token.is_cancelled():
+            entry = tasks.get(task_id)
+            if entry is not None:
+                entry["status"] = "cancelled"
+                entry["message"] = "Обработка прервана."
+                entry["transcript_ready"] = False
+        else:
+            print(f"Error in background_process: {e}")
+            tasks[task_id]["status"] = "error"
+            tasks[task_id]["message"] = str(e)
+            tasks[task_id]["logs"].append(str(e))
     finally:
+        cancel_tokens.pop(task_id, None)
         io_manager.cleanup_job_dir(job_dir)
-        # Cleanup input file
-        if os.path.exists(input_path):
-            os.remove(input_path)
+        _safe_remove(input_path)
+        if cancel_token.is_cancelled() or tasks.get(task_id, {}).get("status") == "cancelled":
+            _safe_remove(output_path)
+            _safe_remove(transcript_path)
 
 @app.get("/")
 async def root():
@@ -173,7 +217,7 @@ async def root():
 @app.get("/api/config")
 async def get_config():
     return {
-        "version": "4.1.1",
+        "version": "4.2.0",
         "cpu_count": CPU_COUNT,
         "default_workers": MAX_WORKERS,
         "max_workers": MAX_ALLOWED_WORKERS,
@@ -211,21 +255,26 @@ async def upload_video(
     asr_model_id = parse_asr_model(asr_model)
     speaker_mode = parse_speaker_count(speakers)
     device_mode = parse_compute_device(compute_device)
-        
+
     task_id = str(uuid.uuid4())
     input_path = os.path.join("uploads", f"{task_id}.mp4")
     output_path = os.path.join("output", f"{task_id}_anonymized.mp4")
     transcript_path = (
         os.path.join("output", f"{task_id}_transcript.txt") if transcribe_enabled else None
     )
-    
-    with open(input_path, "wb") as buffer:
-        while True:
-            chunk = await file.read(4 * 1024 * 1024)
-            if not chunk:
-                break
-            buffer.write(chunk)
-        
+
+    try:
+        with open(input_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                buffer.write(chunk)
+    except BaseException:
+        _safe_remove(input_path)
+        raise
+
+    cancel_tokens[task_id] = CancellationToken()
     tasks[task_id] = {
         "status": "queued",
         "message": "Waiting in queue...",
@@ -237,7 +286,7 @@ async def upload_video(
         "speakers": speaker_mode,
         "compute_device": device_mode,
     }
-    
+
     background_tasks.add_task(
         background_process,
         task_id,
@@ -250,7 +299,7 @@ async def upload_video(
         speaker_mode,
         device_mode,
     )
-    
+
     return {
         "task_id": task_id,
         "status": "queued",
@@ -260,6 +309,37 @@ async def upload_video(
         "asr_model": asr_model_id,
         "speakers": speaker_mode,
         "compute_device": device_mode,
+    }
+
+@app.post("/api/cancel/{task_id}")
+async def cancel_task(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    entry = tasks[task_id]
+    current_status = entry.get("status")
+    if current_status in ("completed", "error", "cancelled"):
+        return {
+            "task_id": task_id,
+            "status": current_status,
+            "cancelled": current_status == "cancelled",
+        }
+
+    token = cancel_tokens.get(task_id)
+    if token is not None:
+        token.cancel()
+
+    entry["status"] = "cancelled"
+    entry["message"] = "Обработка прервана."
+    entry["transcript_ready"] = False
+    cancel_note = "Обработка прервана пользователем."
+    if not entry["logs"] or entry["logs"][-1] != cancel_note:
+        entry["logs"].append(cancel_note)
+
+    return {
+        "task_id": task_id,
+        "status": "cancelled",
+        "cancelled": True,
     }
 
 @app.get("/api/status/{task_id}")

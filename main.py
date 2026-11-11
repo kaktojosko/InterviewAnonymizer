@@ -18,7 +18,7 @@ from src.orchestrator import Orchestrator
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Interview Anonymizer v4.1.1 (Blur faces, pitch shift audio, and local role-split transcription)"
+        description="Interview Anonymizer v4.2.0 (Blur faces, pitch shift audio, and local role-split transcription)"
     )
     parser.add_argument("-i", "--input", required=True, help="Path to input video (.mp4)")
     parser.add_argument("-o", "--output", required=True, help="Path to output anonymized video (.mp4)")

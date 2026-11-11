@@ -138,7 +138,17 @@ class VideoProcessor:
         
         frame[y1:y2, x1:x2] = pixelated_roi
 
-    def process(self, input_video_path: str, output_video_path: str, fps: str = '30/1', orig_width: int = 1920, orig_height: int = 1080) -> bool:
+    def process(
+        self,
+        input_video_path: str,
+        output_video_path: str,
+        fps: str = '30/1',
+        orig_width: int = 1920,
+        orig_height: int = 1080,
+        cancel_event=None,
+    ) -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
         if not os.path.exists(input_video_path):
             return False
             
@@ -162,7 +172,7 @@ class VideoProcessor:
         from fractions import Fraction
         try:
             target_fps = float(Fraction(fps))
-        except:
+        except Exception:
             target_fps = 30.0
             
         # Инициализируем FFmpeg для прямой записи в H.264
@@ -230,20 +240,31 @@ class VideoProcessor:
         buffer = []
         faces_start = []
         is_first_chunk = True
+        cancelled = False
         
         frame_size = target_width * target_height * 3
         
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+
                 frame_array = frame_pool[pool_idx]
                 frame_view = memoryview(frame_array).cast('B')
                 
                 bytes_read = 0
                 while bytes_read < frame_size:
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
                     chunk = ffmpeg_read_process.stdout.readinto(frame_view[bytes_read:])
                     if not chunk:
                         break
                     bytes_read += chunk
+
+                if cancelled:
+                    break
                 
                 if bytes_read != frame_size:
                     if buffer:
@@ -255,6 +276,9 @@ class VideoProcessor:
                         matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
                         
                         for i, b_frame in enumerate(buffer):
+                            if cancel_event is not None and cancel_event.is_set():
+                                cancelled = True
+                                break
                             alpha = i / max(1, len(buffer) - 1) if len(buffer) > 1 else 0
                             for (sf, ef) in matched_pairs:
                                 x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
@@ -283,6 +307,9 @@ class VideoProcessor:
                     matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
                     
                     for i, b_frame in enumerate(buffer):
+                        if cancel_event is not None and cancel_event.is_set():
+                            cancelled = True
+                            break
                         if is_first_chunk:
                             alpha = i / max(1, len(buffer) - 1)
                         else:
@@ -298,6 +325,9 @@ class VideoProcessor:
                             write_process.stdin.write(memoryview(b_frame))
                         except Exception:
                             pass
+
+                    if cancelled:
+                        break
                         
                     is_first_chunk = False
                     
@@ -306,7 +336,7 @@ class VideoProcessor:
         finally:
             try:
                 ffmpeg_read_process.stdout.close()
-            except:
+            except Exception:
                 pass
             ffmpeg_read_process.terminate()
             ffmpeg_read_process.wait()
@@ -315,9 +345,9 @@ class VideoProcessor:
                 try:
                     if write_process.stdin:
                         write_process.stdin.close()
-                except:
+                except Exception:
                     pass
                 write_process.terminate()
                 write_process.wait()
             
-        return True
+        return not cancelled

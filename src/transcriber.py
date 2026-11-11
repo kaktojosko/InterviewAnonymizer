@@ -19,6 +19,7 @@ import sherpa_onnx
 from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions, get_speech_timestamps
 
+from src.cancellation import CancellationToken
 from src.config import (
     ASR_MODEL_PROFILES,
     COMPUTE_DEVICE_OPTIONS,
@@ -927,7 +928,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.1.1)",
+        "# Транскрибация интервью (Interview Anonymizer v4.2.0)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -1127,7 +1128,10 @@ class Transcriber:
         speaker_count: str = "auto",
         threads: int = 4,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> list[DiarizationSegment]:
+        if cancel_token:
+            cancel_token.check()
         if samples.size < 1600:  # < 0.1s
             return []
 
@@ -1166,6 +1170,8 @@ class Transcriber:
 
         def _progress_cb(done_chunks: int, total_chunks: int) -> int:
             nonlocal last_pct, last_log_t
+            if cancel_token and cancel_token.is_cancelled():
+                return 1  # Non-zero return immediately aborts sherpa-onnx C++ diarization
             if status_cb and total_chunks > 0:
                 pct = int((done_chunks * 85) / total_chunks)
                 now = time.time()
@@ -1176,6 +1182,8 @@ class Transcriber:
             return 0
 
         result = sd.process(samples, callback=_progress_cb)
+        if cancel_token:
+            cancel_token.check()
         raw_objs = result.sort_by_start_time()
 
         # Filter out synthetic call-waiting / dial-tone ringback beeps before clustering
@@ -1221,10 +1229,15 @@ class Transcriber:
                 provider="cpu",
             )
         )
-        embeddings = [
-            cls._extract_segment_embedding(extractor, samples, seg.start, seg.end, sample_rate=16000)
-            for seg in pre_merged
-        ]
+        embeddings: list[Optional[np.ndarray]] = []
+        for seg in pre_merged:
+            if cancel_token:
+                cancel_token.check()
+            embeddings.append(
+                cls._extract_segment_embedding(
+                    extractor, samples, seg.start, seg.end, sample_rate=16000
+                )
+            )
 
         return cluster_anchor_embeddings(
             segments=pre_merged,
@@ -1243,7 +1256,11 @@ class Transcriber:
         diar_segments: Optional[list[DiarizationSegment]],
         threads: int,
         status_cb: Optional[Callable[[str], None]],
+        cancel_token: Optional[CancellationToken] = None,
     ) -> list[TimedUnit]:
+        if cancel_token:
+            cancel_token.check()
+
         cpu_threads = max(1, int(threads)) if device == "cpu" else 1
         cache_key = ("faster_whisper", profile_id, model_dir, device, compute_type, cpu_threads)
 
@@ -1257,6 +1274,9 @@ class Transcriber:
                 num_workers=1,
             ),
         )
+
+        if cancel_token:
+            cancel_token.check()
 
         total_dur = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
         if total_dur <= 0.0:
@@ -1282,6 +1302,9 @@ class Transcriber:
         last_log_t = 0.0
 
         for w_start, w_end in windows:
+            if cancel_token:
+                cancel_token.check()
+
             s_idx = max(0, int(w_start * sample_rate))
             e_idx = min(len(samples), int(w_end * sample_rate))
             if e_idx - s_idx < 800:
@@ -1310,6 +1333,9 @@ class Transcriber:
             segments_iter, _ = model.transcribe(samples[s_idx:e_idx], **transcribe_kwargs)
 
             for seg in segments_iter:
+                if cancel_token:
+                    cancel_token.check()
+
                 abs_seg_start = w_start + float(seg.start)
                 abs_seg_end = min(w_end, w_start + float(seg.end))
 
@@ -1368,7 +1394,10 @@ class Transcriber:
         threads: int = 4,
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> list[TimedUnit]:
+        if cancel_token:
+            cancel_token.check()
         device, compute_type = resolve_compute_device(compute_device, status_cb=status_cb)
         try:
             return cls._decode_whisper_windows(
@@ -1381,6 +1410,7 @@ class Transcriber:
                 diar_segments=diar_segments,
                 threads=threads,
                 status_cb=status_cb,
+                cancel_token=cancel_token,
             )
         except RuntimeError as err:
             if device == "cuda":
@@ -1400,6 +1430,7 @@ class Transcriber:
                             diar_segments=diar_segments,
                             threads=threads,
                             status_cb=status_cb,
+                            cancel_token=cancel_token,
                         )
                     except RuntimeError as err_fp32:
                         err = err_fp32
@@ -1415,6 +1446,7 @@ class Transcriber:
                     diar_segments=diar_segments,
                     threads=threads,
                     status_cb=status_cb,
+                    cancel_token=cancel_token,
                 )
             raise
 
@@ -1426,7 +1458,11 @@ class Transcriber:
         diar_segments: list[DiarizationSegment],
         threads: int = 4,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> list[TimedUnit]:
+        if cancel_token:
+            cancel_token.check()
+
         asr_threads = max(1, int(threads))
         cache_key = ("sherpa_parakeet", model_dir, asr_threads)
 
@@ -1458,6 +1494,9 @@ class Transcriber:
         last_log_t = time.time()
 
         for idx, (c_start, c_end) in enumerate(chunks, start=1):
+            if cancel_token:
+                cancel_token.check()
+
             s_idx = max(0, int(c_start * sample_rate))
             e_idx = min(len(samples), int(c_end * sample_rate))
             if e_idx - s_idx < 800:
@@ -1495,6 +1534,7 @@ class Transcriber:
         compute_device: str = "cuda",
         threads: int = 1,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> dict:
         """
         Phase A of hardware-decoupled GPU mode: runs Silero VAD + Whisper on
@@ -1506,6 +1546,9 @@ class Transcriber:
                 status_cb(msg)
             else:
                 print(msg)
+
+        if cancel_token:
+            cancel_token.check()
 
         profile_id = (asr_model or DEFAULT_ASR_MODEL).strip().lower()
         if profile_id not in ASR_MODEL_PROFILES:
@@ -1527,6 +1570,9 @@ class Transcriber:
             }
 
         asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
+        if cancel_token:
+            cancel_token.check()
+
         req_dev = (compute_device or "cuda").strip().lower()
         eff_dev, eff_ctype = resolve_compute_device(req_dev)
         dev_label = f"GPU CUDA ({eff_ctype})" if eff_dev == "cuda" else "CPU"
@@ -1542,6 +1588,7 @@ class Transcriber:
             threads=threads,
             compute_device=req_dev,
             status_cb=update,
+            cancel_token=cancel_token,
         )
         elapsed_asr = time.time() - t_asr
         update(f"[Profile] GPU ASR завершена за {elapsed_asr:.2f}s (единиц текста: {len(units)})")
@@ -1563,6 +1610,7 @@ class Transcriber:
         speaker_count: str = "auto",
         threads: int = 4,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> dict:
         """
         Phase B of hardware-decoupled GPU mode: runs CPU speaker diarization
@@ -1574,6 +1622,9 @@ class Transcriber:
                 status_cb(msg)
             else:
                 print(msg)
+
+        if cancel_token:
+            cancel_token.check()
 
         t0 = time.time()
         samples: np.ndarray = asr_state["samples"]
@@ -1599,6 +1650,9 @@ class Transcriber:
             return {"num_speakers": 0, "num_turns": 0, "elapsed": total_elapsed}
 
         seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+        if cancel_token:
+            cancel_token.check()
+
         eff_threads = max(1, min(int(threads), 8))
         update(
             f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, потоков CPU: {eff_threads})..."
@@ -1611,12 +1665,16 @@ class Transcriber:
             speaker_count=speaker_count,
             threads=eff_threads,
             status_cb=update,
+            cancel_token=cancel_token,
         )
         detected_raw_speakers = len({s.speaker for s in diar_segments})
         update(
             f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
             f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
         )
+
+        if cancel_token:
+            cancel_token.check()
 
         turns, final_speaker_count = align_units_to_speakers(units, diar_segments)
         transcript_text = format_transcript_txt(
@@ -1650,6 +1708,7 @@ class Transcriber:
         diar_threads: Optional[int] = None,
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
     ) -> dict:
         """
         Runs local speaker diarization + multilingual ASR on a 16 kHz mono WAV
@@ -1660,6 +1719,9 @@ class Transcriber:
                 status_cb(msg)
             else:
                 print(msg)
+
+        if cancel_token:
+            cancel_token.check()
 
         profile_id = (asr_model or DEFAULT_ASR_MODEL).strip().lower()
         if profile_id not in ASR_MODEL_PROFILES:
@@ -1686,7 +1748,11 @@ class Transcriber:
 
         # 1. Ensure local models are cached & verified
         seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+        if cancel_token:
+            cancel_token.check()
         asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
+        if cancel_token:
+            cancel_token.check()
 
         # 2. Speaker Diarization
         eff_diar_threads = diar_threads if diar_threads is not None else threads
@@ -1699,6 +1765,7 @@ class Transcriber:
             speaker_count=speaker_count,
             threads=eff_diar_threads,
             status_cb=update,
+            cancel_token=cancel_token,
         )
         detected_raw_speakers = len({s.speaker for s in diar_segments})
         update(
@@ -1722,6 +1789,7 @@ class Transcriber:
                 threads=threads,
                 compute_device=req_dev,
                 status_cb=update,
+                cancel_token=cancel_token,
             )
         elif profile["engine"] == "sherpa_parakeet":
             if req_dev == "cuda":
@@ -1736,11 +1804,15 @@ class Transcriber:
                 diar_segments=diar_segments,
                 threads=threads,
                 status_cb=update,
+                cancel_token=cancel_token,
             )
         else:
             raise ValueError(f"Unsupported engine: {profile['engine']}")
 
         update(f"[Profile] ASR завершена за {time.time() - t_asr:.2f}s (единиц текста: {len(units)})")
+
+        if cancel_token:
+            cancel_token.check()
 
         # 4. Align words/units to speaker roles and write UTF-8 .txt
         turns, final_speaker_count = align_units_to_speakers(units, diar_segments)

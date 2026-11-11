@@ -696,6 +696,17 @@ header p {
     color: #ffffff;
 }
 
+.clay-btn-danger {
+    background: linear-gradient(135deg, #ef4444, #dc2626);
+    color: #ffffff;
+}
+
+.clay-btn:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+    transform: none;
+}
+
 @media (max-width: 520px) {
     .container {
         padding: 1rem;

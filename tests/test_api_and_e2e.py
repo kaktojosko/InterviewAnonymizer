@@ -114,11 +114,13 @@ def test_api_root_and_config():
     assert "transcribeToggle" in root_resp.text
     assert "computeDeviceSelect" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
+    assert "cancelBtn" in root_resp.text
+    assert "Прервать" in root_resp.text
 
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.1.1"
+    assert data["version"] == "4.2.0"
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
     assert data["default_compute_device"] == "cpu"
@@ -256,7 +258,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(
         FFmpegUtils,
         "split_video",
-        staticmethod(lambda inp, pat, _chunk_t: orig_split(inp, pat, 1)),
+        staticmethod(lambda inp, pat, _chunk_t, **kw: orig_split(inp, pat, 1, **kw)),
     )
 
     events = []
@@ -268,6 +270,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         compute_device: str = "cuda",
         threads: int = 1,
         status_cb=None,
+        cancel_token=None,
     ):
         events.append(("gpu_asr", compute_device, threads))
         if status_cb:
@@ -288,6 +291,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         speaker_count: str = "auto",
         threads: int = 4,
         status_cb=None,
+        cancel_token=None,
     ):
         events.append(("cpu_diarize", speaker_count, threads))
         if status_cb:
@@ -334,6 +338,172 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         iom.cleanup_job_dir(job_dir)
 
 
+def test_orchestrator_cancel_aborts_spawn_video_workers(tmp_path, monkeypatch):
+    from src.cancellation import CancellationToken, TaskCancelledError
+
+    in_mp4 = str(tmp_path / "cancel_chunks_input.mp4")
+    out_mp4 = str(tmp_path / "cancel_chunks_output.mp4")
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=15:duration=5.0",
+            "-c:v",
+            "libx264",
+            "-g",
+            "15",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-an",
+            in_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    orig_split = FFmpegUtils.split_video
+    monkeypatch.setattr(
+        FFmpegUtils,
+        "split_video",
+        staticmethod(lambda inp, pat, _chunk_t, **kw: orig_split(inp, pat, 1, **kw)),
+    )
+
+    token = CancellationToken()
+    logs = []
+
+    def _on_status(msg: str):
+        logs.append(msg)
+        if "[Worker] Started: chunk_" in msg:
+            token.cancel()
+
+    iom = IOManager()
+    job_dir = iom.create_job_dir()
+    try:
+        with pytest.raises(TaskCancelledError):
+            Orchestrator.process_video_job(
+                input_path=in_mp4,
+                output_path=out_mp4,
+                job_dir=job_dir,
+                status_cb=_on_status,
+                worker_count=1,
+                transcribe=False,
+                cancel_token=token,
+            )
+        assert not os.path.exists(out_mp4)
+    finally:
+        iom.cleanup_job_dir(job_dir)
+
+
+def test_api_cancel_running_job_stops_and_cleans_up(tmp_path, monkeypatch):
+    import threading
+    import time
+    from app import background_process, cancel_tokens
+    from src.cancellation import CancellationToken
+
+    client = TestClient(app)
+
+    # 404 for unknown task
+    assert client.post("/api/cancel/nonexistent-task").status_code == 404
+
+    task_id = "test-live-cancel-task"
+    in_mp4 = str(tmp_path / "live_cancel_in.mp4")
+    out_mp4 = os.path.join("output", f"{task_id}_anonymized.mp4")
+    out_txt = os.path.join("output", f"{task_id}_transcript.txt")
+    _generate_test_mp4(in_mp4, duration_sec=1.2, with_audio=True)
+
+    entered_transcribe = threading.Event()
+
+    def _slow_cancellable_transcribe(
+        cls,
+        wav_path: str,
+        output_txt_path: str,
+        cancel_token=None,
+        **kwargs,
+    ):
+        # Write a partial transcript before cancellation to verify cleanup deletes it
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write("partial transcript")
+        entered_transcribe.set()
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if cancel_token is not None:
+                cancel_token.check()
+            time.sleep(0.02)
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 10.0}
+
+    monkeypatch.setattr(
+        Transcriber, "transcribe_audio_file", classmethod(_slow_cancellable_transcribe)
+    )
+
+    cancel_tokens[task_id] = CancellationToken()
+    tasks[task_id] = {
+        "status": "queued",
+        "message": "Waiting in queue...",
+        "logs": [],
+        "worker_count": 1,
+        "transcribe_enabled": True,
+        "transcript_ready": False,
+        "asr_model": "turbo",
+        "speakers": "auto",
+        "compute_device": "cpu",
+    }
+
+    worker_thread = threading.Thread(
+        target=background_process,
+        args=(task_id, in_mp4, out_mp4, 1, True, out_txt, "turbo", "auto", "cpu"),
+        daemon=True,
+    )
+    try:
+        worker_thread.start()
+        assert entered_transcribe.wait(timeout=15.0), "Job did not reach transcription stage"
+        # At this point muxed out_mp4 and partial out_txt both exist on disk
+        assert os.path.exists(out_mp4)
+        assert os.path.exists(out_txt)
+
+        t0 = time.time()
+        cancel_resp = client.post(f"/api/cancel/{task_id}")
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json() == {
+            "task_id": task_id,
+            "status": "cancelled",
+            "cancelled": True,
+        }
+
+        worker_thread.join(timeout=3.0)
+        assert not worker_thread.is_alive()
+        assert (time.time() - t0) < 3.0
+
+        st = client.get(f"/api/status/{task_id}").json()
+        assert st["status"] == "cancelled"
+        assert st["transcript_ready"] is False
+        assert client.get(f"/api/download/{task_id}").status_code == 400
+        assert client.get(f"/api/download-transcript/{task_id}").status_code == 400
+
+        # Idempotent second cancel call on already cancelled task
+        cancel_again = client.post(f"/api/cancel/{task_id}")
+        assert cancel_again.status_code == 200
+        assert cancel_again.json()["status"] == "cancelled"
+
+        # Verify input, partial video, partial transcript, and token were cleaned up
+        assert task_id not in cancel_tokens
+        assert not os.path.exists(in_mp4)
+        assert not os.path.exists(out_mp4)
+        assert not os.path.exists(out_txt)
+    finally:
+        tasks.pop(task_id, None)
+        cancel_tokens.pop(task_id, None)
+        for p in (in_mp4, out_mp4, out_txt):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
     mp4_path = str(tmp_path / "interview_clip.mp4")
     _generate_test_mp4(mp4_path, duration_sec=1.5, with_audio=True)
@@ -348,6 +518,7 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         diar_threads=None,
         compute_device: str = "cpu",
         status_cb=None,
+        cancel_token=None,
     ):
         assert os.path.isfile(wav_path)
         turns = [

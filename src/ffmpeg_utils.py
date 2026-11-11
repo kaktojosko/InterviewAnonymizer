@@ -1,9 +1,27 @@
 import os
 from fractions import Fraction
 import ffmpeg
+from src.cancellation import CancellationToken, TaskCancelledError
 from src.config import MAX_PROCESSING_FPS, OUTPUT_VIDEO_CRF, OUTPUT_VIDEO_PRESET
 
 class FFmpegUtils:
+    @staticmethod
+    def _run_stream(stream_spec, cancel_token: CancellationToken | None = None):
+        if cancel_token is None:
+            stream_spec.run(overwrite_output=True, quiet=True)
+            return
+
+        cancel_token.check()
+        proc = ffmpeg.run_async(stream_spec, overwrite_output=True, quiet=True)
+        cancel_token.register_proc(proc)
+        try:
+            out, err = proc.communicate()
+        finally:
+            cancel_token.unregister_proc(proc)
+        cancel_token.check()
+        if proc.returncode != 0:
+            raise ffmpeg.Error("ffmpeg", out or b"", err or b"")
+
     @staticmethod
     def _normalize_fps(video_stream) -> str:
         def parse_rate(rate):
@@ -68,14 +86,19 @@ class FFmpegUtils:
         return width, height, fps, duration, has_audio, sample_rate
 
     @staticmethod
-    def mux(video_path: str, audio_path: str, output_path: str):
+    def mux(
+        video_path: str,
+        audio_path: str | None,
+        output_path: str,
+        cancel_token: CancellationToken | None = None,
+    ):
         is_h264 = False
         try:
             probe = ffmpeg.probe(video_path)
             video_stream = next((s for s in probe.get('streams', []) if s['codec_type'] == 'video'), None)
             if video_stream and video_stream.get('codec_name') == 'h264':
                 is_h264 = True
-        except:
+        except Exception:
             pass
 
         v = ffmpeg.input(video_path)
@@ -93,39 +116,53 @@ class FFmpegUtils:
         
         if audio_path and os.path.exists(audio_path):
             a = ffmpeg.input(audio_path)
-            ffmpeg.output(v, a, output_path, **video_args, acodec='aac', audio_bitrate='128k').run(overwrite_output=True, quiet=True)
+            spec = ffmpeg.output(v, a, output_path, **video_args, acodec='aac', audio_bitrate='128k')
         else:
-            ffmpeg.output(v, output_path, **video_args).run(overwrite_output=True, quiet=True)
+            spec = ffmpeg.output(v, output_path, **video_args)
+        FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
 
     @staticmethod
-    def split_video(input_path: str, output_pattern: str, chunk_time: int):
+    def split_video(
+        input_path: str,
+        output_pattern: str,
+        chunk_time: int,
+        cancel_token: CancellationToken | None = None,
+    ):
         """Splits video into segments of chunk_time seconds."""
         # Using segment format in ffmpeg (stream copy is instant)
-        (
+        spec = (
             ffmpeg
             .input(input_path)
             .output(output_pattern, map='0:v:0', c='copy', an=None, f='segment', segment_time=chunk_time, reset_timestamps=1)
-            .run(overwrite_output=True, quiet=True)
         )
+        FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
         
     @staticmethod
-    def concat_videos(input_list_path: str, output_path: str):
+    def concat_videos(
+        input_list_path: str,
+        output_path: str,
+        cancel_token: CancellationToken | None = None,
+    ):
         """Concatenates videos listed in a text file."""
         # The input list file must follow ffmpeg concat format: file 'path/to/file.mp4'
-        (
+        spec = (
             ffmpeg
             .input(input_list_path, format='concat', safe=0)
             .output(output_path, c='copy')
-            .run(overwrite_output=True, quiet=True)
         )
+        FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
 
     @staticmethod
-    def extract_transcription_audio(input_path: str, output_wav_path: str) -> bool:
+    def extract_transcription_audio(
+        input_path: str,
+        output_wav_path: str,
+        cancel_token: CancellationToken | None = None,
+    ) -> bool:
         """Extracts original 16 kHz mono 16-bit PCM WAV for speaker diarization and ASR."""
         if not os.path.exists(input_path):
             return False
         try:
-            (
+            spec = (
                 ffmpeg
                 .input(input_path)
                 .output(
@@ -136,9 +173,11 @@ class FFmpegUtils:
                     ar=16000,
                     acodec='pcm_s16le',
                 )
-                .run(overwrite_output=True, quiet=True)
             )
+            FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
             return os.path.isfile(output_wav_path) and os.path.getsize(output_wav_path) > 44
+        except TaskCancelledError:
+            raise
         except ffmpeg.Error as e:
             err_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
             print(f"Error extracting transcription audio with FFmpeg: {err_msg}")

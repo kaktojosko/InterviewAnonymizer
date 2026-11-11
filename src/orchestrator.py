@@ -3,7 +3,13 @@ import time
 import glob
 import multiprocessing as mp
 import threading
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait as futures_wait,
+)
+from src.cancellation import CancellationToken, TaskCancelledError
 from src.io_manager import IOManager
 from src.ffmpeg_utils import FFmpegUtils
 from src.audio_processor import AudioProcessor
@@ -21,11 +27,13 @@ from src.config import (
 # Глобальные объекты воркера (инициализируются один раз в каждом spawn-процессе)
 _worker_vp = None
 _worker_log_queue = None
+_worker_cancel_event = None
 
 
-def init_worker(log_queue=None):
-    global _worker_vp, _worker_log_queue
+def init_worker(log_queue=None, cancel_event=None):
+    global _worker_vp, _worker_log_queue, _worker_cancel_event
     _worker_log_queue = log_queue
+    _worker_cancel_event = cancel_event
     _worker_vp = VideoProcessor()
 
 
@@ -36,15 +44,26 @@ def process_chunk(
     width: int,
     height: int,
     log_queue=None,
+    cancel_event=None,
 ) -> tuple[bool, float]:
-    global _worker_vp, _worker_log_queue
+    global _worker_vp, _worker_log_queue, _worker_cancel_event
+    ev = cancel_event if cancel_event is not None else _worker_cancel_event
+    if ev is not None and ev.is_set():
+        return False, 0.0
     q = log_queue if log_queue is not None else _worker_log_queue
     if q is not None:
         q.put(f"[Worker] Started: {os.path.basename(input_chunk)}")
     start_time = time.time()
     if _worker_vp is None:
         _worker_vp = VideoProcessor()
-    success = _worker_vp.process(input_chunk, output_chunk, fps=fps_str, orig_width=width, orig_height=height)
+    success = _worker_vp.process(
+        input_chunk,
+        output_chunk,
+        fps=fps_str,
+        orig_width=width,
+        orig_height=height,
+        cancel_event=ev,
+    )
     return success, time.time() - start_time
 
 
@@ -61,30 +80,38 @@ class Orchestrator:
         asr_model: str = DEFAULT_ASR_MODEL,
         speaker_count: str = "auto",
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        cancel_token: CancellationToken | None = None,
     ) -> dict:
         log_lock = threading.Lock()
 
         def update(msg):
+            if cancel_token is not None and cancel_token.is_cancelled():
+                return
             with log_lock:
                 print(msg)
                 if status_cb:
                     status_cb(msg)
-                
+
+        if cancel_token is not None:
+            cancel_token.check()
+
         update(f"Starting processing for: {input_path}")
         total_start_time = time.time()
         workers = max(1, worker_count or MAX_WORKERS)
         requested_device = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
-        
+
         audio_pitched_path = os.path.join(job_dir, "audio_pitched.wav")
         audio_16k_path = os.path.join(job_dir, "audio_16k.wav")
         if transcribe and not transcript_path:
             stem, _ = os.path.splitext(output_path)
             transcript_path = f"{stem}_transcript.txt"
-        
+
         # 1. Probe (Metadata)
         update("Анализ видеофайла...")
         t0 = time.time()
         width, height, fps_str, duration, has_audio, sample_rate = FFmpegUtils.get_video_metadata(input_path)
+        if cancel_token is not None:
+            cancel_token.check()
         update(f"[Profile] Probe finished in {time.time() - t0:.2f}s")
         update(f"Целевой FPS обработки: {fps_str}")
 
@@ -100,7 +127,7 @@ class Orchestrator:
             from src.transcriber import probe_cuda_available
 
             use_parallel_gpu = probe_cuda_available()
-        
+
         # 2. Split Video & Parallel Audio / GPU Whisper ASR
         audio_future = None
         transcribe_extract_future = None
@@ -110,29 +137,39 @@ class Orchestrator:
             # Split video first so 3 concurrent FFmpeg readers don't thrash the disk
             update("Разделение видео для параллельной обработки...")
             t0 = time.time()
-            
+
             if duration > 0:
                 adaptive_chunk_time = max(30, min(90, int(duration / workers)))
             else:
                 adaptive_chunk_time = max(30, CHUNK_DURATION_SECONDS)
-                
+
             update(f"Оптимальный размер чанка: {adaptive_chunk_time}с (Длительность: {duration:.1f}с)")
-            
+
             chunks_dir = os.path.join(job_dir, "chunks")
             os.makedirs(chunks_dir, exist_ok=True)
             chunk_pattern = os.path.join(chunks_dir, "chunk_%04d.mp4")
-            FFmpegUtils.split_video(input_path, chunk_pattern, adaptive_chunk_time)
+            FFmpegUtils.split_video(
+                input_path, chunk_pattern, adaptive_chunk_time, cancel_token=cancel_token
+            )
+            if cancel_token is not None:
+                cancel_token.check()
             update(f"[Profile] Split video finished in {time.time() - t0:.2f}s")
 
             if has_audio:
                 update("Запуск обработки аудио (в фоне)...")
-                audio_future = audio_executor.submit(AudioProcessor.process, input_path, audio_pitched_path, sample_rate)
+                audio_future = audio_executor.submit(
+                    AudioProcessor.process, input_path, audio_pitched_path, sample_rate, cancel_token
+                )
                 if transcribe and transcript_path:
                     if use_parallel_gpu:
                         def _extract_and_run_gpu_asr() -> tuple[bool, dict | None]:
-                            raw_ok = FFmpegUtils.extract_transcription_audio(input_path, audio_16k_path)
+                            raw_ok = FFmpegUtils.extract_transcription_audio(
+                                input_path, audio_16k_path, cancel_token=cancel_token
+                            )
                             if not raw_ok:
                                 return False, None
+                            if cancel_token is not None:
+                                cancel_token.check()
                             update("Параллельная транскрибация на GPU (в фоне обработки видео)...")
                             from src.transcriber import Transcriber
 
@@ -142,23 +179,39 @@ class Orchestrator:
                                 compute_device="cuda",
                                 threads=1,
                                 status_cb=update,
+                                cancel_token=cancel_token,
                             )
                             return True, asr_state
 
                         parallel_gpu_future = audio_executor.submit(_extract_and_run_gpu_asr)
                     else:
                         transcribe_extract_future = audio_executor.submit(
-                            FFmpegUtils.extract_transcription_audio, input_path, audio_16k_path
+                            FFmpegUtils.extract_transcription_audio,
+                            input_path,
+                            audio_16k_path,
+                            cancel_token,
                         )
-            
+
             input_chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
-            
+
             if not input_chunks:
                 # Fallback
                 update("Распознавание лиц и блюр (Быстрый режим для короткого видео)...")
                 video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
                 vp = VideoProcessor()
-                vp.process(input_path, video_blurred_path, fps=fps_str, orig_width=width, orig_height=height)
+                fallback_ev = threading.Event()
+                if cancel_token is not None:
+                    cancel_token.register_cancel_callback(fallback_ev.set)
+                vp.process(
+                    input_path,
+                    video_blurred_path,
+                    fps=fps_str,
+                    orig_width=width,
+                    orig_height=height,
+                    cancel_event=fallback_ev,
+                )
+                if cancel_token is not None:
+                    cancel_token.check()
             else:
                 # 3. Process chunks in parallel via 'spawn' (avoids Linux fork() deadlocks with CUDA / ONNX Runtime)
                 active_workers = max(1, min(workers, len(input_chunks)))
@@ -166,10 +219,11 @@ class Orchestrator:
                 t0 = time.time()
                 processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
                 os.makedirs(processed_chunks_dir, exist_ok=True)
-                
+
                 spawn_ctx = mp.get_context("spawn")
                 log_queue = spawn_ctx.Queue()
-                
+                worker_cancel_event = spawn_ctx.Event()
+
                 def log_listener():
                     while True:
                         try:
@@ -183,36 +237,81 @@ class Orchestrator:
                 listener_thread = threading.Thread(target=log_listener, daemon=True)
                 listener_thread.start()
 
+                futures_map = {}
+                executor = ProcessPoolExecutor(
+                    max_workers=active_workers,
+                    mp_context=spawn_ctx,
+                    initializer=init_worker,
+                    initargs=(log_queue, worker_cancel_event),
+                )
+
+                def _abort_workers():
+                    worker_cancel_event.set()
+                    for f in list(futures_map.keys()):
+                        f.cancel()
+
+                if cancel_token is not None:
+                    cancel_token.register_cancel_callback(_abort_workers)
+
                 try:
-                    futures_map = {}
-                    with ProcessPoolExecutor(
-                        max_workers=active_workers,
-                        mp_context=spawn_ctx,
-                        initializer=init_worker,
-                        initargs=(log_queue,),
-                    ) as executor:
-                        for idx, chunk in enumerate(input_chunks):
-                            out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                            f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
-                            futures_map[f] = out_chunk
-                    
-                        output_chunks = []
-                        completed_count = 0
-                        total_chunks = len(futures_map)
-                        for future in as_completed(futures_map):
-                            out_chunk = futures_map[future]
-                            _, chunk_duration = future.result()
-                            completed_count += 1
-                            update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
-                            output_chunks.append(out_chunk)
+                    for idx, chunk in enumerate(input_chunks):
+                        if cancel_token is not None:
+                            cancel_token.check()
+                        out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
+                        f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
+                        futures_map[f] = out_chunk
+
+                    output_chunks = []
+                    completed_count = 0
+                    total_chunks = len(futures_map)
+                    for future in as_completed(futures_map):
+                        if cancel_token is not None:
+                            cancel_token.check()
+                        out_chunk = futures_map[future]
+                        chunk_ok, chunk_duration = future.result()
+                        if cancel_token is not None:
+                            cancel_token.check()
+                        if not chunk_ok:
+                            raise RuntimeError(f"Ошибка обработки видео-чанка: {os.path.basename(out_chunk)}")
+                        completed_count += 1
+                        update(
+                            f"[Profile] Finished: {os.path.basename(out_chunk)} "
+                            f"({completed_count}/{total_chunks}) in {chunk_duration:.2f}s"
+                        )
+                        output_chunks.append(out_chunk)
+                except BaseException:
+                    worker_cancel_event.set()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    procs = list((getattr(executor, "_processes", None) or {}).values())
+                    deadline = time.time() + 0.6
+                    for p in procs:
+                        rem = max(0.0, deadline - time.time())
+                        if p.is_alive() and rem > 0:
+                            p.join(timeout=rem)
+                        if p.is_alive():
+                            try:
+                                p.terminate()
+                            except Exception:
+                                pass
+                    raise
+                else:
+                    executor.shutdown(wait=True)
                 finally:
-                    log_queue.put("DONE")
-                    listener_thread.join(timeout=5.0)
-                    log_queue.close()
-                
+                    try:
+                        log_queue.put("DONE")
+                    except Exception:
+                        pass
+                    listener_thread.join(timeout=1.5)
+                    try:
+                        log_queue.close()
+                    except Exception:
+                        pass
+
                 update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
-                    
+
                 # 4. Concat processed chunks
+                if cancel_token is not None:
+                    cancel_token.check()
                 update("Склейка обработанных кусков...")
                 t0 = time.time()
                 list_file_path = os.path.join(job_dir, "concat_list.txt")
@@ -220,12 +319,16 @@ class Orchestrator:
                     for out_chunk in sorted(output_chunks):
                         safe_path = out_chunk.replace('\\', '/')
                         f.write(f"file '{safe_path}'\n")
-                        
+
                 video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
-                FFmpegUtils.concat_videos(list_file_path, video_blurred_path)
+                FFmpegUtils.concat_videos(
+                    list_file_path, video_blurred_path, cancel_token=cancel_token
+                )
                 update(f"[Profile] Concat chunks finished in {time.time() - t0:.2f}s")
-            
+
             # 5. Wait for Audio
+            if cancel_token is not None:
+                cancel_token.check()
             final_audio_path = None
             raw_wav_ready = False
             if has_audio and audio_future:
@@ -237,17 +340,23 @@ class Orchestrator:
                     final_audio_path = audio_pitched_path
             if transcribe_extract_future is not None:
                 raw_wav_ready = bool(transcribe_extract_future.result())
-            
+
             # 6. Mux final result
+            if cancel_token is not None:
+                cancel_token.check()
             update("Сборка финального видео...")
             t0 = time.time()
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            FFmpegUtils.mux(video_blurred_path, final_audio_path, output_path)
+            FFmpegUtils.mux(
+                video_blurred_path, final_audio_path, output_path, cancel_token=cancel_token
+            )
             update(f"[Profile] Mux finished in {time.time() - t0:.2f}s")
 
             # 7. Local Auto-Transcription with Speaker Diarization (if enabled)
             transcript_ready = False
             if transcribe and transcript_path:
+                if cancel_token is not None:
+                    cancel_token.check()
                 from src.transcriber import Transcriber, format_transcript_txt
 
                 gpu_asr_state = None
@@ -277,6 +386,7 @@ class Orchestrator:
                         speaker_count=speaker_count,
                         threads=diar_cpu_threads,
                         status_cb=update,
+                        cancel_token=cancel_token,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
                 else:
@@ -289,11 +399,25 @@ class Orchestrator:
                         threads=workers,
                         compute_device=requested_device,
                         status_cb=update,
+                        cancel_token=cancel_token,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
         finally:
-            audio_executor.shutdown(wait=True)
-        
+            if cancel_token is not None and cancel_token.is_cancelled():
+                pending = [
+                    f
+                    for f in (audio_future, transcribe_extract_future, parallel_gpu_future)
+                    if f is not None
+                ]
+                if pending:
+                    futures_wait(pending, timeout=1.5)
+                audio_executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                audio_executor.shutdown(wait=True)
+
+        if cancel_token is not None:
+            cancel_token.check()
+
         update(f"Success! Output saved to: {output_path}. Total time: {time.time() - total_start_time:.2f}s")
         return {
             "video_ready": os.path.isfile(output_path),
