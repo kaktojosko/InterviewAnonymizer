@@ -322,20 +322,20 @@ def cluster_anchor_embeddings(
     sim_threshold: float = DIARIZATION_CENTROID_SIM_THRESHOLD,
     multi_sim_threshold: float = DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
     merge_gap_sec: float = DIARIZATION_MERGE_GAP_SEC,
-) -> list[DiarizationSegment]:
+    return_centroids: bool = False,
+) -> list[DiarizationSegment] | tuple[list[DiarizationSegment], dict[int, np.ndarray]]:
     """
     Two-stage Anchor-Centroid speaker clustering:
       1. Discovers true speaker voiceprint centroids exclusively from reliable
          anchor utterances (>=2.0s) via duration-weighted cosine centroid
          agglomeration (immune to Complete-Linkage outlier shattering on long
          45-90 min interviews).
-      2. Assigns all segments — including <2.0s backchannels ('Mm-hmm',
-         'Добрый день', 'Пожалуйста') — to the closest anchor speaker centroid
-         with a light temporal continuity prior, followed by one centroid
-         refinement pass.
+      2. Assigns all segments — including rapid <1.5s answers and backchannels
+         ('Ну да', 'Все', 'Добрый день') — unbiasedly to their closest vocal
+         centroid, followed by centroid refinement and voiceprint export.
     """
     if not segments:
-        return []
+        return ([], {}) if return_centroids else []
     if len(segments) != len(embeddings):
         raise ValueError("segments and embeddings must have identical length")
 
@@ -349,12 +349,6 @@ def cluster_anchor_embeddings(
     else:
         target_k = None
         eff_sim_thr = float(sim_threshold)
-
-    if target_k == 1:
-        return smooth_diarization_segments(
-            [DiarizationSegment(s.start, s.end, 0) for s in segments],
-            merge_gap_sec=merge_gap_sec,
-        )
 
     durations = [max(0.0, float(s.end - s.start)) for s in segments]
     norm_embs: list[Optional[np.ndarray]] = []
@@ -371,11 +365,22 @@ def cluster_anchor_embeddings(
         norm_embs.append(vec / norm)
         valid_indices.append(idx)
 
-    if not valid_indices:
-        return smooth_diarization_segments(
+    if target_k == 1 or not valid_indices:
+        single_out = smooth_diarization_segments(
             [DiarizationSegment(s.start, s.end, 0) for s in segments],
             merge_gap_sec=merge_gap_sec,
         )
+        if not return_centroids:
+            return single_out
+        if valid_indices:
+            acc = np.zeros_like(norm_embs[valid_indices[0]])
+            for vi in valid_indices:
+                acc += min(max(durations[vi], 0.25), 8.0) * norm_embs[vi]
+            nrm = float(np.linalg.norm(acc))
+            cents = {0: acc / max(nrm, 1e-12)} if nrm > 1e-8 else {}
+        else:
+            cents = {}
+        return single_out, cents
 
     min_needed = max(2, target_k or 2)
     anchor_idx = [i for i in valid_indices if durations[i] >= 2.0]
@@ -447,19 +452,11 @@ def cluster_anchor_embeddings(
     def _assign_to_centroids(cent_mat: np.ndarray) -> list[int]:
         assigned_ids: list[int] = []
         prev_spk: Optional[int] = None
-        for idx, emb_vec in enumerate(norm_embs):
+        for emb_vec in norm_embs:
             if emb_vec is None:
                 spk = prev_spk if prev_spk is not None else 0
             else:
                 sims = cent_mat @ emb_vec
-                if (
-                    prev_spk is not None
-                    and prev_spk < len(sims)
-                    and durations[idx] < 1.5
-                    and (segments[idx].start - segments[idx - 1].end) <= 1.0
-                ):
-                    sims = sims.copy()
-                    sims[prev_spk] += 0.04
                 spk = int(np.argmax(sims))
             assigned_ids.append(spk)
             prev_spk = spk
@@ -510,7 +507,28 @@ def cluster_anchor_embeddings(
     smoothed = smooth_diarization_segments(out_segments, merge_gap_sec=merge_gap_sec)
     if target_k is None:
         smoothed = consolidate_minor_speakers(smoothed, merge_gap_sec=merge_gap_sec)
-    return smoothed
+
+    if not return_centroids:
+        return smoothed
+
+    surviving_spks = {s.speaker for s in smoothed}
+    final_centroids: dict[int, np.ndarray] = {}
+    for spk_id in sorted(surviving_spks):
+        strong_ids = [
+            i
+            for i, spk in enumerate(assigned)
+            if spk == spk_id and norm_embs[i] is not None and durations[i] >= 1.2
+        ]
+        if not strong_ids:
+            strong_ids = [
+                i for i, spk in enumerate(assigned) if spk == spk_id and norm_embs[i] is not None
+            ]
+        if strong_ids:
+            final_centroids[spk_id] = _compute_centroid(strong_ids)
+        elif 0 <= spk_id < cent_mat.shape[0]:
+            final_centroids[spk_id] = cent_mat[spk_id]
+
+    return smoothed, final_centroids
 
 
 
@@ -748,9 +766,9 @@ def build_vad_asr_windows(
 ) -> list[tuple[float, float]]:
     """
     Slices raw audio into <=26s speech-only windows via Silero VAD (single CPU
-    thread, ~1s for a 1-hour file) and filters narrowband dial-tone beeps.
-    Used in parallel GPU mode so Whisper immediately saturates CUDA without
-    waiting for CPU speaker diarization.
+    thread, ~1s for a 1-hour file), filters narrowband dial-tone beeps, and
+    subdivides continuous rapid dialogue at local 50ms RMS energy valleys rather
+    than hard mid-word duration cuts.
     """
     total_dur = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
     if total_dur <= 0.0 or samples.size < 800:
@@ -760,10 +778,10 @@ def build_vad_asr_windows(
         samples,
         vad_options=VadOptions(
             threshold=0.45,
-            min_speech_duration_ms=200,
-            max_speech_duration_s=max_window_sec,
-            min_silence_duration_ms=450,
-            speech_pad_ms=150,
+            min_speech_duration_ms=180,
+            max_speech_duration_s=float("inf"),
+            min_silence_duration_ms=300,
+            speech_pad_ms=180,
         ),
         sampling_rate=sample_rate,
     )
@@ -818,7 +836,9 @@ def build_vad_asr_windows(
         if w_end - w_start >= 0.1:
             windows.append((w_start, w_end))
 
-    return windows
+    return subdivide_long_asr_windows(
+        windows, samples, sample_rate=sample_rate, max_window_sec=max_window_sec
+    )
 
 
 def group_bpe_tokens_to_units(
@@ -862,30 +882,420 @@ def group_bpe_tokens_to_units(
     return units
 
 
+_COMPOUND_HYPHEN_BEFORE_RE = re.compile(r"([A-Za-zА-Яа-яЁё])\s+-([A-Za-zА-Яа-яЁё])")
+_NUMERIC_SUFFIX_HYPHEN_RE = re.compile(r"([0-9])\s+-([A-Za-zА-Яа-яЁё]{1,4})\b")
+_ENCLITIC_HYPHEN_AFTER_RE = re.compile(
+    r"\b([А-Яа-яЁё]+)-\s+(то|либо|нибудь|таки|ка)\b", re.IGNORECASE
+)
+_PREFIX_HYPHEN_AFTER_RE = re.compile(
+    r"\b(по|во|в|из|кое)-\s+([А-Яа-яЁё]{2,})\b", re.IGNORECASE
+)
+_MULTI_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!…])\s+(?=[A-ZА-ЯЁ0-9\"'«])")
+_SENTENCE_END_PUNCT_RE = re.compile(r"(?:[.?!…]+|[.?!][\"'»\)]*)$")
+_STRIP_PUNCT_RE = re.compile(r"^[^\wА-Яа-яЁё]+|[^\wА-Яа-яЁё]+$")
+
+_TURN_STARTER_WORDS = frozenset(
+    {
+        "да",
+        "нет",
+        "ну",
+        "так",
+        "хорошо",
+        "ладно",
+        "окей",
+        "ок",
+        "понял",
+        "понятно",
+        "угу",
+        "ага",
+        "слушай",
+        "слушайте",
+        "смотри",
+        "смотрите",
+        "короче",
+        "кстати",
+        "тогда",
+        "значит",
+        "супер",
+        "отлично",
+        "ясно",
+        "скажи",
+        "расскажи",
+        "какие",
+        "какой",
+        "какая",
+        "а",
+        "но",
+        "yes",
+        "yeah",
+        "no",
+        "well",
+        "okay",
+        "ok",
+        "right",
+        "so",
+    }
+)
+
+_NON_FINAL_SYNTACTIC_WORDS = frozenset(
+    {
+        "в",
+        "на",
+        "к",
+        "ко",
+        "с",
+        "со",
+        "у",
+        "о",
+        "об",
+        "от",
+        "до",
+        "из",
+        "за",
+        "по",
+        "про",
+        "без",
+        "для",
+        "при",
+        "не",
+        "ни",
+        "же",
+        "бы",
+        "ли",
+        "и",
+        "а",
+        "но",
+        "или",
+        "что",
+        "как",
+        "где",
+        "когда",
+        "который",
+        "которая",
+        "которые",
+        "это",
+        "то",
+        "все",
+        "всё",
+        "еще",
+        "ещё",
+        "очень",
+        "прям",
+        "просто",
+    }
+)
+
+_RESPONSE_OPENER_WORDS = frozenset(
+    {
+        "да",
+        "нет",
+        "ну",
+        "угу",
+        "ага",
+        "все",
+        "всё",
+        "конечно",
+        "точно",
+        "верно",
+        "есть",
+        "хорошо",
+        "ладно",
+        "ок",
+        "окей",
+        "а",
+        "понял",
+        "понятно",
+        "удивительно",
+        "отлично",
+        "супер",
+        "yes",
+        "yeah",
+        "no",
+        "sure",
+        "right",
+    }
+)
+
+
 def _join_unit_texts(pieces: list[str]) -> str:
     if not pieces:
         return ""
-    raw = "".join(
-        p if (idx == 0 or p.startswith(" ")) else f" {p}"
-        for idx, p in enumerate(pieces)
-    )
+    raw_parts: list[str] = []
+    for idx, p in enumerate(pieces):
+        if idx == 0 or p.startswith(" ") or (len(p) > 1 and p.startswith("-") and p[1].isalnum()):
+            raw_parts.append(p)
+        else:
+            raw_parts.append(f" {p}")
+    raw = "".join(raw_parts)
     # Normalize multiple spaces and spaces before punctuation
     compact = " ".join(raw.split())
-    for punct in (".", ",", "!", "?", ":", ";"):
+    for punct in (".", ",", "!", "?", ":", ";", "…"):
         compact = compact.replace(f" {punct}", punct)
+    # Fix broken Whisper compound hyphens ('что -то' -> 'что-то', 'ключ -кандидат' -> 'ключ-кандидат')
+    # while preserving spaced sentence dashes ('базовые - есть ещё')
+    compact = _COMPOUND_HYPHEN_BEFORE_RE.sub(r"\1-\2", compact)
+    compact = _NUMERIC_SUFFIX_HYPHEN_RE.sub(r"\1-\2", compact)
+    compact = _ENCLITIC_HYPHEN_AFTER_RE.sub(r"\1-\2", compact)
+    compact = _PREFIX_HYPHEN_AFTER_RE.sub(r"\1-\2", compact)
     return clean_hallucinated_text(compact.strip())
+
+
+@dataclass
+class _SpeechClause:
+    start: float
+    end: float
+    text: str
+
+
+def _clean_word_lower(raw_token: str) -> str:
+    return _STRIP_PUNCT_RE.sub("", raw_token.strip()).lower()
+
+
+def _expand_multi_sentence_units(units: list[TimedUnit]) -> list[TimedUnit]:
+    """
+    If a coarse segment-level TimedUnit contains multiple punctuated sentences,
+    proportionally subdivides its [start, end] span into per-sentence TimedUnits
+    so rapid Q&A inside one segment ('...в работе? Ну да.') can be attributed
+    per sentence. Word-level TimedUnits pass through unchanged.
+    """
+    expanded: list[TimedUnit] = []
+    for u in units:
+        txt = u.text.strip()
+        dur = max(0.0, float(u.end) - float(u.start))
+        if dur >= 0.8 and ("?" in txt or "." in txt or "!" in txt):
+            parts = [p.strip() for p in _MULTI_SENTENCE_SPLIT_RE.split(txt) if p and p.strip()]
+            if len(parts) >= 2:
+                weights = [max(1, len(p)) for p in parts]
+                total_w = float(sum(weights))
+                cur_t = float(u.start)
+                for i, (part, w) in enumerate(zip(parts, weights)):
+                    nxt_t = float(u.end) if i == len(parts) - 1 else (cur_t + dur * (w / total_w))
+                    expanded.append(TimedUnit(start=cur_t, end=max(cur_t + 0.04, nxt_t), text=f" {part}"))
+                    cur_t = nxt_t
+                continue
+        expanded.append(u)
+    return expanded
+
+
+def _score_span_overlap(
+    s_start: float,
+    s_end: float,
+    diar_segments: list[DiarizationSegment],
+    seg_ends: list[float],
+    prev_spk: Optional[int] = None,
+) -> tuple[int, dict[int, float], bool]:
+    """
+    Returns (chosen_speaker, overlap_by_speaker, has_nearby_contention) for a
+    temporal span [s_start, s_end].
+    """
+    u_start = float(s_start)
+    u_end = max(u_start + 0.02, float(s_end))
+
+    idx = max(0, bisect.bisect_left(seg_ends, u_start - 1.5) - 1)
+    overlap_by_spk: dict[int, float] = {}
+    nearby_speakers: set[int] = set()
+    nearest_dist = float("inf")
+    nearest_spk = diar_segments[0].speaker
+
+    for j in range(idx, len(diar_segments)):
+        seg = diar_segments[j]
+        if seg.start > u_end + 1.5:
+            break
+
+        if seg.end >= (u_start - 0.65) and seg.start <= (u_end + 0.65):
+            nearby_speakers.add(seg.speaker)
+
+        ov = min(u_end, seg.end) - max(u_start, seg.start)
+        if ov > 0.0:
+            overlap_by_spk[seg.speaker] = overlap_by_spk.get(seg.speaker, 0.0) + ov
+        else:
+            dist = min(abs(u_start - seg.end), abs(seg.start - u_end))
+            if dist < nearest_dist or (
+                math.isclose(dist, nearest_dist, abs_tol=0.05) and seg.speaker == prev_spk
+            ):
+                nearest_dist = dist
+                nearest_spk = seg.speaker
+
+    if overlap_by_spk:
+        chosen_spk = max(
+            overlap_by_spk.items(),
+            key=lambda kv: (kv[1], 1 if kv[0] == prev_spk else 0),
+        )[0]
+    elif nearest_dist <= 1.5:
+        chosen_spk = nearest_spk
+    elif prev_spk is not None:
+        chosen_spk = prev_spk
+    else:
+        closest_seg = min(
+            diar_segments,
+            key=lambda s: min(abs(u_start - s.end), abs(s.start - u_end)),
+        )
+        chosen_spk = closest_seg.speaker
+
+    has_contention = len(nearby_speakers) >= 2
+    if len(overlap_by_spk) >= 2:
+        sorted_ovs = sorted(overlap_by_spk.values(), reverse=True)
+        if sorted_ovs[1] >= 0.10:
+            has_contention = True
+
+    return chosen_spk, overlap_by_spk, has_contention
+
+
+def _split_unpunctuated_multispeaker_units(
+    clause_units: list[TimedUnit],
+    diar_segments: list[DiarizationSegment],
+    seg_ends: list[float],
+    depth: int = 0,
+) -> list[list[TimedUnit]]:
+    """
+    When Whisper omits punctuation across a fast turn transition (e.g. '...сложно
+    джойном отнести хорошо так ладно раз мы залезли...'), finds the most natural
+    syntactic + acoustic speaker transition point without tearing trailing verbs
+    or 1-2 word prefixes away from their clause.
+    """
+    if depth >= 2 or len(clause_units) < 6 or not diar_segments:
+        return [clause_units]
+
+    span_start = float(clause_units[0].start)
+    span_end = float(clause_units[-1].end)
+    if (span_end - span_start) < 2.4:
+        return [clause_units]
+
+    _, ov_map, _ = _score_span_overlap(span_start, span_end, diar_segments, seg_ends)
+    substantial_spks = [spk for spk, ov in ov_map.items() if ov >= 0.65]
+    if len(substantial_spks) < 2:
+        return [clause_units]
+
+    best_k: Optional[int] = None
+    best_score = -1e9
+
+    for k in range(2, len(clause_units) - 1):
+        left_s = float(clause_units[0].start)
+        left_e = float(clause_units[k - 1].end)
+        right_s = float(clause_units[k].start)
+        right_e = float(clause_units[-1].end)
+        left_dur = left_e - left_s
+        right_dur = right_e - right_s
+        if left_dur < 0.75 or right_dur < 0.75:
+            continue
+
+        left_spk, left_ov, _ = _score_span_overlap(left_s, left_e, diar_segments, seg_ends)
+        right_spk, right_ov, _ = _score_span_overlap(right_s, right_e, diar_segments, seg_ends)
+        if left_spk == right_spk:
+            continue
+
+        left_total_ov = sum(left_ov.values()) or max(0.01, left_dur)
+        right_total_ov = sum(right_ov.values()) or max(0.01, right_dur)
+        left_purity = left_ov.get(left_spk, 0.0) / left_total_ov
+        right_purity = right_ov.get(right_spk, 0.0) / right_total_ov
+        if left_purity < 0.58 or right_purity < 0.58:
+            continue
+
+        prev_raw = clause_units[k - 1].text.rstrip()
+        prev_word = _clean_word_lower(clause_units[k - 1].text)
+        next_word = _clean_word_lower(clause_units[k].text)
+        gap = max(0.0, right_s - left_e)
+
+        ling_bonus = 0.0
+        if prev_raw.endswith((",", ":", ";", "—", "-")):
+            ling_bonus += 0.42
+        if next_word in _TURN_STARTER_WORDS:
+            ling_bonus += 0.45
+        if prev_word in _NON_FINAL_SYNTACTIC_WORDS and not prev_raw.endswith((",", ":", ";")):
+            ling_bonus -= 0.85
+        ling_bonus += 0.25 * min(1.0, gap / 0.30)
+
+        score = left_purity + right_purity + ling_bonus
+        if score > best_score:
+            best_score = score
+            best_k = k
+
+    if best_k is None or best_score < 1.35:
+        return [clause_units]
+
+    left_part = _split_unpunctuated_multispeaker_units(
+        clause_units[:best_k], diar_segments, seg_ends, depth=depth + 1
+    )
+    right_part = _split_unpunctuated_multispeaker_units(
+        clause_units[best_k:], diar_segments, seg_ends, depth=depth + 1
+    )
+    return left_part + right_part
+
+
+def _build_speech_clauses(
+    units: list[TimedUnit],
+    diar_segments: list[DiarizationSegment],
+    seg_ends: list[float],
+) -> list[_SpeechClause]:
+    """
+    Groups word-level TimedUnits into atomic grammatical clauses so sentences
+    like 'А что такое ключ-кандидат?' are never torn mid-phrase across speakers
+    during overlapping turn transitions.
+    """
+    expanded = _expand_multi_sentence_units(units)
+    if not expanded:
+        return []
+
+    raw_groups: list[list[TimedUnit]] = [[expanded[0]]]
+    for cur_u in expanded[1:]:
+        prev_u = raw_groups[-1][-1]
+        prev_r = prev_u.text.rstrip()
+        gap = float(cur_u.start) - float(prev_u.end)
+
+        ends_sentence = bool(_SENTENCE_END_PUNCT_RE.search(prev_r))
+        if ends_sentence and prev_r.endswith(".") and not prev_r.endswith(".."):
+            prev_alpha = _clean_word_lower(prev_r)
+            cur_stripped = cur_u.text.lstrip()
+            cur_Starts_lower = bool(cur_stripped) and cur_stripped[0].islower()
+            if len(prev_alpha) <= 2 and cur_Starts_lower and gap < 0.25:
+                ends_sentence = False
+
+        if ends_sentence or gap >= 0.48:
+            raw_groups.append([cur_u])
+        else:
+            raw_groups[-1].append(cur_u)
+
+    clauses: list[_SpeechClause] = []
+    for grp in raw_groups:
+        last_txt = grp[-1].text.rstrip()
+        is_unpunctuated = not bool(_SENTENCE_END_PUNCT_RE.search(last_txt))
+        sub_groups = (
+            _split_unpunctuated_multispeaker_units(grp, diar_segments, seg_ends)
+            if (is_unpunctuated and diar_segments)
+            else [grp]
+        )
+        for sub in sub_groups:
+            joined = _join_unit_texts([u.text for u in sub])
+            if not joined:
+                continue
+            c_start = float(sub[0].start)
+            c_end = max(c_start + 0.02, float(max(u.end for u in sub)))
+            clauses.append(_SpeechClause(start=c_start, end=c_end, text=joined))
+
+    return clauses
 
 
 def align_units_to_speakers(
     units: list[TimedUnit],
     diar_segments: list[DiarizationSegment],
     pause_break_sec: float = TRANSCRIPT_PAUSE_BREAK_SEC,
+    samples: Optional[np.ndarray] = None,
+    sample_rate: int = 16000,
+    speaker_centroids: Optional[dict[int, np.ndarray]] = None,
+    embedding_extractor: Optional[sherpa_onnx.SpeakerEmbeddingExtractor] = None,
+    clause_embed_fn: Optional[Callable[[np.ndarray, int, float, float], Optional[np.ndarray]]] = None,
 ) -> tuple[list[SpeakerTurn], int]:
     """
-    Assigns each TimedUnit to the speaker with maximum temporal overlap (or
-    nearest speaker boundary within 1.5s if inside a micro-gap), normalizes
-    speaker IDs chronologically (Спикер 1, Спикер 2, ...), and merges contiguous
-    same-speaker units into readable dialogue turns.
+    Clause-aware + voiceprint-verified speaker attribution:
+      1. Groups words into grammatical clauses/sentences so simultaneous turn
+         starts ('А что такое ключ-кандидат?') and trailing verbs ('...отнести.')
+         are never torn mid-clause by +-250ms overlap boundaries.
+      2. Scores each clause against diarization segments with edge-bleed trimming.
+      3. When speaker CAM++ voiceprint centroids and waveform samples are
+         available, acoustically verifies Q&A turns, rapid replies ('Ну да.',
+         'Ну да, есть немного.'), and contested overlap clauses directly against
+         speaker centroids, separating ping-pong dialogue even if coarse
+         segmentation fused adjacent turns.
     """
     non_empty_units = [u for u in units if u.text and u.text.strip()]
     if not non_empty_units:
@@ -915,74 +1325,142 @@ def align_units_to_speakers(
         return merged_turns, (1 if merged_turns else 0)
 
     seg_ends = [s.end for s in diar_segments]
+    clauses = _build_speech_clauses(non_empty_units, diar_segments, seg_ends)
+    if not clauses:
+        return [], 0
+
     prev_spk: Optional[int] = None
-    assigned: list[tuple[TimedUnit, int]] = []
+    assigned_spks: list[int] = []
+    clause_contentions: list[bool] = []
 
-    for u in non_empty_units:
-        u_start = float(u.start)
-        u_end = max(u_start + 0.02, float(u.end))
-
-        # Binary search first segment whose end > u_start - 1.5
-        idx = max(0, bisect.bisect_left(seg_ends, u_start - 1.5) - 1)
-        overlap_by_spk: dict[int, float] = {}
-        nearest_dist = float("inf")
-        nearest_spk = diar_segments[0].speaker
-
-        for j in range(idx, len(diar_segments)):
-            seg = diar_segments[j]
-            if seg.start > u_end + 1.5:
-                break
-
-            ov = min(u_end, seg.end) - max(u_start, seg.start)
-            if ov > 0.0:
-                overlap_by_spk[seg.speaker] = overlap_by_spk.get(seg.speaker, 0.0) + ov
-            else:
-                dist = min(abs(u_start - seg.end), abs(seg.start - u_end))
-                if dist < nearest_dist or (
-                    math.isclose(dist, nearest_dist, abs_tol=0.05) and seg.speaker == prev_spk
-                ):
-                    nearest_dist = dist
-                    nearest_spk = seg.speaker
-
-        if overlap_by_spk:
-            chosen_spk = max(
-                overlap_by_spk.items(),
-                key=lambda kv: (kv[1], 1 if kv[0] == prev_spk else 0),
-            )[0]
-        elif nearest_dist <= 1.5:
-            chosen_spk = nearest_spk
-        elif prev_spk is not None:
-            chosen_spk = prev_spk
-        else:
-            # Pick globally closest diarization segment
-            closest_seg = min(
-                diar_segments,
-                key=lambda s: min(abs(u_start - s.end), abs(s.start - u_end)),
-            )
-            chosen_spk = closest_seg.speaker
-
+    for cl in clauses:
+        dur = cl.end - cl.start
+        # Trim up to 100ms inward on multi-word clauses so overlap bleed at turn
+        # edges doesn't outweigh the main body of the sentence
+        trim = min(0.10, 0.15 * dur) if (dur >= 0.65 and " " in cl.text) else 0.0
+        chosen_spk, _, contended = _score_span_overlap(
+            cl.start + trim,
+            cl.end - trim,
+            diar_segments,
+            seg_ends,
+            prev_spk=prev_spk,
+        )
+        assigned_spks.append(chosen_spk)
+        clause_contentions.append(contended)
         prev_spk = chosen_spk
-        assigned.append((u, chosen_spk))
+
+    # Acoustic clause verification via CAM++ voiceprints for Q&A and rapid back-and-forth
+    can_verify_acoustically = (
+        samples is not None
+        and samples.size >= int(0.35 * sample_rate)
+        and speaker_centroids is not None
+        and len(speaker_centroids) >= 2
+        and (embedding_extractor is not None or clause_embed_fn is not None)
+    )
+    if can_verify_acoustically:
+        spk_ids = sorted(speaker_centroids.keys())
+        cent_mat = np.stack([speaker_centroids[k] for k in spk_ids], axis=0)
+        spk_to_row = {k: i for i, k in enumerate(spk_ids)}
+
+        for idx, cl in enumerate(clauses):
+            cur_spk = assigned_spks[idx]
+            dur = cl.end - cl.start
+            if dur < 0.30 or dur > 8.5 or cur_spk not in spk_to_row:
+                continue
+
+            ends_q = cl.text.rstrip().endswith("?")
+            prev_ends_q = (
+                idx > 0
+                and clauses[idx - 1].text.rstrip().endswith("?")
+                and (cl.start - clauses[idx - 1].end) <= 2.2
+            )
+            next_ends_q = (
+                idx + 1 < len(clauses)
+                and clauses[idx + 1].text.rstrip().endswith("?")
+                and (clauses[idx + 1].start - cl.end) <= 1.8
+            )
+            contended = clause_contentions[idx]
+            first_word = _clean_word_lower(cl.text.split()[0]) if cl.text.split() else ""
+            is_short_reply = dur <= 2.8 and first_word in _RESPONSE_OPENER_WORDS
+
+            if not (ends_q or prev_ends_q or next_ends_q or contended or is_short_reply):
+                continue
+
+            v_trim = min(0.05, 0.10 * dur) if dur >= 0.55 else 0.0
+            v_start = cl.start + v_trim
+            v_end = cl.end - v_trim
+            s_i = max(0, int(v_start * sample_rate))
+            e_i = min(len(samples), int(v_end * sample_rate))
+            if e_i - s_i < int(0.26 * sample_rate):
+                continue
+            wav_slice = samples[s_i:e_i]
+            rms = float(np.sqrt(np.mean(wav_slice * wav_slice)))
+            if rms < 7e-4:
+                continue
+
+            if clause_embed_fn is not None:
+                emb_vec = clause_embed_fn(samples, sample_rate, v_start, v_end)
+            else:
+                emb_vec = Transcriber._extract_segment_embedding(
+                    embedding_extractor,
+                    samples,
+                    v_start,
+                    v_end,
+                    sample_rate=sample_rate,
+                    pad_short=False,
+                )
+            if emb_vec is None:
+                continue
+
+            sims = cent_mat @ emb_vec
+            best_row = int(np.argmax(sims))
+            best_spk = spk_ids[best_row]
+            if best_spk == cur_spk:
+                continue
+
+            best_sim = float(sims[best_row])
+            cur_sim = float(sims[spk_to_row[cur_spk]])
+            margin = best_sim - cur_sim
+
+            prev_final_spk = assigned_spks[idx - 1] if idx > 0 else None
+            dialogic_turn_prior = (prev_ends_q and prev_final_spk == cur_spk) or (
+                ends_q
+                and prev_final_spk == cur_spk
+                and idx > 0
+                and (cl.start - clauses[idx - 1].end) <= 1.5
+            )
+            if dialogic_turn_prior:
+                req_margin = 0.045 if dur >= 0.75 else 0.065
+                min_abs_sim = 0.38
+            elif contended:
+                req_margin = 0.065 if dur >= 0.90 else 0.090
+                min_abs_sim = 0.42
+            else:
+                req_margin = 0.085 if dur >= 0.90 else 0.110
+                min_abs_sim = 0.44
+
+            if best_sim >= min_abs_sim and margin >= req_margin:
+                assigned_spks[idx] = best_spk
 
     raw_turns: list[tuple[float, float, int, str]] = []
-    cur_spk_raw = assigned[0][1]
-    cur_start = assigned[0][0].start
-    cur_end = assigned[0][0].end
-    cur_pieces: list[str] = [assigned[0][0].text]
+    cur_spk_raw = assigned_spks[0]
+    cur_start = clauses[0].start
+    cur_end = clauses[0].end
+    cur_pieces: list[str] = [clauses[0].text]
 
-    for u, raw_spk in assigned[1:]:
-        gap = u.start - cur_end
+    for cl, raw_spk in zip(clauses[1:], assigned_spks[1:]):
+        gap = cl.start - cur_end
         if raw_spk != cur_spk_raw or gap > pause_break_sec:
             text_out = _join_unit_texts(cur_pieces)
             if text_out:
                 raw_turns.append((cur_start, cur_end, cur_spk_raw, text_out))
             cur_spk_raw = raw_spk
-            cur_start = u.start
-            cur_end = max(u.start, u.end)
-            cur_pieces = [u.text]
+            cur_start = cl.start
+            cur_end = max(cl.start, cl.end)
+            cur_pieces = [cl.text]
         else:
-            cur_pieces.append(u.text)
-            cur_end = max(cur_end, u.end)
+            cur_pieces.append(cl.text)
+            cur_end = max(cur_end, cl.end)
 
     last_text = _join_unit_texts(cur_pieces)
     if last_text:
@@ -1017,7 +1495,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.3.1)",
+        "# Транскрибация интервью (Interview Anonymizer v4.4.0)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -1191,6 +1669,43 @@ def resolve_compute_device(
     return "cpu", "int8"
 
 
+_WHISPER_STYLE_PROMPTS: dict[str, str] = {
+    "ru": (
+        "Здравствуйте! Расскажите, пожалуйста, про ваш опыт: AI, SQL, JOIN, UNION, "
+        "подзапросы, реляционные базы данных, ClickHouse, API, Python, Git, Docker. "
+        "Ну да, по-моему, что-то такое мы использовали в продакшене."
+    ),
+    "en": (
+        "Hello! Could you tell me about your engineering experience with AI, SQL, APIs, "
+        "relational databases, Python, Git, and Docker? Sure, we used them in production."
+    ),
+    "uk": (
+        "Вітаю! Розкажіть, будь ласка, про ваш досвід роботи з AI, SQL, JOIN, API, "
+        "реляційними базами даних, Python та Docker."
+    ),
+}
+
+_CONSECUTIVE_REPEAT_RE = re.compile(r"\b(\w+)(?:\s+\1){2,}\b", re.IGNORECASE)
+
+
+def _extract_clean_context_tail(text: str, max_chars: int = 140) -> str:
+    """
+    Extracts a verified, non-repetitive trailing snippet from the previous ASR
+    window to preserve punctuation and technical-term continuity across adjacent
+    windows without enabling Whisper's drift-prone condition_on_previous_text.
+    """
+    cleaned = clean_hallucinated_text(text or "")
+    if len(cleaned) < 12 or _CONSECUTIVE_REPEAT_RE.search(cleaned):
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+    tail = cleaned[-max_chars:]
+    space_pos = tail.find(" ")
+    if 0 <= space_pos < len(tail) - 8:
+        tail = tail[space_pos + 1 :]
+    return tail.strip()
+
+
 class Transcriber:
     """
     100% local speaker-diarized multilingual speech transcription pipeline.
@@ -1203,11 +1718,31 @@ class Transcriber:
         start_sec: float,
         end_sec: float,
         sample_rate: int = 16000,
+        pad_short: bool = True,
+        min_start: float = 0.0,
+        max_end: Optional[float] = None,
     ) -> Optional[np.ndarray]:
+        total_end = (len(samples) / float(sample_rate)) if max_end is None else max_end
         dur = end_sec - start_sec
-        pad = 0.06 if dur < 1.2 else 0.0
-        s_idx = max(0, int((start_sec - pad) * sample_rate))
-        e_idx = min(len(samples), int((end_sec + pad) * sample_rate))
+        if pad_short and dur < 1.2:
+            eff_start = max(min_start, start_sec - 0.05)
+            eff_end = min(total_end, end_sec + 0.05)
+        elif dur >= 1.0:
+            # Trim 40ms inward when abutting an adjacent turn to avoid co-articulation bleed
+            trim_l = 0.04 if (start_sec - min_start) < 0.15 and min_start > 0.0 else 0.0
+            trim_r = (
+                0.04
+                if (max_end is not None and (max_end - end_sec) < 0.15)
+                else 0.0
+            )
+            eff_start = start_sec + trim_l
+            eff_end = end_sec - trim_r
+        else:
+            eff_start = start_sec
+            eff_end = end_sec
+
+        s_idx = max(0, int(eff_start * sample_rate))
+        e_idx = min(len(samples), int(eff_end * sample_rate))
         seg_wav = samples[s_idx:e_idx]
         if seg_wav.size < int(0.18 * sample_rate):
             return None
@@ -1251,11 +1786,12 @@ class Transcriber:
         threads: int = 4,
         status_cb: Optional[Callable[[str], None]] = None,
         cancel_token: Optional[CancellationToken] = None,
-    ) -> list[DiarizationSegment]:
+        return_voiceprints: bool = False,
+    ):
         if cancel_token:
             cancel_token.check()
         if samples.size < 1600:  # < 0.1s
-            return []
+            return ([], {}, None) if return_voiceprints else []
 
         diar_threads = max(1, min(int(threads), 8))
         emb_workers = min(4, max(1, diar_threads // 2))
@@ -1263,16 +1799,16 @@ class Transcriber:
         mode = (speaker_count or "auto").strip().lower()
 
         # Pass 1: High-recall speaker-turn boundary detection via pyannote-segmentation-3.0.
-        # Note: sherpa-onnx's built-in FastClustering uses Complete Linkage, which shatters
-        # real speakers into 50+ clusters on long interviews; therefore we use a tight
-        # local threshold here ONLY to prevent cross-speaker turn merges, then extract clean
-        # full-turn CAM++ voiceprints and cluster via Anchor-Centroid clustering.
+        # Fine min_duration_on/off (0.18s) and tight local clustering threshold preserve
+        # rapid Q&A replies ('Ну да.', 'Все.', 'Немного?') instead of fusing adjacent speakers.
         diar_key = (
             seg_model_path,
             emb_model_path,
             diar_threads,
             emb_intra_threads,
             DIARIZATION_SEGMENTATION_THRESHOLD,
+            0.18,
+            0.18,
         )
 
         def _create_diar_engines():
@@ -1293,8 +1829,8 @@ class Transcriber:
                     num_clusters=-1,
                     threshold=DIARIZATION_SEGMENTATION_THRESHOLD,
                 ),
-                min_duration_on=0.30,
-                min_duration_off=0.45,
+                min_duration_on=0.18,
+                min_duration_off=0.18,
             )
             sd_inst = sherpa_onnx.OfflineSpeakerDiarization(cfg)
             ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
@@ -1342,9 +1878,9 @@ class Transcriber:
             speech_segments.append(DiarizationSegment(start=st, end=en, speaker=int(s.speaker)))
 
         if not speech_segments:
-            return []
+            return ([], {}, extractor) if return_voiceprints else []
 
-        # Merge micro-pauses (<=0.45s) within the same local turn up to 10s for cleaner embeddings
+        # Merge only ultra-short intra-speaker pauses (<=0.20s, <=6s span) before CAM++ extraction
         pre_merged: list[DiarizationSegment] = [
             DiarizationSegment(
                 speech_segments[0].start, speech_segments[0].end, speech_segments[0].speaker
@@ -1354,8 +1890,8 @@ class Transcriber:
             prev = pre_merged[-1]
             if (
                 cur.speaker == prev.speaker
-                and (cur.start - prev.end) <= 0.45
-                and (cur.end - prev.start) <= 10.0
+                and (cur.start - prev.end) <= 0.20
+                and (cur.end - prev.start) <= 6.0
             ):
                 prev.end = max(prev.end, cur.end)
             else:
@@ -1364,14 +1900,28 @@ class Transcriber:
         if status_cb and len(pre_merged) > 30:
             status_cb("Диаризация спикеров: 90% (сопоставление голосовых отпечатков)...")
 
+        total_dur_s = len(samples) / 16000.0
+
+        def _neighbor_bounds(idx: int) -> tuple[float, float]:
+            lo = pre_merged[idx - 1].end if idx > 0 else 0.0
+            hi = pre_merged[idx + 1].start if idx + 1 < len(pre_merged) else total_dur_s
+            return lo, hi
+
         if emb_workers <= 1 or len(pre_merged) < 8:
             embeddings: list[Optional[np.ndarray]] = []
-            for seg in pre_merged:
+            for i, seg in enumerate(pre_merged):
                 if cancel_token:
                     cancel_token.check()
+                lo_b, hi_b = _neighbor_bounds(i)
                 embeddings.append(
                     cls._extract_segment_embedding(
-                        extractor, samples, seg.start, seg.end, sample_rate=16000
+                        extractor,
+                        samples,
+                        seg.start,
+                        seg.end,
+                        sample_rate=16000,
+                        min_start=lo_b,
+                        max_end=hi_b,
                     )
                 )
         else:
@@ -1381,8 +1931,15 @@ class Transcriber:
                 i, seg = idx_seg
                 if cancel_token:
                     cancel_token.check()
+                lo_b, hi_b = _neighbor_bounds(i)
                 vec = cls._extract_segment_embedding(
-                    extractor, samples, seg.start, seg.end, sample_rate=16000
+                    extractor,
+                    samples,
+                    seg.start,
+                    seg.end,
+                    sample_rate=16000,
+                    min_start=lo_b,
+                    max_end=hi_b,
                 )
                 return i, vec
 
@@ -1399,6 +1956,15 @@ class Transcriber:
                 raise
             else:
                 emb_pool.shutdown(wait=True)
+
+        if return_voiceprints:
+            clustered_segs, centroids = cluster_anchor_embeddings(
+                segments=pre_merged,
+                embeddings=embeddings,
+                speaker_count=mode,
+                return_centroids=True,
+            )
+            return clustered_segs, centroids, extractor
 
         return cluster_anchor_embeddings(
             segments=pre_merged,
@@ -1424,8 +1990,13 @@ class Transcriber:
 
         if device == "cpu":
             total_threads = max(1, int(threads))
-            max_workers_cap = 2 if profile_id == "turbo" else 3
-            if total_threads >= 8:
+            if profile_id == "large-v3":
+                max_workers_cap = 1
+            elif profile_id == "turbo":
+                max_workers_cap = 2
+            else:
+                max_workers_cap = 3
+            if total_threads >= 8 and max_workers_cap > 1:
                 num_workers = min(max_workers_cap, total_threads // 4)
                 cpu_threads = max(1, total_threads // num_workers)
             else:
@@ -1472,13 +2043,13 @@ class Transcriber:
             windows = build_speaker_asr_windows(
                 ordered_diar,
                 total_dur,
-                max_same_speaker_sec=28.5 if device == "cpu" else 27.0,
-                merge_gap_sec=3.5 if device == "cpu" else 1.8,
+                max_same_speaker_sec=28.0 if device == "cpu" else 26.5,
+                merge_gap_sec=3.0 if device == "cpu" else 1.6,
                 split_speaker_turns=(device != "cpu"),
             )
             if windows:
                 windows = subdivide_long_asr_windows(
-                    windows, samples, sample_rate=sample_rate, max_window_sec=29.0
+                    windows, samples, sample_rate=sample_rate, max_window_sec=28.5
                 )
             used_diar_windows = bool(windows)
         else:
@@ -1501,9 +2072,27 @@ class Transcriber:
         if not valid_windows:
             return []
 
-        beam_size = 4 if device == "cuda" else 1
-        temperatures = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) if device == "cuda" else (0.0, 0.4)
-        comp_ratio_thr = 2.2 if device == "cuda" else 2.4
+        # Detect interview primary language once on the first substantive window to
+        # supply a language-matched punctuation & technical code-switching style prompt
+        primary_lang = "ru"
+        if hasattr(model, "detect_language"):
+            probe_win = next(
+                (w for w in valid_windows if (w[1] - w[0]) >= 1.5),
+                valid_windows[0],
+            )
+            try:
+                det_lang, det_prob, _ = model.detect_language(
+                    audio=samples[probe_win[2] : probe_win[3]]
+                )
+                if det_lang and float(det_prob) >= 0.55:
+                    primary_lang = str(det_lang)
+            except Exception:
+                primary_lang = "ru"
+
+        base_prompt = _WHISPER_STYLE_PROMPTS.get(primary_lang)
+        beam_size = 5 if device == "cuda" else 2
+        temperatures = (0.0, 0.2, 0.4)
+        comp_ratio_thr = 2.65
         dev_tag = "GPU CUDA" if device == "cuda" else "CPU"
 
         last_pct = 0
@@ -1529,38 +2118,47 @@ class Transcriber:
             if msg:
                 status_cb(msg)
 
-        def _decode_single_window(win_item: tuple[float, float, int, int]) -> list[TimedUnit]:
+        def _decode_single_window(
+            win_item: tuple[float, float, int, int],
+            rolling_tail: str = "",
+        ) -> list[TimedUnit]:
             w_start, w_end, s_idx, e_idx = win_item
             if cancel_token:
                 cancel_token.check()
 
             win_dur = w_end - w_start
             use_vad = win_dur > 30.0
-            need_word_ts = (
-                True
-                if (device == "cuda" or not used_diar_windows)
-                else window_has_multiple_speakers(w_start, w_end, ordered_diar)
-            )
+            if base_prompt and rolling_tail:
+                win_prompt: Optional[str] = f"{base_prompt} {rolling_tail}"
+            elif base_prompt:
+                win_prompt = base_prompt
+            elif rolling_tail:
+                win_prompt = rolling_tail
+            else:
+                win_prompt = None
+
             transcribe_kwargs = dict(
                 # Non-None default language + multilingual=True skips faster-whisper's
                 # discarded pre-encode detect_language() pass (saving a full 30s Encoder
                 # pass per window!) while generate_segments still runs model.detect_language()
                 # on encoder_output for every window across all 99 languages.
-                language="ru",
+                language=primary_lang,
                 task="transcribe",
                 multilingual=True,
-                word_timestamps=need_word_ts,
+                word_timestamps=True,
+                prepend_punctuations="\"'“¿([{",
                 vad_filter=use_vad,
                 condition_on_previous_text=False,
+                initial_prompt=win_prompt,
                 no_speech_threshold=0.6,
                 compression_ratio_threshold=comp_ratio_thr,
-                log_prob_threshold=-1.0,
+                log_prob_threshold=-1.15,
                 beam_size=beam_size,
                 temperature=temperatures,
             )
             if use_vad:
                 transcribe_kwargs["vad_parameters"] = dict(
-                    min_silence_duration_ms=400, speech_pad_ms=250
+                    min_silence_duration_ms=350, speech_pad_ms=220
                 )
                 transcribe_kwargs["hallucination_silence_threshold"] = 2.0
 
@@ -1574,7 +2172,7 @@ class Transcriber:
                 abs_seg_start = w_start + float(seg.start)
                 abs_seg_end = min(w_end, w_start + float(seg.end))
 
-                if getattr(seg, "no_speech_prob", 0.0) > 0.75 and getattr(seg, "avg_logprob", 0.0) < -0.9:
+                if getattr(seg, "no_speech_prob", 0.0) > 0.78 and getattr(seg, "avg_logprob", 0.0) < -1.0:
                     continue
 
                 if not used_diar_windows:
@@ -1613,8 +2211,20 @@ class Transcriber:
 
         if num_workers <= 1 or len(valid_windows) <= 1:
             units: list[TimedUnit] = []
+            prev_tail = ""
+            prev_w_end: Optional[float] = None
             for win_item in valid_windows:
-                units.extend(_decode_single_window(win_item))
+                w_s, w_e, _, _ = win_item
+                carry = prev_tail if (prev_w_end is not None and (w_s - prev_w_end) <= 2.5) else ""
+                w_units = _decode_single_window(win_item, rolling_tail=carry)
+                units.extend(w_units)
+                if w_units:
+                    prev_tail = _extract_clean_context_tail(
+                        _join_unit_texts([u.text for u in w_units])
+                    )
+                else:
+                    prev_tail = ""
+                prev_w_end = w_e
             return units
 
         # Parallel multi-worker CTranslate2 CPU execution preserving deterministic window order
@@ -1915,6 +2525,7 @@ class Transcriber:
 
         t0 = time.time()
         samples: np.ndarray = asr_state["samples"]
+        sample_rate = int(asr_state.get("sample_rate", 16000))
         duration_sec = float(asr_state.get("duration_sec", 0.0))
         units: list[TimedUnit] = list(asr_state.get("units", []))
         profile_id = str(asr_state.get("profile_id", DEFAULT_ASR_MODEL))
@@ -1945,7 +2556,7 @@ class Transcriber:
             f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, потоков CPU: {eff_threads})..."
         )
         t_diar = time.time()
-        diar_segments = cls._run_diarization(
+        diar_out = cls._run_diarization(
             samples=samples,
             seg_model_path=seg_onnx,
             emb_model_path=emb_onnx,
@@ -1953,7 +2564,13 @@ class Transcriber:
             threads=eff_threads,
             status_cb=update,
             cancel_token=cancel_token,
+            return_voiceprints=True,
         )
+        if isinstance(diar_out, tuple):
+            diar_segments, speaker_centroids, emb_extractor = diar_out
+        else:
+            diar_segments, speaker_centroids, emb_extractor = diar_out, None, None
+
         detected_raw_speakers = len({s.speaker for s in diar_segments})
         update(
             f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
@@ -1963,7 +2580,14 @@ class Transcriber:
         if cancel_token:
             cancel_token.check()
 
-        turns, final_speaker_count = align_units_to_speakers(units, diar_segments)
+        turns, final_speaker_count = align_units_to_speakers(
+            units,
+            diar_segments,
+            samples=samples,
+            sample_rate=sample_rate,
+            speaker_centroids=speaker_centroids,
+            embedding_extractor=emb_extractor,
+        )
         transcript_text = format_transcript_txt(
             turns=turns,
             duration_sec=duration_sec,
@@ -2045,7 +2669,7 @@ class Transcriber:
         eff_diar_threads = diar_threads if diar_threads is not None else threads
         update(f"Разделение говорящих по ролям (режим спикеров: {speaker_count})...")
         t_diar = time.time()
-        diar_segments = cls._run_diarization(
+        diar_out = cls._run_diarization(
             samples=samples,
             seg_model_path=seg_onnx,
             emb_model_path=emb_onnx,
@@ -2053,7 +2677,13 @@ class Transcriber:
             threads=eff_diar_threads,
             status_cb=update,
             cancel_token=cancel_token,
+            return_voiceprints=True,
         )
+        if isinstance(diar_out, tuple):
+            diar_segments, speaker_centroids, emb_extractor = diar_out
+        else:
+            diar_segments, speaker_centroids, emb_extractor = diar_out, None, None
+
         detected_raw_speakers = len({s.speaker for s in diar_segments})
         update(
             f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
@@ -2081,7 +2711,7 @@ class Transcriber:
         elif profile["engine"] == "sherpa_parakeet":
             if req_dev == "cuda":
                 update(
-                    "Модель Parakeet оптимизирована под CPU (INT8); для GPU рекомендуется Whisper Turbo."
+                    "Модель Parakeet оптимизирована под CPU (INT8); для GPU рекомендуется Whisper Turbo или Large v3."
                 )
             update(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
             units = cls._run_sherpa_parakeet(
@@ -2102,7 +2732,14 @@ class Transcriber:
             cancel_token.check()
 
         # 4. Align words/units to speaker roles and write UTF-8 .txt
-        turns, final_speaker_count = align_units_to_speakers(units, diar_segments)
+        turns, final_speaker_count = align_units_to_speakers(
+            units,
+            diar_segments,
+            samples=samples,
+            sample_rate=sample_rate,
+            speaker_centroids=speaker_centroids,
+            embedding_extractor=emb_extractor,
+        )
         transcript_text = format_transcript_txt(
             turns=turns,
             duration_sec=duration_sec,

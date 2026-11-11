@@ -53,6 +53,16 @@ ASR_MODEL_PROFILES = {
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
         "min_total_bytes": 600_000_000,
     },
+    "large-v3": {
+        "id": "large-v3",
+        "label": "Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)",
+        "short_name": "Whisper Large v3",
+        "engine": "faster_whisper",
+        "repo_id": "Systran/faster-whisper-large-v3",
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
+        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
+        "min_total_bytes": 2_500_000_000,
+    },
     "parakeet": {
         "id": "parakeet",
         "label": "Parakeet v3 — быстрая (25 яз., 600 МБ)",
@@ -98,14 +108,14 @@ DIARIZATION_MODELS = {
 
 SPEAKER_COUNT_OPTIONS = ["auto", "2", "3", "4+"]
 # Fine-grained turn boundary threshold for initial pyannote segmentation pass
-DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.50"))
+DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.35"))
 # Cosine similarity thresholds for Anchor-Centroid voiceprint clustering (CAM++)
 DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.54"))
 DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.58"))
 # Backwards-compatible alias
 DIARIZATION_CLUSTER_THRESHOLD = DIARIZATION_CENTROID_SIM_THRESHOLD
-DIARIZATION_MERGE_GAP_SEC = 0.8
-DIARIZATION_MIN_SEGMENT_SEC = 0.25
+DIARIZATION_MERGE_GAP_SEC = 0.45
+DIARIZATION_MIN_SEGMENT_SEC = 0.18
 TRANSCRIPT_PAUSE_BREAK_SEC = 2.5
 
 

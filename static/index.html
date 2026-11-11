@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=16">
+    <link rel="stylesheet" href="/static/style.css?v=17">
 </head>
 <body>
     <div class="container">
@@ -74,6 +74,7 @@
                             <label class="custom-worker-label" for="asrModelSelect">Модель распознавания</label>
                             <select id="asrModelSelect" class="worker-select">
                                 <option value="turbo" selected>Whisper Turbo — точная (99 яз., 810 МБ)</option>
+                                <option value="large-v3">Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)</option>
                                 <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
                                 <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
                             </select>
@@ -126,10 +127,10 @@
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v4.3.1 (Stable Edition)
+            v4.4.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=16"></script>
+    <script src="/static/script.js?v=17"></script>
 </body>
 </html>
 

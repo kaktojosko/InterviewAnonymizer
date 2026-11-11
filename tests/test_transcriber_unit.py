@@ -258,7 +258,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.3.1)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.4.0)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -690,24 +690,26 @@ def test_decode_whisper_windows_cpu_optimizations_and_parallel_workers(monkeypat
             created_init_kwargs.update(kwargs)
 
         def transcribe(self, audio_slice, **kwargs):
-            # Sleep slightly longer on the first window so worker 2 finishes first,
+            # Sleep slightly longer on the 9.4s first window so worker 2 finishes first,
             # proving deterministic chronological reassembly of results!
-            is_multi_spk = bool(kwargs.get("word_timestamps"))
+            dur_s = len(audio_slice) / 16000.0
             transcribe_calls.append(dict(kwargs))
-            if not is_multi_spk:
+            if dur_s > 9.35:
                 time.sleep(0.04)
                 seg = SimpleNamespace(
                     start=0.1,
-                    end=min(2.0, len(audio_slice) / 16000.0),
+                    end=min(2.0, dur_s),
                     text=" Монолог первого спикера.",
-                    words=None,
+                    words=[
+                        SimpleNamespace(start=0.1, end=1.9, word=" Монолог первого спикера."),
+                    ],
                     no_speech_prob=0.05,
                     avg_logprob=-0.2,
                 )
             else:
                 seg = SimpleNamespace(
                     start=0.1,
-                    end=min(3.0, len(audio_slice) / 16000.0),
+                    end=min(3.0, dur_s),
                     text=" Вопрос? Ответ!",
                     words=[
                         SimpleNamespace(start=0.1, end=1.2, word=" Вопрос?"),
@@ -724,13 +726,13 @@ def test_decode_whisper_windows_cpu_optimizations_and_parallel_workers(monkeypat
 
     sr = 16000
     samples = np.ones(sr * 40, dtype=np.float32) * 0.05
-    # Window 1 (0..10s): single speaker 0 -> word_timestamps=False
-    # Gap of 6s (>3.5s merge_gap_sec) forces second window:
-    # Window 2 (16..26s): speakers 0 and 1 -> word_timestamps=True
+    # Window 1 (0.3..9.7s = 9.4s): speaker 0
+    # Gap of 6.5s (>3.0s merge_gap_sec) forces second window:
+    # Window 2 (15.8..25.0s = 9.2s): speakers 0 and 1
     diar = [
         DiarizationSegment(0.5, 9.5, speaker=0),
         DiarizationSegment(16.0, 20.0, speaker=0),
-        DiarizationSegment(20.5, 25.0, speaker=1),
+        DiarizationSegment(20.5, 24.8, speaker=1),
     ]
 
     units = Transcriber._decode_whisper_windows(
@@ -751,11 +753,12 @@ def test_decode_whisper_windows_cpu_optimizations_and_parallel_workers(monkeypat
     for call_kw in transcribe_calls:
         assert call_kw["language"] == "ru"
         assert call_kw["multilingual"] is True
-        assert call_kw["beam_size"] == 1
-        assert call_kw["temperature"] == (0.0, 0.4)
-
-    word_ts_flags = sorted(c["word_timestamps"] for c in transcribe_calls)
-    assert word_ts_flags == [False, True]
+        assert call_kw["word_timestamps"] is True
+        assert call_kw["beam_size"] == 2
+        assert call_kw["temperature"] == (0.0, 0.2, 0.4)
+        assert call_kw["compression_ratio_threshold"] == pytest.approx(2.65)
+        assert "-" not in call_kw["prepend_punctuations"]
+        assert "SQL" in call_kw["initial_prompt"]
 
     # Chronological order preserved despite window 1 sleeping longer than window 2!
     assert [u.text.strip() for u in units] == ["Монолог первого спикера.", "Вопрос?", "Ответ!"]
@@ -814,3 +817,256 @@ def test_run_sherpa_parakeet_batched_decode_streams(monkeypatch):
     assert batch_sizes == [4, 1]
     assert len(units) == 9
     assert units[0].start < units[-1].start
+
+
+def test_compound_hyphen_orthography_and_spaced_dash_preservation():
+    from src.transcriber import _join_unit_texts
+
+    # Exact Whisper hyphen artifacts from Russian + IT interviews
+    assert _join_unit_texts([" что", " -то", " подобное", " по -моему", " где -то"]) == (
+        "что-то подобное по-моему где-то"
+    )
+    assert _join_unit_texts([" ключи", " -кандидаты,", " а", " что", " такое", " ключ", "-кандидат?"]) == (
+        "ключи-кандидаты, а что такое ключ-кандидат?"
+    )
+    assert _join_unit_texts([" 28 -й", " кадр", " кто- то", " по- разному"]) == (
+        "28-й кадр кто-то по-разному"
+    )
+    # Legitimate spaced dashes and negative numbers must remain untouched
+    assert _join_unit_texts([" Это базовые - есть ещё расширенные, шаг -2."]) == (
+        "Это базовые - есть ещё расширенные, шаг -2."
+    )
+
+
+def test_clause_alignment_prevents_mid_sentence_split_on_overlapping_turn():
+    """
+    Reproduces real interview bug [00:13:53 - 00:13:58]:
+      Спикер 1 finishes 'Есть естественные ключи, есть суррогатные ключи.' at 55.65s,
+      while Спикер 2 starts overlapping at 55.68s with 'А что такое ключ-кандидат? Это прям интересно.'
+      and coarse diarization only switches from speaker 0 to speaker 1 at 56.05s.
+    'А что' MUST NOT be glued onto Спикер 1's turn!
+    """
+    diar = [
+        DiarizationSegment(53.00, 56.05, speaker=0),
+        DiarizationSegment(56.05, 58.60, speaker=1),
+    ]
+    units = [
+        TimedUnit(53.10, 53.45, " Есть"),
+        TimedUnit(53.46, 54.10, " естественные"),
+        TimedUnit(54.12, 54.50, " ключи,"),
+        TimedUnit(54.55, 54.82, " есть"),
+        TimedUnit(54.84, 55.30, " суррогатные"),
+        TimedUnit(55.31, 55.65, " ключи."),
+        # Speaker 2 jumps in while Speaker 1's mic decays (before diar boundary 56.05s)
+        TimedUnit(55.68, 55.82, " А"),
+        TimedUnit(55.83, 56.02, " что"),
+        TimedUnit(56.04, 56.38, " такое"),
+        TimedUnit(56.40, 57.22, " ключ -кандидат?"),
+        TimedUnit(57.32, 57.52, " Это"),
+        TimedUnit(57.53, 57.80, " прям"),
+        TimedUnit(57.82, 58.40, " интересно."),
+    ]
+    turns, spk_count = align_units_to_speakers(units, diar)
+    assert spk_count == 2
+    assert len(turns) == 2
+    assert turns[0].speaker_label == "Спикер 1"
+    assert turns[0].text == "Есть естественные ключи, есть суррогатные ключи."
+    assert turns[1].speaker_label == "Спикер 2"
+    assert turns[1].text == "А что такое ключ-кандидат? Это прям интересно."
+
+
+def test_unpunctuated_overlap_keeps_trailing_verb_and_splits_at_discourse_starter():
+    """
+    Reproduces real interview bug [00:13:22 - 00:13:36]:
+      Even if ASR omits punctuation across a simultaneous transition ('...сложно
+      джойном отнести хорошо так ладно раз мы залезли...'), trailing verb 'отнести'
+      stays with Спикер 1 and Спикер 2's turn opens at discourse marker 'хорошо'.
+    """
+    diar = [
+        DiarizationSegment(22.0, 24.95, speaker=0),
+        DiarizationSegment(24.95, 31.0, speaker=1),
+    ]
+    words_with_spans = [
+        (22.10, 22.35, " так"),
+        (22.36, 22.55, " не"),
+        (22.56, 22.95, " скажу"),
+        (23.00, 23.18, " но"),
+        (23.20, 23.45, " ещё"),
+        (23.46, 23.90, " юнионы"),
+        (23.92, 24.18, " есть"),
+        (24.22, 24.38, " но"),
+        (24.40, 24.60, " это"),
+        (24.62, 24.92, " сложно"),
+        (24.93, 25.12, " джойном"),
+        (25.13, 25.42, " отнести"),
+        # Speaker 2 takes the floor with 'хорошо так ладно...'
+        (25.48, 25.88, " хорошо"),
+        (25.90, 26.15, " так"),
+        (26.18, 26.55, " ладно"),
+        (26.58, 26.85, " раз"),
+        (26.86, 27.10, " мы"),
+        (27.12, 27.65, " залезли"),
+        (27.66, 27.80, " в"),
+        (27.82, 28.30, " базу"),
+        (28.32, 28.90, " данных"),
+    ]
+    units = [TimedUnit(s, e, w) for s, e, w in words_with_spans]
+    turns, spk_count = align_units_to_speakers(units, diar)
+    assert spk_count == 2
+    assert len(turns) == 2
+    assert turns[0].speaker_label == "Спикер 1"
+    assert turns[0].text.endswith("сложно джойном отнести")
+    assert turns[1].speaker_label == "Спикер 2"
+    assert turns[1].text.startswith("хорошо так ладно раз мы залезли")
+
+
+def test_rapid_ping_pong_qa_voiceprint_verification_and_unbiased_clustering():
+    """
+    Reproduces real interview bugs [00:12:18 - 00:12:21] and [00:12:39 - 00:12:51]:
+      1. Short <1s replies ('Ну да.', 'Все.') 0.1s after a question are no longer
+         swallowed into the questioner by prev_spk bias in cluster_anchor_embeddings.
+      2. Even when coarse pyannote diarization fuses a fast 5-turn Q&A exchange into
+         a single speaker segment, CAM++ clause-level voiceprint verification cleanly
+         separates every question and answer while keeping rhetorical self-questions intact.
+    """
+    dim = 64
+    rng = np.random.RandomState(2026)
+    qr, _ = np.linalg.qr(rng.randn(dim, 2))
+    v_spk1 = qr[:, 0].astype(np.float32)  # Candidate (Спикер 1)
+    v_spk2 = qr[:, 1].astype(np.float32)  # Interviewer (Спикер 2)
+
+    # Part A: cluster_anchor_embeddings on a close-margin short reply ('Ну да.', 0.6s)
+    # where v_reply is slightly closer to v_spk1 by 0.025 (previously +0.04 prev_spk bias flipped it!)
+    close_reply = (0.52 * v_spk1 + 0.48 * v_spk2)
+    close_reply /= np.linalg.norm(close_reply)
+    segs = [
+        DiarizationSegment(0.0, 4.0, speaker=0),    # Anchor Spk 1
+        DiarizationSegment(5.0, 9.0, speaker=1),    # Anchor Spk 2 question
+        DiarizationSegment(9.15, 9.75, speaker=2),  # 0.6s rapid reply 0.15s after Spk 2!
+    ]
+    embs = [v_spk1, v_spk2, close_reply]
+    clustered, cents = cluster_anchor_embeddings(segs, embs, speaker_count="auto", return_centroids=True)
+    assert len(clustered) == 3
+    assert clustered[0].speaker != clustered[1].speaker
+    assert clustered[2].speaker == clustered[0].speaker  # Short reply stays with Candidate!
+    assert set(cents.keys()) == {clustered[0].speaker, clustered[1].speaker}
+
+    # Part B: Full 5-turn rapid Q&A fused into one diarization segment + rhetorical self-question
+    sr = 16000
+    samples = (0.05 * np.sin(2 * np.pi * 220.0 * np.linspace(0, 30.0, sr * 30, endpoint=False))).astype(
+        np.float32
+    )
+    # Speaker 0 speaks first at 1..3s so Speaker 0 = 'Спикер 1', Speaker 1 = 'Спикер 2'.
+    # Then 4..16s is fused by coarse diarization into a single Speaker 1 block,
+    # followed by 18..24s Speaker 0 rhetorical self-question + self-answer.
+    fused_diar = [
+        DiarizationSegment(1.0, 3.0, speaker=0),
+        DiarizationSegment(4.0, 16.0, speaker=1),
+        DiarizationSegment(18.0, 24.0, speaker=0),
+    ]
+    qa_units = [
+        TimedUnit(1.1, 2.8, " Да, у нас все с курсором."),
+        TimedUnit(4.1, 6.0, " Так, чего я хотел спросить."),
+        TimedUnit(6.1, 8.8, " Так, SQL ты знаешь, да, насколько понимаю?"),
+        TimedUnit(8.95, 10.45, " Ну да, есть немного."),
+        TimedUnit(10.55, 11.25, " Немного?"),
+        TimedUnit(11.35, 13.30, " Ну, джойны, подзапросы."),
+        TimedUnit(13.45, 15.60, " Какие джойны знаешь?"),
+        # Rhetorical self-question by Speaker 0 (both clauses have v_spk1 voiceprint!)
+        TimedUnit(18.2, 20.5, " Какие ещё джойны у нас есть?"),
+        TimedUnit(20.7, 23.2, " Так сразу не скажу."),
+    ]
+
+    def _mock_clause_embed(_wav: np.ndarray, _sr: int, t_s: float, t_e: float):
+        mid = 0.5 * (t_s + t_e)
+        # Candidate answers at ~9.7s and ~12.3s, plus Candidate monologue at 1..3s and 18..24s
+        if (8.9 <= mid <= 10.5) or (11.3 <= mid <= 13.35) or mid < 3.5 or mid > 17.5:
+            return v_spk1
+        return v_spk2
+
+    turns, spk_count = align_units_to_speakers(
+        qa_units,
+        fused_diar,
+        samples=samples,
+        sample_rate=sr,
+        speaker_centroids={0: v_spk1, 1: v_spk2},
+        clause_embed_fn=_mock_clause_embed,
+    )
+    assert spk_count == 2
+    assert [(t.speaker_label, t.text) for t in turns] == [
+        ("Спикер 1", "Да, у нас все с курсором."),
+        ("Спикер 2", "Так, чего я хотел спросить. Так, SQL ты знаешь, да, насколько понимаю?"),
+        ("Спикер 1", "Ну да, есть немного."),
+        ("Спикер 2", "Немного?"),
+        ("Спикер 1", "Ну, джойны, подзапросы."),
+        ("Спикер 2", "Какие джойны знаешь?"),
+        ("Спикер 1", "Какие ещё джойны у нас есть? Так сразу не скажу."),
+    ]
+
+
+def test_sequential_whisper_rolling_context_and_large_v3_single_worker(monkeypatch):
+    from types import SimpleNamespace
+
+    init_kwargs = {}
+    prompts_seen = []
+
+    class _FakeLargeV3Model:
+        def __init__(self, model_dir, **kwargs):
+            init_kwargs.update(kwargs)
+
+        def detect_language(self, audio=None, **kwargs):
+            return "ru", 0.96, [("ru", 0.96)]
+
+        def transcribe(self, audio_slice, **kwargs):
+            prompts_seen.append(kwargs.get("initial_prompt"))
+            idx = len(prompts_seen)
+            txt = (
+                " Мы используем inner join и intersect."
+                if idx == 1
+                else " А ещё у нас есть UNION в реляционной базе."
+            )
+            seg = SimpleNamespace(
+                start=0.1,
+                end=2.0,
+                text=txt,
+                words=[SimpleNamespace(start=0.1, end=2.0, word=txt)],
+                no_speech_prob=0.02,
+                avg_logprob=-0.15,
+            )
+            return [seg], SimpleNamespace(language="ru")
+
+    monkeypatch.setattr(tr_mod, "WhisperModel", _FakeLargeV3Model)
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    sr = 16000
+    samples = np.ones(sr * 65, dtype=np.float32) * 0.04
+    # Two adjacent ~27s windows separated by <1s gap, followed by a window after a 6s silence
+    diar = [
+        DiarizationSegment(0.5, 27.5, speaker=0),
+        DiarizationSegment(28.0, 52.0, speaker=1),
+        DiarizationSegment(59.0, 63.0, speaker=0),
+    ]
+
+    Transcriber._decode_whisper_windows(
+        samples=samples,
+        sample_rate=sr,
+        model_dir="/tmp/fake_large_v3",
+        profile_id="large-v3",
+        device="cpu",
+        compute_type="int8",
+        diar_segments=diar,
+        threads=12,
+        status_cb=None,
+    )
+
+    # large-v3 caps num_workers=1 on CPU to preserve RAM bandwidth & enable rolling context
+    assert init_kwargs["num_workers"] == 1
+    assert init_kwargs["cpu_threads"] == 12
+    assert len(prompts_seen) == 3
+    # Window 1 gets base style prompt only; Window 2 (<2.5s gap) gets base + Window 1 clean tail;
+    # Window 3 (>2.5s silence gap) resets to base style prompt only!
+    assert "inner join" not in prompts_seen[0]
+    assert "Мы используем inner join и intersect." in prompts_seen[1]
+    assert "UNION в реляционной базе" not in prompts_seen[2]
+

@@ -120,7 +120,7 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.3.1"
+    assert data["version"] == "4.4.0"
 
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
@@ -128,7 +128,7 @@ def test_api_root_and_config():
     assert isinstance(data["cuda_available"], bool)
     assert [d["id"] for d in data["compute_devices"]] == ["cpu", "cuda"]
     model_ids = [m["id"] for m in data["asr_models"]]
-    assert model_ids == ["turbo", "parakeet", "small"]
+    assert model_ids == ["turbo", "large-v3", "parakeet", "small"]
     assert data["speaker_options"] == ["auto", "2", "3", "4+"]
 
 
@@ -920,6 +920,7 @@ function runScenario({ cudaAvailable }) {
 
     const asrGroup = makeSelect('asrModelSelect', [
         ['turbo', 'Whisper Turbo — точная (99 яз., 810 МБ)', true],
+        ['large-v3', 'Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)'],
         ['parakeet', 'Parakeet v3 — быстрая (25 яз., 600 МБ)'],
         ['small', 'Whisper Small — лёгкая (99 яз., 245 МБ)'],
     ]);
@@ -972,7 +973,7 @@ function runScenario({ cudaAvailable }) {
             return {
                 ok: true,
                 json: async () => ({
-                    version: '4.3.1',
+                    version: '4.4.0',
                     cpu_count: 8,
                     default_workers: 4,
                     max_workers: 7,
@@ -980,6 +981,7 @@ function runScenario({ cudaAvailable }) {
                     default_asr_model: 'turbo',
                     asr_models: [
                         { id: 'turbo', label: 'Whisper Turbo — точная (99 яз., 810 МБ)' },
+                        { id: 'large-v3', label: 'Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)' },
                         { id: 'parakeet', label: 'Parakeet v3 — быстрая (25 яз., 600 МБ)' },
                         { id: 'small', label: 'Whisper Small — лёгкая (99 яз., 245 МБ)' },
                     ],
@@ -1066,7 +1068,9 @@ function runScenario({ cudaAvailable }) {
     const getMenuButtons = (wrapper) => wrapper.children.find((c) => c.classList.contains('clay-select-menu')).children;
 
     // Step 1: User selects CPU-only 'Parakeet v3 — быстрая' for fast CPU job
-    getMenuButtons(asrWrapper)[1].click();
+    const parakeetBtn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Parakeet'));
+    assert.ok(parakeetBtn, 'Parakeet option must exist in ASR dropdown');
+    parakeetBtn.click();
     assert.strictEqual(s1.asrGroup.sel.value, 'parakeet');
     assert.strictEqual(s1.devGroup.sel.value, 'cpu');
 
@@ -1106,14 +1110,21 @@ function runScenario({ cudaAvailable }) {
     assert.strictEqual(s1.localStorage.getItem('selectedComputeDevice'), 'cuda');
     assert.strictEqual(s1.localStorage.getItem('selectedAsrModel'), 'turbo');
 
-    // Step 6: Upload second video -> verify compute_device='cuda' & asr_model='turbo' are sent!
+    // Step 5b: User can also switch to 'Whisper Large v3' while keeping GPU (CUDA) active
+    const largeV3Btn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Large v3'));
+    assert.ok(largeV3Btn, 'Whisper Large v3 option must exist in ASR dropdown');
+    largeV3Btn.click();
+    assert.strictEqual(s1.asrGroup.sel.value, 'large-v3');
+    assert.strictEqual(s1.devGroup.sel.value, 'cuda', 'GPU must remain active when Whisper Large v3 is selected');
+
+    // Step 6: Upload second video -> verify compute_device='cuda' & asr_model='large-v3' are sent!
     fileInput.files = [{ name: 'interview2.mp4' }];
     fileInput.dispatchEvent(new s1.ctx.Event('change'));
     await new Promise((r) => setTimeout(r, 30));
 
     assert.strictEqual(s1.uploadedPayloads.length, 2);
     assert.strictEqual(s1.uploadedPayloads[1].compute_device, 'cuda');
-    assert.strictEqual(s1.uploadedPayloads[1].asr_model, 'turbo');
+    assert.strictEqual(s1.uploadedPayloads[1].asr_model, 'large-v3');
 
     // Step 7: Click 'Загрузить ещё' again -> GPU (CUDA) remains selected and enabled
     s1.resetBtn.click();

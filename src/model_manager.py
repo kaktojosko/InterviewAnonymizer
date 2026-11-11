@@ -182,7 +182,7 @@ def _cli():
     parser.add_argument(
         "--preload",
         required=True,
-        help="Comma-separated ASR profile IDs (turbo,parakeet,small), 'all', or 'diarization'.",
+        help="Comma-separated ASR profile IDs (turbo,large-v3,parakeet,small), 'all', or 'diarization'.",
     )
     args = parser.parse_args()
 

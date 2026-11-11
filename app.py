@@ -22,7 +22,7 @@ from src.config import (
 from src.cancellation import CancellationToken, TaskCancelledError
 from src.transcriber import probe_cuda_available
 
-app = FastAPI(title="Interview Anonymizer", version="4.3.1")
+app = FastAPI(title="Interview Anonymizer", version="4.4.0")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -217,7 +217,7 @@ async def root():
 @app.get("/api/config")
 async def get_config():
     return {
-        "version": "4.3.1",
+        "version": "4.4.0",
 
         "cpu_count": CPU_COUNT,
         "default_workers": MAX_WORKERS,
