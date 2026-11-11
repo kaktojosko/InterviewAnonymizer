@@ -135,6 +135,11 @@ header p {
     font-size: 1.02rem;
 }
 
+main {
+    position: relative;
+    z-index: 10;
+}
+
 /* Clay Panel */
 .clay-panel {
     background: var(--clay-bg);

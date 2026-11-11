@@ -258,7 +258,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.3.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.3.1)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt

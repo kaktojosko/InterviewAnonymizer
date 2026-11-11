@@ -1017,7 +1017,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.3.0)",
+        "# Транскрибация интервью (Interview Anonymizer v4.3.1)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -1088,6 +1088,8 @@ class _DiarizationCache:
 
 
 _nvidia_libs_loaded = False
+_cublas_preloaded = False
+_cuda_probe_ok = False
 
 
 def _preload_nvidia_pip_libs() -> None:
@@ -1096,7 +1098,7 @@ def _preload_nvidia_pip_libs() -> None:
     are visible to CTranslate2's dynamic dlopen() both in local virtualenvs and
     inside Docker containers without requiring manual LD_LIBRARY_PATH exports.
     """
-    global _nvidia_libs_loaded
+    global _nvidia_libs_loaded, _cublas_preloaded
     if _nvidia_libs_loaded:
         return
     _nvidia_libs_loaded = True
@@ -1127,6 +1129,8 @@ def _preload_nvidia_pip_libs() -> None:
                         for so_path in sorted(glob.glob(os.path.join(cand_dir, pat))):
                             try:
                                 ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+                                if "libcublas.so" in os.path.basename(so_path):
+                                    _cublas_preloaded = True
                             except OSError:
                                 pass
 
@@ -1136,6 +1140,9 @@ def probe_cuda_available() -> bool:
     Returns True if at least one NVIDIA CUDA GPU and a compatible cuBLAS 12
     runtime are usable by CTranslate2 in the current process.
     """
+    global _cuda_probe_ok
+    if _cuda_probe_ok:
+        return True
     _preload_nvidia_pip_libs()
     try:
         if ctranslate2.get_cuda_device_count() <= 0:
@@ -1143,8 +1150,9 @@ def probe_cuda_available() -> bool:
         supported = ctranslate2.get_supported_compute_types("cuda")
         if not supported:
             return False
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") and not _cublas_preloaded:
             ctypes.CDLL("libcublas.so.12")
+        _cuda_probe_ok = True
         return True
     except Exception:
         return False

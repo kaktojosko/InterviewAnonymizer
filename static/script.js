@@ -135,15 +135,18 @@ function syncClaySelect(selectEl) {
             poly.setAttribute('points', '20 6 9 17 4 12');
             checkSvg.appendChild(poly);
             itemBtn.appendChild(checkSvg);
+        } else if (!opt.disabled && opt.dataset.infoHint) {
+            const metaEl = document.createElement('span');
+            metaEl.className = 'clay-opt-meta';
+            metaEl.textContent = opt.dataset.infoHint;
+            itemBtn.appendChild(metaEl);
         }
 
         itemBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             if (opt.disabled) return;
-            if (selectEl.value !== opt.value) {
-                selectEl.value = opt.value;
-                selectEl.dispatchEvent(new Event('change', { bubbles: true }));
-            }
+            selectEl.value = opt.value;
+            selectEl.dispatchEvent(new Event('change', { bubbles: true }));
             syncClaySelect(selectEl);
             closeAllClaySelects();
             entry.trigger.focus();
@@ -200,6 +203,7 @@ function enhanceSelect(selectEl) {
         if (assocLabel) {
             assocLabel.addEventListener('click', (e) => {
                 e.preventDefault();
+                e.stopPropagation();
                 trigger.focus();
                 trigger.click();
             });
@@ -312,28 +316,32 @@ function renderWorkerControls() {
 
 function applyComputeDeviceAvailability() {
     if (!computeDeviceSelect) return;
+    const cudaMissingOnHost = serverCudaAvailable === false;
+    if (selectedComputeDevice === 'cuda' && cudaMissingOnHost) {
+        selectedComputeDevice = 'cpu';
+    } else if (selectedComputeDevice === 'cuda' && selectedAsrModel === 'parakeet') {
+        selectedAsrModel = 'turbo';
+        localStorage.setItem('selectedAsrModel', selectedAsrModel);
+    }
+
+    const parakeetSelected = selectedAsrModel === 'parakeet';
     Array.from(computeDeviceSelect.options).forEach((opt) => {
         if (opt.value !== 'cuda') return;
-        const cudaUnsupportedByModel = selectedAsrModel === 'parakeet';
-        const cudaMissingOnHost = serverCudaAvailable === false;
-        const isDisabled = cudaMissingOnHost || cudaUnsupportedByModel;
-        opt.disabled = isDisabled;
+        opt.disabled = cudaMissingOnHost;
         if (cudaMissingOnHost) {
             opt.dataset.limitHint = 'нет GPU';
+            opt.dataset.infoHint = '';
             opt.title = 'NVIDIA CUDA не обнаружена (для Docker запустите с docker-compose.gpu.yml)';
-        } else if (cudaUnsupportedByModel) {
-            opt.dataset.limitHint = 'только CPU';
-            opt.title = 'Parakeet работает на CPU (INT8). Для GPU выберите Whisper Turbo или Small';
+        } else if (parakeetSelected) {
+            opt.dataset.limitHint = '';
+            opt.dataset.infoHint = 'Whisper';
+            opt.title = 'При выборе GPU модель автоматически переключится на Whisper Turbo';
         } else {
             opt.dataset.limitHint = '';
+            opt.dataset.infoHint = '';
             opt.title = '';
         }
     });
-
-    const cudaOpt = Array.from(computeDeviceSelect.options).find((o) => o.value === 'cuda');
-    if (selectedComputeDevice === 'cuda' && cudaOpt && cudaOpt.disabled) {
-        selectedComputeDevice = 'cpu';
-    }
 }
 
 function renderTranscriptionControls() {
@@ -341,6 +349,8 @@ function renderTranscriptionControls() {
     transcribeOptionsWrap.classList.toggle('hidden', !transcribeEnabled);
     transcribeStateBadge.textContent = transcribeEnabled ? 'Вкл' : 'Выкл';
     transcribeStateBadge.classList.toggle('off', !transcribeEnabled);
+
+    applyComputeDeviceAvailability();
 
     if (Array.from(asrModelSelect.options).some((opt) => opt.value === selectedAsrModel)) {
         asrModelSelect.value = selectedAsrModel;
@@ -350,7 +360,6 @@ function renderTranscriptionControls() {
     }
     syncClaySelect(asrModelSelect);
 
-    applyComputeDeviceAvailability();
     if (computeDeviceSelect) {
         if (Array.from(computeDeviceSelect.options).some((opt) => opt.value === selectedComputeDevice && !opt.disabled)) {
             computeDeviceSelect.value = selectedComputeDevice;
@@ -423,6 +432,23 @@ function applyWorkerAvailability() {
     renderWorkerControls();
 }
 
+function syncSelectOptionsIfChanged(selectEl, items) {
+    if (!selectEl || !Array.isArray(items) || items.length === 0) return;
+    const current = Array.from(selectEl.options);
+    const unchanged =
+        current.length === items.length &&
+        current.every((opt, idx) => opt.value === items[idx].id && opt.textContent === items[idx].label);
+    if (unchanged) return;
+
+    selectEl.innerHTML = '';
+    items.forEach((item) => {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        opt.textContent = item.label;
+        selectEl.appendChild(opt);
+    });
+}
+
 async function loadServerConfig() {
     try {
         const response = await fetch('/api/config');
@@ -435,32 +461,20 @@ async function loadServerConfig() {
         }
 
         if (Array.isArray(data.asr_models) && data.asr_models.length > 0) {
-            asrModelSelect.innerHTML = '';
-            data.asr_models.forEach((model) => {
-                const opt = document.createElement('option');
-                opt.value = model.id;
-                opt.textContent = model.label;
-                asrModelSelect.appendChild(opt);
-            });
+            syncSelectOptionsIfChanged(asrModelSelect, data.asr_models);
             if (!localStorage.getItem('selectedAsrModel') && data.default_asr_model) {
                 selectedAsrModel = data.default_asr_model;
             }
         }
 
         if (Array.isArray(data.compute_devices) && data.compute_devices.length > 0 && computeDeviceSelect) {
-            computeDeviceSelect.innerHTML = '';
-            data.compute_devices.forEach((dev) => {
-                const opt = document.createElement('option');
-                opt.value = dev.id;
-                opt.textContent = dev.label;
-                computeDeviceSelect.appendChild(opt);
-            });
+            syncSelectOptionsIfChanged(computeDeviceSelect, data.compute_devices);
             if (!localStorage.getItem('selectedComputeDevice') && data.default_compute_device) {
                 selectedComputeDevice = data.default_compute_device;
             }
         }
 
-        if (savedTranscribe === null && typeof data.transcription_default === 'boolean') {
+        if (savedTranscribe === null && localStorage.getItem('transcribeEnabled') === null && typeof data.transcription_default === 'boolean') {
             transcribeEnabled = data.transcription_default;
         }
 
@@ -490,6 +504,10 @@ transcribeToggle.addEventListener('change', () => {
 asrModelSelect.addEventListener('change', () => {
     selectedAsrModel = asrModelSelect.value;
     localStorage.setItem('selectedAsrModel', selectedAsrModel);
+    if (selectedAsrModel === 'parakeet' && selectedComputeDevice === 'cuda') {
+        selectedComputeDevice = 'cpu';
+        localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
+    }
     renderTranscriptionControls();
 });
 
@@ -497,7 +515,11 @@ if (computeDeviceSelect) {
     computeDeviceSelect.addEventListener('change', () => {
         selectedComputeDevice = computeDeviceSelect.value;
         localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
-        syncClaySelect(computeDeviceSelect);
+        if (selectedComputeDevice === 'cuda' && selectedAsrModel === 'parakeet') {
+            selectedAsrModel = 'turbo';
+            localStorage.setItem('selectedAsrModel', selectedAsrModel);
+        }
+        renderTranscriptionControls();
     });
 }
 
@@ -769,6 +791,7 @@ if (cancelBtn) {
 
 resetBtn.onclick = () => {
     stopPolling();
+    closeAllClaySelects();
     currentTaskId = null;
     taskFinished = false;
     cancelRequested = false;
@@ -788,4 +811,9 @@ resetBtn.onclick = () => {
     resetBtn.classList.add('hidden');
     debugLog.classList.add('hidden');
     fileInput.value = '';
+    renderWorkerControls();
+    renderTranscriptionControls();
+    if (serverCudaAvailable === null) {
+        loadServerConfig();
+    }
 };

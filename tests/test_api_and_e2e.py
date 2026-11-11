@@ -120,7 +120,7 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.3.0"
+    assert data["version"] == "4.3.1"
 
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
@@ -680,3 +680,466 @@ def test_planar_yuv420p_video_processor_and_single_pass_concat_mux(tmp_path):
     assert int(streams["video"]["width"]) == 320
     assert int(streams["video"]["height"]) == 240
     assert streams["audio"]["codec_name"] == "aac"
+
+
+def test_frontend_reset_btn_allows_gpu_selection():
+    """
+    Executes static/script.js in Node.js against a DOM harness to verify that:
+      1. After processing a CPU job (including with CPU-only 'parakeet') and clicking
+         'Загрузить ещё' (#resetBtn), 'GPU (CUDA)' in #computeDeviceSelect is enabled,
+         clickable, auto-switches ASR model from 'parakeet' to 'turbo', and submits
+         compute_device='cuda' on the next upload.
+      2. Clicking <label for="computeDeviceSelect"> opens the dropdown without immediately
+         closing via document click bubbling.
+      3. When cuda_available=false on the server, 'GPU (CUDA)' is disabled ('нет GPU').
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+function runScenario({ cudaAvailable }) {
+    const storage = new Map();
+    const localStorage = {
+        getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+        setItem: (k, v) => storage.set(k, String(v)),
+    };
+
+    class ClassList {
+        constructor(el, initial = []) {
+            this.el = el;
+            this.set = new Set(initial.filter(Boolean));
+        }
+        add(...cls) { cls.forEach((c) => this.set.add(c)); }
+        remove(...cls) { cls.forEach((c) => this.set.delete(c)); }
+        contains(c) { return this.set.has(c); }
+        toggle(c, force) {
+            const next = force !== undefined ? Boolean(force) : !this.set.has(c);
+            if (next) this.set.add(c); else this.set.delete(c);
+            return next;
+        }
+    }
+
+    class FakeEvent {
+        constructor(type, opts = {}) {
+            this.type = type;
+            this.bubbles = Boolean(opts.bubbles);
+            this.defaultPrevented = false;
+            this.propagationStopped = false;
+        }
+        preventDefault() { this.defaultPrevented = true; }
+        stopPropagation() { this.propagationStopped = true; }
+    }
+
+    const byId = new Map();
+    let activeElement = null;
+
+    class FakeElement {
+        constructor(tagName, { id = '', classes = [], attrs = {}, text = '' } = {}) {
+            this.tagName = tagName.toUpperCase();
+            this.id = id;
+            if (id) byId.set(id, this);
+            this.classList = new ClassList(this, classes);
+            this.attrs = { ...attrs };
+            this.dataset = {};
+            this.children = [];
+            this.parentNode = null;
+            this.listeners = {};
+            this._textContent = text;
+            this._innerHTML = '';
+            this.disabled = false;
+            this.checked = Boolean(attrs.checked);
+            this.title = '';
+            this.tabIndex = 0;
+            this.scrollTop = 0;
+            this.scrollHeight = 100;
+            this.files = [];
+            this._value = attrs.value !== undefined ? String(attrs.value) : '';
+            this.selected = Boolean(attrs.selected);
+            this.onclick = null;
+        }
+
+        get className() { return Array.from(this.classList.set).join(' '); }
+        set className(v) { this.classList = new ClassList(this, String(v).split(/\s+/)); }
+
+        get textContent() {
+            if (this.children.length === 0) return this._textContent;
+            return this._textContent + this.children.map((c) => c.textContent).join('');
+        }
+        set textContent(v) {
+            this._textContent = String(v);
+            this.children = [];
+        }
+
+        get innerHTML() { return this._innerHTML; }
+        set innerHTML(v) {
+            this._innerHTML = String(v);
+            if (v === '') {
+                this.children.forEach((c) => { c.parentNode = null; });
+                this.children = [];
+            }
+        }
+
+        get options() {
+            return this.children.filter((c) => c.tagName === 'OPTION');
+        }
+
+        get selectedIndex() {
+            const opts = this.options;
+            const idx = opts.findIndex((o) => o.value === this.value);
+            return idx >= 0 ? idx : 0;
+        }
+
+        get value() {
+            if (this.tagName === 'SELECT') {
+                const opts = this.options;
+                if (this._value && opts.some((o) => o.value === this._value)) return this._value;
+                const sel = opts.find((o) => o.selected) || opts[0];
+                return sel ? sel.value : '';
+            }
+            return this._value;
+        }
+        set value(v) {
+            this._value = String(v);
+        }
+
+        setAttribute(k, v) { this.attrs[k] = String(v); }
+        getAttribute(k) { return this.attrs[k] ?? null; }
+
+        appendChild(child) {
+            if (child.parentNode) {
+                const idx = child.parentNode.children.indexOf(child);
+                if (idx >= 0) child.parentNode.children.splice(idx, 1);
+            }
+            child.parentNode = this;
+            this.children.push(child);
+            return child;
+        }
+
+        insertBefore(newNode, refNode) {
+            if (newNode.parentNode) {
+                const oldIdx = newNode.parentNode.children.indexOf(newNode);
+                if (oldIdx >= 0) newNode.parentNode.children.splice(oldIdx, 1);
+            }
+            newNode.parentNode = this;
+            const idx = this.children.indexOf(refNode);
+            if (idx >= 0) this.children.splice(idx, 0, newNode);
+            else this.children.push(newNode);
+            return newNode;
+        }
+
+        addEventListener(type, fn) {
+            if (!this.listeners[type]) this.listeners[type] = [];
+            this.listeners[type].push(fn);
+        }
+
+        dispatchEvent(evt) {
+            const fns = this.listeners[evt.type] || [];
+            fns.forEach((fn) => fn.call(this, evt));
+            if (evt.type === 'click' && typeof this.onclick === 'function') {
+                this.onclick.call(this, evt);
+            }
+            if (evt.bubbles && !evt.propagationStopped) {
+                if (this.parentNode) this.parentNode.dispatchEvent(evt);
+                else documentObj.dispatchEvent(evt);
+            }
+            return !evt.defaultPrevented;
+        }
+
+        click() {
+            const evt = new FakeEvent('click', { bubbles: true });
+            this.dispatchEvent(evt);
+        }
+
+        focus() { activeElement = this; }
+
+        matchesSelector(sel) {
+            if (sel === '.sun-icon') return this.classList.contains('sun-icon');
+            if (sel === '.moon-icon') return this.classList.contains('moon-icon');
+            const labelMatch = sel.match(/^label\[for="(.+)"\]$/);
+            if (labelMatch) return this.tagName === 'LABEL' && this.attrs.for === labelMatch[1];
+            if (sel === '.clay-select-option:not(:disabled)') {
+                return this.classList.contains('clay-select-option') && !this.disabled;
+            }
+            if (sel === '.clay-select-option.is-selected:not(:disabled)') {
+                return (
+                    this.classList.contains('clay-select-option') &&
+                    this.classList.contains('is-selected') &&
+                    !this.disabled
+                );
+            }
+            return false;
+        }
+
+        querySelectorAll(sel) {
+            const out = [];
+            const walk = (node) => {
+                node.children.forEach((ch) => {
+                    if (ch.matchesSelector(sel)) out.push(ch);
+                    walk(ch);
+                });
+            };
+            walk(this);
+            return out;
+        }
+
+        querySelector(sel) {
+            return this.querySelectorAll(sel)[0] || null;
+        }
+    }
+
+    const root = new FakeElement('div', { id: 'root' });
+    const makeSelect = (id, opts) => {
+        const container = new FakeElement('div');
+        const lbl = new FakeElement('label', { attrs: { for: id }, text: id });
+        const sel = new FakeElement('select', { id, classes: ['worker-select'] });
+        opts.forEach(([val, text, selected]) => {
+            sel.appendChild(new FakeElement('option', { attrs: { value: val, selected }, text }));
+        });
+        container.appendChild(lbl);
+        container.appendChild(sel);
+        root.appendChild(container);
+        return { sel, lbl, container };
+    };
+
+    const themeBtn = root.appendChild(new FakeElement('button', { id: 'themeToggle' }));
+    themeBtn.appendChild(new FakeElement('svg', { classes: ['sun-icon', 'hidden'] }));
+    themeBtn.appendChild(new FakeElement('svg', { classes: ['moon-icon', 'hidden'] }));
+
+    const uploadPanel = root.appendChild(new FakeElement('div', { id: 'uploadPanel' }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'dropZone' }));
+    uploadPanel.appendChild(new FakeElement('input', { id: 'fileInput' }));
+    uploadPanel.appendChild(new FakeElement('span', { id: 'workerValue', text: '4' }));
+    makeSelect('workerSelect', [['1', '1'], ['2', '2'], ['4', '4', true], ['6', '6'], ['custom', 'Другое']]);
+    uploadPanel.appendChild(new FakeElement('div', { id: 'customWorkerWrap', classes: ['hidden'] }));
+    uploadPanel.appendChild(new FakeElement('input', { id: 'customWorkerInput' }));
+    uploadPanel.appendChild(new FakeElement('p', { id: 'workerLimitText' }));
+    uploadPanel.appendChild(new FakeElement('input', { id: 'transcribeToggle', attrs: { checked: true } }));
+    uploadPanel.appendChild(new FakeElement('span', { id: 'transcribeStateBadge', text: 'Вкл' }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
+
+    const asrGroup = makeSelect('asrModelSelect', [
+        ['turbo', 'Whisper Turbo — точная (99 яз., 810 МБ)', true],
+        ['parakeet', 'Parakeet v3 — быстрая (25 яз., 600 МБ)'],
+        ['small', 'Whisper Small — лёгкая (99 яз., 245 МБ)'],
+    ]);
+    const devGroup = makeSelect('computeDeviceSelect', [
+        ['cpu', 'CPU', true],
+        ['cuda', 'GPU (CUDA)'],
+    ]);
+    makeSelect('speakerCountSelect', [['auto', 'Авто', true], ['2', '2 спикера']]);
+
+    const statusPanel = root.appendChild(new FakeElement('div', { id: 'statusPanel', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'spinner' }));
+    statusPanel.appendChild(new FakeElement('svg', { id: 'successIcon', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('svg', { id: 'cancelIcon', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('h2', { id: 'statusText' }));
+    statusPanel.appendChild(new FakeElement('p', { id: 'statusSubText' }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'debugLog', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'cancelBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'downloadBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'downloadTranscriptBtn', classes: ['hidden'] }));
+    const resetBtn = statusPanel.appendChild(new FakeElement('button', { id: 'resetBtn', classes: ['hidden'] }));
+
+    const docListeners = {};
+    const documentObj = {
+        documentElement: new FakeElement('html'),
+        get activeElement() { return activeElement; },
+        getElementById: (id) => byId.get(id) || null,
+        querySelector: (sel) => root.querySelector(sel),
+        querySelectorAll: (sel) => root.querySelectorAll(sel),
+        createElement: (tag) => new FakeElement(tag),
+        createElementNS: (_ns, tag) => new FakeElement(tag),
+        addEventListener: (type, fn) => {
+            if (!docListeners[type]) docListeners[type] = [];
+            docListeners[type].push(fn);
+        },
+        dispatchEvent: (evt) => {
+            (docListeners[evt.type] || []).forEach((fn) => fn(evt));
+        },
+    };
+
+    const uploadedPayloads = [];
+    let taskSeq = 0;
+
+    class FakeFormData {
+        constructor() { this.entries = {}; }
+        append(k, v) { this.entries[k] = v; }
+    }
+
+    const fakeFetch = async (url, opts = {}) => {
+        if (url === '/api/config') {
+            return {
+                ok: true,
+                json: async () => ({
+                    version: '4.3.1',
+                    cpu_count: 8,
+                    default_workers: 4,
+                    max_workers: 7,
+                    transcription_default: true,
+                    default_asr_model: 'turbo',
+                    asr_models: [
+                        { id: 'turbo', label: 'Whisper Turbo — точная (99 яз., 810 МБ)' },
+                        { id: 'parakeet', label: 'Parakeet v3 — быстрая (25 яз., 600 МБ)' },
+                        { id: 'small', label: 'Whisper Small — лёгкая (99 яз., 245 МБ)' },
+                    ],
+                    cuda_available: cudaAvailable,
+                    default_compute_device: 'cpu',
+                    compute_devices: [
+                        { id: 'cpu', label: 'CPU' },
+                        { id: 'cuda', label: 'GPU (CUDA)' },
+                    ],
+                }),
+            };
+        }
+        if (url === '/api/upload') {
+            taskSeq += 1;
+            uploadedPayloads.push({ ...opts.body.entries });
+            return {
+                ok: true,
+                json: async () => ({
+                    task_id: `task-${taskSeq}`,
+                    status: 'queued',
+                    worker_count: 4,
+                }),
+            };
+        }
+        if (url.startsWith('/api/status/')) {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: 'completed',
+                    message: 'Done!',
+                    logs: ['Initializing...', 'Done!'],
+                    transcript_ready: true,
+                }),
+            };
+        }
+        throw new Error('Unexpected URL: ' + url);
+    };
+
+    const ctx = vm.createContext({
+        document: documentObj,
+        window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+        localStorage,
+        Event: FakeEvent,
+        FormData: FakeFormData,
+        AbortController: class { constructor() { this.signal = {}; } abort() {} },
+        fetch: fakeFetch,
+        setInterval: () => 1,
+        clearInterval: () => {},
+        alert: () => {},
+        console,
+        Number,
+        String,
+        Boolean,
+        Array,
+        Map,
+        Set,
+        Date,
+    });
+    ctx.window.matchMedia = () => ({ matches: false });
+
+    const code = fs.readFileSync('static/script.js', 'utf8');
+    vm.runInContext(code, ctx);
+
+    return {
+        ctx,
+        byId,
+        asrGroup,
+        devGroup,
+        resetBtn,
+        uploadPanel,
+        statusPanel,
+        uploadedPayloads,
+        localStorage,
+    };
+}
+
+(async () => {
+    // Scenario 1: Server HAS GPU (cudaAvailable = true)
+    const s1 = runScenario({ cudaAvailable: true });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const asrWrapper = s1.asrGroup.sel.parentNode;
+    const devWrapper = s1.devGroup.sel.parentNode;
+    const getMenuButtons = (wrapper) => wrapper.children.find((c) => c.classList.contains('clay-select-menu')).children;
+
+    // Step 1: User selects CPU-only 'Parakeet v3 — быстрая' for fast CPU job
+    getMenuButtons(asrWrapper)[1].click();
+    assert.strictEqual(s1.asrGroup.sel.value, 'parakeet');
+    assert.strictEqual(s1.devGroup.sel.value, 'cpu');
+
+    // Verify GPU (CUDA) button in menu is STILL enabled (not locked out!) with 'Whisper' hint
+    const gpuBtnBefore = getMenuButtons(devWrapper)[1];
+    assert.strictEqual(gpuBtnBefore.disabled, false, 'GPU option must NOT be disabled when Parakeet is selected');
+    assert.ok(gpuBtnBefore.textContent.includes('Whisper'), 'GPU option should show Whisper auto-switch hint');
+
+    // Step 2: Upload & complete first video job on CPU with Parakeet
+    const fileInput = s1.byId.get('fileInput');
+    fileInput.files = [{ name: 'interview1.mp4' }];
+    fileInput.dispatchEvent(new s1.ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 30));
+
+    assert.strictEqual(s1.uploadedPayloads.length, 1);
+    assert.strictEqual(s1.uploadedPayloads[0].asr_model, 'parakeet');
+    assert.strictEqual(s1.uploadedPayloads[0].compute_device, 'cpu');
+    assert.strictEqual(s1.statusPanel.classList.contains('hidden'), false);
+    assert.strictEqual(s1.resetBtn.classList.contains('hidden'), false);
+
+    // Step 3: Click 'Загрузить ещё' (#resetBtn)
+    s1.resetBtn.click();
+    assert.strictEqual(s1.uploadPanel.classList.contains('hidden'), false);
+    assert.strictEqual(s1.statusPanel.classList.contains('hidden'), true);
+
+    // Step 4: Click <label for="computeDeviceSelect"> -> menu must open and NOT immediately close!
+    s1.devGroup.lbl.click();
+    assert.strictEqual(devWrapper.classList.contains('is-open'), true, 'Label click must open Clay select');
+
+    // Step 5: Click 'GPU (CUDA)' option in custom dropdown
+    const gpuBtnAfterReset = getMenuButtons(devWrapper)[1];
+    assert.strictEqual(gpuBtnAfterReset.disabled, false, 'GPU option must remain enabled after resetBtn');
+    gpuBtnAfterReset.click();
+
+    assert.strictEqual(s1.devGroup.sel.value, 'cuda', 'computeDeviceSelect must switch to cuda');
+    assert.strictEqual(s1.asrGroup.sel.value, 'turbo', 'asrModelSelect must auto-switch from parakeet to turbo');
+    assert.strictEqual(s1.localStorage.getItem('selectedComputeDevice'), 'cuda');
+    assert.strictEqual(s1.localStorage.getItem('selectedAsrModel'), 'turbo');
+
+    // Step 6: Upload second video -> verify compute_device='cuda' & asr_model='turbo' are sent!
+    fileInput.files = [{ name: 'interview2.mp4' }];
+    fileInput.dispatchEvent(new s1.ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 30));
+
+    assert.strictEqual(s1.uploadedPayloads.length, 2);
+    assert.strictEqual(s1.uploadedPayloads[1].compute_device, 'cuda');
+    assert.strictEqual(s1.uploadedPayloads[1].asr_model, 'turbo');
+
+    // Step 7: Click 'Загрузить ещё' again -> GPU (CUDA) remains selected and enabled
+    s1.resetBtn.click();
+    assert.strictEqual(s1.devGroup.sel.value, 'cuda');
+    assert.strictEqual(getMenuButtons(devWrapper)[1].disabled, false);
+
+    // Scenario 2: Server has NO GPU (cudaAvailable = false) -> GPU option MUST be disabled ('нет GPU')
+    const s2 = runScenario({ cudaAvailable: false });
+    await new Promise((r) => setTimeout(r, 20));
+    const s2GpuBtn = getMenuButtons(s2.devGroup.sel.parentNode)[1];
+    assert.strictEqual(s2GpuBtn.disabled, true);
+    assert.ok(s2GpuBtn.textContent.includes('нет GPU'));
+
+    console.log('FRONTEND_GPU_RESET_TEST_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_GPU_RESET_TEST_OK" in proc.stdout
+
