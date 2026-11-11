@@ -8,8 +8,6 @@ services:
     volumes:
       - ./uploads:/app/uploads
       - ./output:/app/output
-      - ./tmp:/app/tmp
       - ./models:/app/models
-      # Optional: mount src for hot-reloading in dev
-      # - ./src:/app/src
+      # Note: /app/tmp stays inside container's fast native Linux filesystem (cleaned after each job)
     restart: unless-stopped

@@ -17,6 +17,7 @@ import ctranslate2
 import numpy as np
 import sherpa_onnx
 from faster_whisper import WhisperModel
+from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from src.config import (
     ASR_MODEL_PROFILES,
@@ -648,6 +649,88 @@ def build_speaker_asr_windows(
     return windows
 
 
+def build_vad_asr_windows(
+    samples: np.ndarray,
+    sample_rate: int = 16000,
+    max_window_sec: float = 26.0,
+    merge_gap_sec: float = 1.4,
+    pad_sec: float = 0.15,
+) -> list[tuple[float, float]]:
+    """
+    Slices raw audio into <=26s speech-only windows via Silero VAD (single CPU
+    thread, ~1s for a 1-hour file) and filters narrowband dial-tone beeps.
+    Used in parallel GPU mode so Whisper immediately saturates CUDA without
+    waiting for CPU speaker diarization.
+    """
+    total_dur = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
+    if total_dur <= 0.0 or samples.size < 800:
+        return []
+
+    raw_chunks = get_speech_timestamps(
+        samples,
+        vad_options=VadOptions(
+            threshold=0.45,
+            min_speech_duration_ms=200,
+            max_speech_duration_s=max_window_sec,
+            min_silence_duration_ms=450,
+            speech_pad_ms=150,
+        ),
+        sampling_rate=sample_rate,
+    )
+    if not raw_chunks:
+        return []
+
+    speech_spans: list[tuple[float, float]] = []
+    for ch in raw_chunks:
+        s_idx = max(0, int(ch["start"]))
+        e_idx = min(len(samples), int(ch["end"]))
+        if e_idx <= s_idx:
+            continue
+        if is_narrowband_tone(samples[s_idx:e_idx], sample_rate=sample_rate):
+            continue
+        speech_spans.append((s_idx / float(sample_rate), e_idx / float(sample_rate)))
+
+    if not speech_spans:
+        return []
+
+    grouped: list[list[float]] = [[speech_spans[0][0], speech_spans[0][1]]]
+    for s_sec, e_sec in speech_spans[1:]:
+        prev_start, prev_end = grouped[-1]
+        gap = s_sec - prev_end
+        combined_span = e_sec - prev_start
+        cur_dur = prev_end - prev_start
+        next_dur = e_sec - s_sec
+        turn_boundary = gap >= 0.6 and cur_dur >= 6.0 and next_dur >= 2.5
+
+        if gap <= merge_gap_sec and combined_span <= max_window_sec and not turn_boundary:
+            grouped[-1][1] = max(prev_end, e_sec)
+        else:
+            grouped.append([s_sec, e_sec])
+
+    windows: list[tuple[float, float]] = []
+    for i, (g_start, g_end) in enumerate(grouped):
+        if i == 0:
+            w_start = max(0.0, g_start - pad_sec)
+        else:
+            prev_end = grouped[i - 1][1]
+            mid = 0.5 * (prev_end + g_start)
+            cand_start = mid if (g_start - prev_end) < 2 * pad_sec else (g_start - pad_sec)
+            w_start = max(windows[-1][1] if windows else 0.0, cand_start)
+
+        if i == len(grouped) - 1:
+            w_end = min(total_dur, g_end + pad_sec)
+        else:
+            next_start = grouped[i + 1][0]
+            mid = 0.5 * (g_end + next_start)
+            cand_end = mid if (next_start - g_end) < 2 * pad_sec else (g_end + pad_sec)
+            w_end = min(total_dur, cand_end)
+
+        if w_end - w_start >= 0.1:
+            windows.append((w_start, w_end))
+
+    return windows
+
+
 def group_bpe_tokens_to_units(
     tokens: list[str],
     timestamps: list[float],
@@ -844,7 +927,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.1.0)",
+        "# Транскрибация интервью (Interview Anonymizer v4.1.1)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -973,7 +1056,9 @@ def resolve_compute_device(
             supported = ctranslate2.get_supported_compute_types("cuda")
         except Exception:
             supported = set()
-        for preferred in ("int8_float16", "float16", "int8", "float32"):
+        # Prefer native FP16 on NVIDIA Tensor Core GPUs (including RTX 50-series Blackwell sm_120,
+        # where CTranslate2's int8/int8_float16 GEMM triggers CUBLAS_STATUS_NOT_SUPPORTED)
+        for preferred in ("float16", "int8_float32", "float32", "int8_float16", "int8"):
             if preferred in supported:
                 return "cuda", preferred
         return "cuda", "float16"
@@ -1076,7 +1161,7 @@ class Transcriber:
         )
 
         sd = sherpa_onnx.OfflineSpeakerDiarization(config)
-        last_pct = -15
+        last_pct = 0
         last_log_t = 0.0
 
         def _progress_cb(done_chunks: int, total_chunks: int) -> int:
@@ -1084,7 +1169,7 @@ class Transcriber:
             if status_cb and total_chunks > 0:
                 pct = int((done_chunks * 85) / total_chunks)
                 now = time.time()
-                if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
+                if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
                     last_pct = pct
                     last_log_t = now
                     status_cb(f"Диаризация спикеров: {pct}%...")
@@ -1159,7 +1244,7 @@ class Transcriber:
         threads: int,
         status_cb: Optional[Callable[[str], None]],
     ) -> list[TimedUnit]:
-        cpu_threads = max(1, int(threads)) if device == "cpu" else 2
+        cpu_threads = max(1, int(threads)) if device == "cpu" else 1
         cache_key = ("faster_whisper", profile_id, model_dir, device, compute_type, cpu_threads)
 
         model: WhisperModel = _ModelCache.get_or_create(
@@ -1174,17 +1259,27 @@ class Transcriber:
         )
 
         total_dur = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
-        windows = build_speaker_asr_windows(diar_segments or [], total_dur)
-        if not windows:
-            windows = [(0.0, total_dur)]
-            used_diar_windows = False
+        if total_dur <= 0.0:
+            return []
+
+        if diar_segments:
+            windows = build_speaker_asr_windows(diar_segments, total_dur)
+            used_diar_windows = bool(windows)
         else:
-            used_diar_windows = True
+            windows = build_vad_asr_windows(samples, sample_rate=sample_rate)
+            used_diar_windows = False
+
+        if not windows:
+            if total_dur <= 5.0 and not is_narrowband_tone(samples, sample_rate=sample_rate):
+                windows = [(0.0, total_dur)]
+            else:
+                return []
 
         beam_size = 4 if device == "cuda" else 2
+        dev_tag = "GPU CUDA" if device == "cuda" else "CPU"
         units: list[TimedUnit] = []
-        last_pct = -15
-        last_log_t = time.time()
+        last_pct = 0
+        last_log_t = 0.0
 
         for w_start, w_end in windows:
             s_idx = max(0, int(w_start * sample_rate))
@@ -1193,7 +1288,7 @@ class Transcriber:
                 continue
 
             win_dur = w_end - w_start
-            use_vad = (not used_diar_windows) or (win_dur > 30.0)
+            use_vad = win_dur > 30.0
             transcribe_kwargs = dict(
                 language=None,
                 task="transcribe",
@@ -1253,11 +1348,11 @@ class Transcriber:
                 if status_cb and total_dur > 0:
                     pct = min(99, int((abs_seg_end / total_dur) * 100))
                     now = time.time()
-                    if pct >= last_pct + 15 and (now - last_log_t) >= 2.0:
+                    if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
                         last_pct = pct
                         last_log_t = now
                         status_cb(
-                            f"Распознавание речи: {pct}% ({format_timestamp(abs_seg_end)} / {format_timestamp(total_dur)})..."
+                            f"Распознавание речи ({dev_tag}): {pct}% ({format_timestamp(abs_seg_end)} / {format_timestamp(total_dur)})..."
                         )
 
         return units
@@ -1289,6 +1384,25 @@ class Transcriber:
             )
         except RuntimeError as err:
             if device == "cuda":
+                if compute_type != "float32":
+                    if status_cb:
+                        status_cb(
+                            f"Предупреждение CUDA {compute_type} ({err}) — повтор на GPU CUDA (float32)..."
+                        )
+                    try:
+                        return cls._decode_whisper_windows(
+                            samples=samples,
+                            sample_rate=sample_rate,
+                            model_dir=model_dir,
+                            profile_id=profile_id,
+                            device="cuda",
+                            compute_type="float32",
+                            diar_segments=diar_segments,
+                            threads=threads,
+                            status_cb=status_cb,
+                        )
+                    except RuntimeError as err_fp32:
+                        err = err_fp32
                 if status_cb:
                     status_cb(f"Ошибка CUDA ({err}) — автоматический переход на CPU...")
                 return cls._decode_whisper_windows(
@@ -1372,6 +1486,158 @@ class Transcriber:
                     status_cb(f"Распознавание речи (Parakeet): {pct}% ({idx}/{total_chunks})...")
 
         return units
+
+    @classmethod
+    def transcribe_units_only(
+        cls,
+        wav_path: str,
+        asr_model: str = DEFAULT_ASR_MODEL,
+        compute_device: str = "cuda",
+        threads: int = 1,
+        status_cb: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """
+        Phase A of hardware-decoupled GPU mode: runs Silero VAD + Whisper on
+        CUDA immediately during CPU video blurring, without competing with CPU
+        video workers by deferring CPU speaker diarization until Phase B.
+        """
+        def update(msg: str):
+            if status_cb:
+                status_cb(msg)
+            else:
+                print(msg)
+
+        profile_id = (asr_model or DEFAULT_ASR_MODEL).strip().lower()
+        if profile_id not in ASR_MODEL_PROFILES:
+            raise ValueError(f"Unsupported ASR profile: {profile_id}")
+        profile = ASR_MODEL_PROFILES[profile_id]
+
+        t0 = time.time()
+        samples, sample_rate = load_wav_16k_mono(wav_path, normalize_gain=True)
+        duration_sec = len(samples) / float(sample_rate) if sample_rate > 0 else 0.0
+
+        if samples.size < 1600:
+            return {
+                "samples": samples,
+                "sample_rate": sample_rate,
+                "duration_sec": duration_sec,
+                "units": [],
+                "profile_id": profile_id,
+                "elapsed_asr": time.time() - t0,
+            }
+
+        asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
+        req_dev = (compute_device or "cuda").strip().lower()
+        eff_dev, eff_ctype = resolve_compute_device(req_dev)
+        dev_label = f"GPU CUDA ({eff_ctype})" if eff_dev == "cuda" else "CPU"
+        update(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
+
+        t_asr = time.time()
+        units = cls._run_faster_whisper(
+            samples=samples,
+            sample_rate=sample_rate,
+            model_dir=asr_dir,
+            profile_id=profile_id,
+            diar_segments=None,
+            threads=threads,
+            compute_device=req_dev,
+            status_cb=update,
+        )
+        elapsed_asr = time.time() - t_asr
+        update(f"[Profile] GPU ASR завершена за {elapsed_asr:.2f}s (единиц текста: {len(units)})")
+
+        return {
+            "samples": samples,
+            "sample_rate": sample_rate,
+            "duration_sec": duration_sec,
+            "units": units,
+            "profile_id": profile_id,
+            "elapsed_asr": elapsed_asr,
+        }
+
+    @classmethod
+    def diarize_and_write_transcript(
+        cls,
+        asr_state: dict,
+        output_txt_path: str,
+        speaker_count: str = "auto",
+        threads: int = 4,
+        status_cb: Optional[Callable[[str], None]] = None,
+    ) -> dict:
+        """
+        Phase B of hardware-decoupled GPU mode: runs CPU speaker diarization
+        using uncontested CPU cores after video blurring completes, then aligns
+        the pre-computed GPU Whisper words to speaker turns and writes .txt.
+        """
+        def update(msg: str):
+            if status_cb:
+                status_cb(msg)
+            else:
+                print(msg)
+
+        t0 = time.time()
+        samples: np.ndarray = asr_state["samples"]
+        duration_sec = float(asr_state.get("duration_sec", 0.0))
+        units: list[TimedUnit] = list(asr_state.get("units", []))
+        profile_id = str(asr_state.get("profile_id", DEFAULT_ASR_MODEL))
+        elapsed_asr = float(asr_state.get("elapsed_asr", 0.0))
+        profile = ASR_MODEL_PROFILES.get(profile_id, ASR_MODEL_PROFILES[DEFAULT_ASR_MODEL])
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_txt_path)), exist_ok=True)
+
+        if samples.size < 1600 or not units:
+            txt = format_transcript_txt(
+                turns=[],
+                duration_sec=duration_sec,
+                model_name=profile["short_name"],
+                num_speakers=0,
+            )
+            with open(output_txt_path, "w", encoding="utf-8") as f:
+                f.write(txt)
+            total_elapsed = elapsed_asr + (time.time() - t0)
+            update(f"[Profile] Транскрипт сохранён (0 реплик, спикеров: 0) за {total_elapsed:.2f}s")
+            return {"num_speakers": 0, "num_turns": 0, "elapsed": total_elapsed}
+
+        seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+        eff_threads = max(1, min(int(threads), 8))
+        update(
+            f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, потоков CPU: {eff_threads})..."
+        )
+        t_diar = time.time()
+        diar_segments = cls._run_diarization(
+            samples=samples,
+            seg_model_path=seg_onnx,
+            emb_model_path=emb_onnx,
+            speaker_count=speaker_count,
+            threads=eff_threads,
+            status_cb=update,
+        )
+        detected_raw_speakers = len({s.speaker for s in diar_segments})
+        update(
+            f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
+            f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
+        )
+
+        turns, final_speaker_count = align_units_to_speakers(units, diar_segments)
+        transcript_text = format_transcript_txt(
+            turns=turns,
+            duration_sec=duration_sec,
+            model_name=profile["short_name"],
+            num_speakers=final_speaker_count,
+        )
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+
+        total_elapsed = elapsed_asr + (time.time() - t0)
+        update(
+            f"[Profile] Транскрипт сохранён ({len(turns)} реплик, спикеров: {final_speaker_count}) "
+            f"за {total_elapsed:.2f}s"
+        )
+        return {
+            "num_speakers": final_speaker_count,
+            "num_turns": len(turns),
+            "elapsed": total_elapsed,
+        }
 
     @classmethod
     def transcribe_audio_file(

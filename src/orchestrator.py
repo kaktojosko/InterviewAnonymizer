@@ -1,9 +1,9 @@
 import os
 import time
 import glob
+import multiprocessing as mp
 import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from multiprocessing import Manager
 from src.io_manager import IOManager
 from src.ffmpeg_utils import FFmpegUtils
 from src.audio_processor import AudioProcessor
@@ -13,26 +13,40 @@ from src.config import (
     CHUNK_DURATION_SECONDS,
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
+    MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     TRANSCRIPTION_ENABLED_DEFAULT,
 )
 
-# Глобальная переменная для воркера, чтобы не пересоздавать модель
+# Глобальные объекты воркера (инициализируются один раз в каждом spawn-процессе)
 _worker_vp = None
+_worker_log_queue = None
 
-def init_worker():
-    global _worker_vp
+
+def init_worker(log_queue=None):
+    global _worker_vp, _worker_log_queue
+    _worker_log_queue = log_queue
     _worker_vp = VideoProcessor()
 
-def process_chunk(input_chunk: str, output_chunk: str, fps_str: str, width: int, height: int, log_queue=None) -> tuple[bool, float]:
-    global _worker_vp
-    if log_queue:
-        log_queue.put(f"[Worker] Started: {os.path.basename(input_chunk)}")
+
+def process_chunk(
+    input_chunk: str,
+    output_chunk: str,
+    fps_str: str,
+    width: int,
+    height: int,
+    log_queue=None,
+) -> tuple[bool, float]:
+    global _worker_vp, _worker_log_queue
+    q = log_queue if log_queue is not None else _worker_log_queue
+    if q is not None:
+        q.put(f"[Worker] Started: {os.path.basename(input_chunk)}")
     start_time = time.time()
     if _worker_vp is None:
         _worker_vp = VideoProcessor()
     success = _worker_vp.process(input_chunk, output_chunk, fps=fps_str, orig_width=width, orig_height=height)
     return success, time.time() - start_time
+
 
 class Orchestrator:
     @staticmethod
@@ -87,42 +101,13 @@ class Orchestrator:
 
             use_parallel_gpu = probe_cuda_available()
         
-        # 2. Parallel Audio & Split Video
+        # 2. Split Video & Parallel Audio / GPU Whisper ASR
         audio_future = None
         transcribe_extract_future = None
         parallel_gpu_future = None
         audio_executor = ThreadPoolExecutor(max_workers=2)
         try:
-            if has_audio:
-                update("Запуск обработки аудио (в фоне)...")
-                audio_future = audio_executor.submit(AudioProcessor.process, input_path, audio_pitched_path, sample_rate)
-                if transcribe and transcript_path:
-                    if use_parallel_gpu:
-                        def _extract_and_transcribe_on_gpu() -> tuple[bool, bool]:
-                            raw_ok = FFmpegUtils.extract_transcription_audio(input_path, audio_16k_path)
-                            if not raw_ok:
-                                return False, False
-                            update("Параллельная транскрибация на GPU (в фоне обработки видео)...")
-                            from src.transcriber import Transcriber
-
-                            Transcriber.transcribe_audio_file(
-                                wav_path=audio_16k_path,
-                                output_txt_path=transcript_path,
-                                asr_model=asr_model,
-                                speaker_count=speaker_count,
-                                threads=workers,
-                                diar_threads=max(1, min(2, workers)),
-                                compute_device="cuda",
-                                status_cb=update,
-                            )
-                            return True, os.path.isfile(transcript_path)
-
-                        parallel_gpu_future = audio_executor.submit(_extract_and_transcribe_on_gpu)
-                    else:
-                        transcribe_extract_future = audio_executor.submit(
-                            FFmpegUtils.extract_transcription_audio, input_path, audio_16k_path
-                        )
-                
+            # Split video first so 3 concurrent FFmpeg readers don't thrash the disk
             update("Разделение видео для параллельной обработки...")
             t0 = time.time()
             
@@ -138,6 +123,33 @@ class Orchestrator:
             chunk_pattern = os.path.join(chunks_dir, "chunk_%04d.mp4")
             FFmpegUtils.split_video(input_path, chunk_pattern, adaptive_chunk_time)
             update(f"[Profile] Split video finished in {time.time() - t0:.2f}s")
+
+            if has_audio:
+                update("Запуск обработки аудио (в фоне)...")
+                audio_future = audio_executor.submit(AudioProcessor.process, input_path, audio_pitched_path, sample_rate)
+                if transcribe and transcript_path:
+                    if use_parallel_gpu:
+                        def _extract_and_run_gpu_asr() -> tuple[bool, dict | None]:
+                            raw_ok = FFmpegUtils.extract_transcription_audio(input_path, audio_16k_path)
+                            if not raw_ok:
+                                return False, None
+                            update("Параллельная транскрибация на GPU (в фоне обработки видео)...")
+                            from src.transcriber import Transcriber
+
+                            asr_state = Transcriber.transcribe_units_only(
+                                wav_path=audio_16k_path,
+                                asr_model=asr_model,
+                                compute_device="cuda",
+                                threads=1,
+                                status_cb=update,
+                            )
+                            return True, asr_state
+
+                        parallel_gpu_future = audio_executor.submit(_extract_and_run_gpu_asr)
+                    else:
+                        transcribe_extract_future = audio_executor.submit(
+                            FFmpegUtils.extract_transcription_audio, input_path, audio_16k_path
+                        )
             
             input_chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
             
@@ -148,15 +160,15 @@ class Orchestrator:
                 vp = VideoProcessor()
                 vp.process(input_path, video_blurred_path, fps=fps_str, orig_width=width, orig_height=height)
             else:
-                # 3. Process chunks in parallel
+                # 3. Process chunks in parallel via 'spawn' (avoids Linux fork() deadlocks with CUDA / ONNX Runtime)
                 active_workers = max(1, min(workers, len(input_chunks)))
                 update(f"Распознавание лиц и блюр (Потоков: {active_workers})...")
                 t0 = time.time()
                 processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
                 os.makedirs(processed_chunks_dir, exist_ok=True)
                 
-                manager = Manager()
-                log_queue = manager.Queue()
+                spawn_ctx = mp.get_context("spawn")
+                log_queue = spawn_ctx.Queue()
                 
                 def log_listener():
                     while True:
@@ -168,28 +180,35 @@ class Orchestrator:
                         except Exception:
                             break
 
-                listener_thread = threading.Thread(target=log_listener)
+                listener_thread = threading.Thread(target=log_listener, daemon=True)
                 listener_thread.start()
 
-                futures_map = {}
-                with ProcessPoolExecutor(max_workers=active_workers, initializer=init_worker) as executor:
-                    for idx, chunk in enumerate(input_chunks):
-                        out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                        f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height, log_queue)
-                        futures_map[f] = out_chunk
-                
-                    output_chunks = []
-                    completed_count = 0
-                    total_chunks = len(futures_map)
-                    for future in as_completed(futures_map):
-                        out_chunk = futures_map[future]
-                        _, chunk_duration = future.result() # wait for completion
-                        completed_count += 1
-                        update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
-                        output_chunks.append(out_chunk)
+                try:
+                    futures_map = {}
+                    with ProcessPoolExecutor(
+                        max_workers=active_workers,
+                        mp_context=spawn_ctx,
+                        initializer=init_worker,
+                        initargs=(log_queue,),
+                    ) as executor:
+                        for idx, chunk in enumerate(input_chunks):
+                            out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
+                            f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
+                            futures_map[f] = out_chunk
                     
-                log_queue.put("DONE")
-                listener_thread.join()
+                        output_chunks = []
+                        completed_count = 0
+                        total_chunks = len(futures_map)
+                        for future in as_completed(futures_map):
+                            out_chunk = futures_map[future]
+                            _, chunk_duration = future.result()
+                            completed_count += 1
+                            update(f"[Profile] Finished: {os.path.basename(out_chunk)} ({completed_count}/{total_chunks}) in {chunk_duration:.2f}s")
+                            output_chunks.append(out_chunk)
+                finally:
+                    log_queue.put("DONE")
+                    listener_thread.join(timeout=5.0)
+                    log_queue.close()
                 
                 update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
                     
@@ -231,10 +250,11 @@ class Orchestrator:
             if transcribe and transcript_path:
                 from src.transcriber import Transcriber, format_transcript_txt
 
+                gpu_asr_state = None
                 if parallel_gpu_future is not None:
                     if not parallel_gpu_future.done():
-                        update("Ожидание завершения GPU-транскрибации...")
-                    raw_wav_ready, transcript_ready = parallel_gpu_future.result()
+                        update("Ожидание завершения распознавания речи на GPU...")
+                    raw_wav_ready, gpu_asr_state = parallel_gpu_future.result()
 
                 if not has_audio or not raw_wav_ready:
                     update("Аудиодорожка отсутствует — формирование пустого файла транскрибации...")
@@ -249,7 +269,17 @@ class Orchestrator:
                     with open(transcript_path, "w", encoding="utf-8") as f:
                         f.write(empty_txt)
                     transcript_ready = True
-                elif parallel_gpu_future is None:
+                elif parallel_gpu_future is not None and gpu_asr_state is not None:
+                    diar_cpu_threads = min(8, max(workers, MAX_ALLOWED_WORKERS))
+                    Transcriber.diarize_and_write_transcript(
+                        asr_state=gpu_asr_state,
+                        output_txt_path=transcript_path,
+                        speaker_count=speaker_count,
+                        threads=diar_cpu_threads,
+                        status_cb=update,
+                    )
+                    transcript_ready = os.path.isfile(transcript_path)
+                else:
                     update("Запуск локальной автотранскрибации по ролям...")
                     Transcriber.transcribe_audio_file(
                         wav_path=audio_16k_path,

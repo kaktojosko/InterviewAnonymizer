@@ -12,9 +12,11 @@ from src.transcriber import (
     DiarizationSegment,
     SpeakerTurn,
     TimedUnit,
+    Transcriber,
     _ModelCache,
     align_units_to_speakers,
     build_speaker_asr_windows,
+    build_vad_asr_windows,
     clean_hallucinated_text,
     cluster_anchor_embeddings,
     consolidate_minor_speakers,
@@ -172,14 +174,22 @@ def test_resolve_compute_device_cpu_cuda_and_fallback(monkeypatch):
     assert (dev, ctype) == ("cpu", "int8")
     assert any("CUDA недоступна" in m for m in logs)
 
-    # 3. CUDA requested when available -> selects int8_float16
+    # 3. CUDA on Tensor Core GPUs (incl. RTX 50-series Blackwell) -> prefers native float16
     monkeypatch.setattr(tr_mod, "probe_cuda_available", lambda: True)
     monkeypatch.setattr(
         tr_mod.ctranslate2,
         "get_supported_compute_types",
-        lambda device: {"float32", "float16", "int8_float16"},
+        lambda device: {"float32", "float16", "int8_float16", "int8"},
     )
-    assert resolve_compute_device("cuda") == ("cuda", "int8_float16")
+    assert resolve_compute_device("cuda") == ("cuda", "float16")
+
+    # 4. CUDA on older Pascal GPUs without FP16 Tensor Cores -> selects int8_float32
+    monkeypatch.setattr(
+        tr_mod.ctranslate2,
+        "get_supported_compute_types",
+        lambda device: {"float32", "int8_float32", "int8"},
+    )
+    assert resolve_compute_device("cuda") == ("cuda", "int8_float32")
 
 
 def test_group_bpe_tokens_to_units_code_switching():
@@ -245,7 +255,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.1.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.1.1)" in txt
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
     assert "[00:00:10 - 00:00:15] Спикер 2: Всё отлично, PR уже в main." in txt
@@ -448,4 +458,139 @@ def test_cluster_anchor_embeddings_prevents_speaker_explosion_on_3_person_interv
     ]
     mono_clustered = cluster_anchor_embeddings(mono_segs, mono_embs, speaker_count="auto")
     assert len({s.speaker for s in mono_clustered}) == 1
+
+
+def test_build_vad_asr_windows_filters_ringback_and_packs_speech(monkeypatch):
+    sr = 16000
+    total_sec = 20.0
+    samples = np.zeros(int(sr * total_sec), dtype=np.float32)
+
+    # 1..2s: pure 425 Hz dial-tone beep -> must be rejected
+    t1 = np.linspace(0, 1.0, sr, endpoint=False, dtype=np.float32)
+    samples[1 * sr : 2 * sr] = 0.5 * np.sin(2 * np.pi * 425.0 * t1)
+
+    # 3..10s (7s) and 11..15s (4s): broadband speech-like spans separated by 1.0s (>=0.6s) -> 2 windows
+    rng = np.random.RandomState(99)
+    for s_sec, e_sec in ((3, 10), (11, 15)):
+        n = (e_sec - s_sec) * sr
+        tt = np.linspace(0, float(e_sec - s_sec), n, endpoint=False, dtype=np.float32)
+        chunk = rng.normal(0.0, 0.08, n).astype(np.float32)
+        for f0 in (200, 420, 880, 1550, 2600):
+            chunk += (0.06 * np.sin(2 * np.pi * f0 * tt)).astype(np.float32)
+        samples[s_sec * sr : e_sec * sr] = chunk
+
+    monkeypatch.setattr(
+        tr_mod,
+        "get_speech_timestamps",
+        lambda audio, vad_options=None, sampling_rate=16000, **kw: [
+            {"start": 1 * sr, "end": 2 * sr},
+            {"start": 3 * sr, "end": 10 * sr},
+            {"start": 11 * sr, "end": 15 * sr},
+        ],
+    )
+
+    windows = build_vad_asr_windows(samples, sample_rate=sr)
+    assert len(windows) == 2
+    assert windows[0] == pytest.approx((2.85, 10.15))
+    assert windows[1] == pytest.approx((10.85, 15.15))
+
+
+def test_run_faster_whisper_retries_cuda_float32_before_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(tr_mod, "resolve_compute_device", lambda dev, status_cb=None: ("cuda", "float16"))
+
+    attempted = []
+
+    def _mock_decode_fp32_succeeds(**kwargs):
+        attempted.append((kwargs["device"], kwargs["compute_type"]))
+        if kwargs["device"] == "cuda" and kwargs["compute_type"] == "float16":
+            raise RuntimeError("CUBLAS_STATUS_NOT_SUPPORTED")
+        return [TimedUnit(0.0, 1.0, " GPU-FP32")]
+
+    monkeypatch.setattr(Transcriber, "_decode_whisper_windows", staticmethod(_mock_decode_fp32_succeeds))
+    logs = []
+    out = Transcriber._run_faster_whisper(
+        samples=np.zeros(16000, dtype=np.float32),
+        sample_rate=16000,
+        model_dir="/tmp/mock",
+        profile_id="turbo",
+        compute_device="cuda",
+        status_cb=logs.append,
+    )
+    assert [u.text for u in out] == [" GPU-FP32"]
+    assert attempted == [("cuda", "float16"), ("cuda", "float32")]
+    assert any("float32" in m for m in logs)
+
+    # If CUDA float32 ALSO fails, it safely falls back to CPU int8
+    attempted.clear()
+
+    def _mock_decode_all_cuda_fail(**kwargs):
+        attempted.append((kwargs["device"], kwargs["compute_type"]))
+        if kwargs["device"] == "cuda":
+            raise RuntimeError("CUDA driver error")
+        return [TimedUnit(0.0, 1.0, " CPU-INT8")]
+
+    monkeypatch.setattr(Transcriber, "_decode_whisper_windows", staticmethod(_mock_decode_all_cuda_fail))
+    out_cpu = Transcriber._run_faster_whisper(
+        samples=np.zeros(16000, dtype=np.float32),
+        sample_rate=16000,
+        model_dir="/tmp/mock",
+        profile_id="turbo",
+        compute_device="cuda",
+    )
+    assert [u.text for u in out_cpu] == [" CPU-INT8"]
+    assert attempted == [("cuda", "float16"), ("cuda", "float32"), ("cpu", "int8")]
+
+
+def test_decoupled_gpu_transcribe_units_and_diarize(tmp_path, monkeypatch):
+    wav_path = str(tmp_path / "sample.wav")
+    out_txt = str(tmp_path / "out.txt")
+    sr = 16000
+    tone = (0.2 * np.sin(2 * np.pi * 300 * np.linspace(0, 2.0, sr * 2, endpoint=False)) * 32767).astype(
+        np.int16
+    )
+    _write_pcm16_wav(wav_path, tone, sample_rate=sr)
+
+    monkeypatch.setattr(ModelManager, "ensure_asr_model", classmethod(lambda cls, pid, status_cb=None: "/tmp/asr"))
+    monkeypatch.setattr(
+        ModelManager,
+        "ensure_diarization_models",
+        classmethod(lambda cls, status_cb=None: ("/tmp/seg.onnx", "/tmp/emb.onnx")),
+    )
+    monkeypatch.setattr(tr_mod, "resolve_compute_device", lambda dev, status_cb=None: ("cuda", "float16"))
+    monkeypatch.setattr(
+        Transcriber,
+        "_run_faster_whisper",
+        classmethod(
+            lambda cls, **kw: [
+                TimedUnit(0.1, 0.9, " Привет!"),
+                TimedUnit(1.1, 1.9, " Hello!"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        Transcriber,
+        "_run_diarization",
+        classmethod(
+            lambda cls, **kw: [
+                DiarizationSegment(0.0, 1.0, speaker=0),
+                DiarizationSegment(1.05, 2.0, speaker=1),
+            ]
+        ),
+    )
+
+    state = Transcriber.transcribe_units_only(wav_path, asr_model="turbo", compute_device="cuda")
+    assert len(state["units"]) == 2
+
+    res = Transcriber.diarize_and_write_transcript(
+        asr_state=state,
+        output_txt_path=out_txt,
+        speaker_count="auto",
+        threads=4,
+    )
+    assert res["num_speakers"] == 2
+    assert res["num_turns"] == 2
+    txt = open(out_txt, encoding="utf-8").read()
+    assert "Спикер 1: Привет!" in txt
+    assert "Спикер 2: Hello!" in txt
+
 

@@ -118,7 +118,7 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.1.0"
+    assert data["version"] == "4.1.1"
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
     assert data["default_compute_device"] == "cpu"
@@ -213,33 +213,94 @@ def test_orchestrator_silent_video_creates_note_transcript(tmp_path):
 
 
 def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
+    import numpy as np
     import src.transcriber as tr_mod
+    from src.transcriber import TimedUnit
 
     in_mp4 = str(tmp_path / "gpu_input.mp4")
     out_mp4 = str(tmp_path / "gpu_output.mp4")
     out_txt = str(tmp_path / "gpu_transcript.txt")
-    _generate_test_mp4(in_mp4, duration_sec=1.2, with_audio=True)
 
-    recorded_calls = []
+    # Generate 2.4s MP4 with 1s keyframes (-g 15 at 15fps) so split_video produces >=2 chunks
+    # and exercises real 'spawn' ProcessPoolExecutor + Queue inheritance!
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=15:duration=2.4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2.4",
+            "-c:v",
+            "libx264",
+            "-g",
+            "15",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            in_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
-    def _mock_gpu_transcribe(
+    orig_split = FFmpegUtils.split_video
+    monkeypatch.setattr(
+        FFmpegUtils,
+        "split_video",
+        staticmethod(lambda inp, pat, _chunk_t: orig_split(inp, pat, 1)),
+    )
+
+    events = []
+
+    def _mock_gpu_units_only(
         cls,
         wav_path: str,
-        output_txt_path: str,
         asr_model: str = "turbo",
-        speaker_count: str = "auto",
+        compute_device: str = "cuda",
         threads: int = 1,
-        diar_threads=None,
-        compute_device: str = "cpu",
         status_cb=None,
     ):
-        recorded_calls.append({"compute_device": compute_device, "diar_threads": diar_threads})
+        events.append(("gpu_asr", compute_device, threads))
+        if status_cb:
+            status_cb("[Profile] GPU ASR завершена за 0.01s (единиц текста: 1)")
+        return {
+            "samples": np.ones(16000, dtype=np.float32) * 0.1,
+            "sample_rate": 16000,
+            "duration_sec": 2.4,
+            "units": [TimedUnit(0.1, 0.9, " GPU OK")],
+            "profile_id": asr_model,
+            "elapsed_asr": 0.01,
+        }
+
+    def _mock_post_mux_diarize(
+        cls,
+        asr_state: dict,
+        output_txt_path: str,
+        speaker_count: str = "auto",
+        threads: int = 4,
+        status_cb=None,
+    ):
+        events.append(("cpu_diarize", speaker_count, threads))
+        if status_cb:
+            status_cb("[Profile] Диаризация завершена за 0.01s")
         with open(output_txt_path, "w", encoding="utf-8") as f:
             f.write("[00:00:00 - 00:00:01] Спикер 1: GPU OK\n")
-        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01}
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.02}
 
     monkeypatch.setattr(tr_mod, "probe_cuda_available", lambda: True)
-    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_gpu_transcribe))
+    monkeypatch.setattr(Transcriber, "transcribe_units_only", classmethod(_mock_gpu_units_only))
+    monkeypatch.setattr(
+        Transcriber, "diarize_and_write_transcript", classmethod(_mock_post_mux_diarize)
+    )
 
     logs = []
     iom = IOManager()
@@ -250,7 +311,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
             output_path=out_mp4,
             job_dir=job_dir,
             status_cb=logs.append,
-            worker_count=4,
+            worker_count=2,
             transcribe=True,
             transcript_path=out_txt,
             asr_model="turbo",
@@ -259,8 +320,16 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         )
         assert res["video_ready"] is True
         assert res["transcript_ready"] is True
-        assert recorded_calls == [{"compute_device": "cuda", "diar_threads": 2}]
-        assert any("Параллельная транскрибация на GPU" in m for m in logs)
+        assert events[0] == ("gpu_asr", "cuda", 1)
+        assert events[1][0] == "cpu_diarize"
+        assert events[1][1] == "auto"
+        assert events[1][2] >= 2
+        # Verify real spawned child workers logged through spawn_ctx.Queue()
+        assert sum(1 for m in logs if "[Worker] Started: chunk_" in m) >= 2
+        # Verify CPU diarization ran AFTER video muxing finished (no CPU contention!)
+        mux_idx = next(i for i, m in enumerate(logs) if "Mux finished" in m)
+        diar_idx = next(i for i, m in enumerate(logs) if "Диаризация завершена" in m)
+        assert diar_idx > mux_idx
     finally:
         iom.cleanup_job_dir(job_dir)
 
