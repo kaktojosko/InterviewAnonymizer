@@ -29,13 +29,16 @@ class AudioProcessor:
             # asetrate changes sample rate (pitch + speed)
             # aresample restores standard sample rate
             # atempo fixes the speed
-            af_filter = f"asetrate={new_rate},aresample={sample_rate},atempo={atempo:.4f}"
-            
-            spec = (
-                ffmpeg
-                .input(input_audio_path)
-                .output(output_audio_path, map='0:a:0', af=af_filter)
-            )
+            valid_aac_rates = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+            out_rate = sample_rate if sample_rate in valid_aac_rates else 44100
+            af_filter = f"asetrate={new_rate},aresample={out_rate},atempo={atempo:.4f}"
+
+            out_kwargs = {"map": "0:a:0", "vn": None, "af": af_filter}
+            if output_audio_path.lower().endswith((".m4a", ".aac", ".mp4")):
+                out_kwargs["acodec"] = "aac"
+                out_kwargs["audio_bitrate"] = "128k"
+
+            spec = ffmpeg.input(input_audio_path).output(output_audio_path, **out_kwargs)
             FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
             return True
         except TaskCancelledError:
@@ -44,3 +47,4 @@ class AudioProcessor:
             err_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
             print(f"Error processing audio with FFmpeg: {err_msg}")
             return False
+

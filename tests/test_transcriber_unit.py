@@ -29,7 +29,10 @@ from src.transcriber import (
     resolve_compute_device,
     smooth_diarization_segments,
     split_audio_ranges_at_silence,
+    subdivide_long_asr_windows,
+    window_has_multiple_speakers,
 )
+
 
 
 def _write_pcm16_wav(path: str, samples_i16: np.ndarray, sample_rate: int = 16000, channels: int = 1):
@@ -255,7 +258,8 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.2.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.3.0)" in txt
+
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
     assert "[00:00:10 - 00:00:15] Спикер 2: Всё отлично, PR уже в main." in txt
@@ -636,3 +640,177 @@ def test_cancellation_token_terminates_subprocess_and_transcriber(tmp_path):
 
 
 
+
+
+def test_cpu_dense_window_packing_and_monologue_subdivision():
+    diar = [
+        DiarizationSegment(0.5, 9.0, speaker=0),
+        DiarizationSegment(10.0, 18.0, speaker=1),
+        DiarizationSegment(19.0, 26.0, speaker=0),
+    ]
+    # Default mode splits substantive speaker turns -> 3 windows
+    split_wins = build_speaker_asr_windows(diar, total_dur=27.0, split_speaker_turns=True)
+    assert len(split_wins) == 3
+
+    # Dense CPU mode packs all 3 turns into a single <=28.5s window (3x fewer Encoder passes!)
+    dense_wins = build_speaker_asr_windows(
+        diar, total_dur=27.0, max_same_speaker_sec=28.5, merge_gap_sec=3.5, split_speaker_turns=False
+    )
+    assert len(dense_wins) == 1
+    assert dense_wins[0] == pytest.approx((0.3, 26.2))
+    assert window_has_multiple_speakers(dense_wins[0][0], dense_wins[0][1], diar) is True
+
+    # Single-speaker monologue window -> window_has_multiple_speakers is False (skips DTW word_timestamps)
+    mono_diar = [DiarizationSegment(1.0, 62.0, speaker=0)]
+    sr = 16000
+    samples = np.random.RandomState(11).normal(0.0, 0.15, int(65.0 * sr)).astype(np.float32)
+    # Insert quiet breath pauses at 26.5s and 53.0s
+    samples[int(26.3 * sr) : int(26.8 * sr)] = 0.0
+    samples[int(52.8 * sr) : int(53.3 * sr)] = 0.0
+
+    raw_mono_wins = build_speaker_asr_windows(
+        mono_diar, total_dur=65.0, max_same_speaker_sec=28.5, split_speaker_turns=False
+    )
+    sub_wins = subdivide_long_asr_windows(raw_mono_wins, samples, sample_rate=sr, max_window_sec=29.0)
+    assert len(sub_wins) == 3
+    for ws, we in sub_wins:
+        assert (we - ws) <= 29.01
+        assert window_has_multiple_speakers(ws, we, mono_diar) is False
+
+
+def test_decode_whisper_windows_cpu_optimizations_and_parallel_workers(monkeypatch):
+    import time
+    from types import SimpleNamespace
+
+    created_init_kwargs = {}
+    transcribe_calls = []
+
+    class _FakeWhisperModel:
+        def __init__(self, model_dir, **kwargs):
+            created_init_kwargs.update(kwargs)
+
+        def transcribe(self, audio_slice, **kwargs):
+            # Sleep slightly longer on the first window so worker 2 finishes first,
+            # proving deterministic chronological reassembly of results!
+            is_multi_spk = bool(kwargs.get("word_timestamps"))
+            transcribe_calls.append(dict(kwargs))
+            if not is_multi_spk:
+                time.sleep(0.04)
+                seg = SimpleNamespace(
+                    start=0.1,
+                    end=min(2.0, len(audio_slice) / 16000.0),
+                    text=" Монолог первого спикера.",
+                    words=None,
+                    no_speech_prob=0.05,
+                    avg_logprob=-0.2,
+                )
+            else:
+                seg = SimpleNamespace(
+                    start=0.1,
+                    end=min(3.0, len(audio_slice) / 16000.0),
+                    text=" Вопрос? Ответ!",
+                    words=[
+                        SimpleNamespace(start=0.1, end=1.2, word=" Вопрос?"),
+                        SimpleNamespace(start=1.6, end=2.8, word=" Ответ!"),
+                    ],
+                    no_speech_prob=0.05,
+                    avg_logprob=-0.2,
+                )
+            return [seg], SimpleNamespace(language="ru")
+
+    monkeypatch.setattr(tr_mod, "WhisperModel", _FakeWhisperModel)
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    sr = 16000
+    samples = np.ones(sr * 40, dtype=np.float32) * 0.05
+    # Window 1 (0..10s): single speaker 0 -> word_timestamps=False
+    # Gap of 6s (>3.5s merge_gap_sec) forces second window:
+    # Window 2 (16..26s): speakers 0 and 1 -> word_timestamps=True
+    diar = [
+        DiarizationSegment(0.5, 9.5, speaker=0),
+        DiarizationSegment(16.0, 20.0, speaker=0),
+        DiarizationSegment(20.5, 25.0, speaker=1),
+    ]
+
+    units = Transcriber._decode_whisper_windows(
+        samples=samples,
+        sample_rate=sr,
+        model_dir="/tmp/fake_whisper_cpu",
+        profile_id="turbo",
+        device="cpu",
+        compute_type="int8",
+        diar_segments=diar,
+        threads=8,
+        status_cb=None,
+    )
+
+    assert created_init_kwargs["num_workers"] == 2
+    assert created_init_kwargs["cpu_threads"] == 4
+    assert len(transcribe_calls) == 2
+    for call_kw in transcribe_calls:
+        assert call_kw["language"] == "ru"
+        assert call_kw["multilingual"] is True
+        assert call_kw["beam_size"] == 1
+        assert call_kw["temperature"] == (0.0, 0.4)
+
+    word_ts_flags = sorted(c["word_timestamps"] for c in transcribe_calls)
+    assert word_ts_flags == [False, True]
+
+    # Chronological order preserved despite window 1 sleeping longer than window 2!
+    assert [u.text.strip() for u in units] == ["Монолог первого спикера.", "Вопрос?", "Ответ!"]
+    assert units[0].start < units[1].start < units[2].start
+
+
+def test_run_sherpa_parakeet_batched_decode_streams(monkeypatch):
+    from types import SimpleNamespace
+
+    batch_sizes = []
+
+    class _FakeStream:
+        def __init__(self):
+            self.result = None
+
+        def accept_waveform(self, sr, wav):
+            self.dur = len(wav) / float(sr)
+
+    class _FakeParakeetRecognizer:
+        def create_stream(self):
+            return _FakeStream()
+
+        def decode_streams(self, streams):
+            batch_sizes.append(len(streams))
+            for idx, s in enumerate(streams):
+                s.result = SimpleNamespace(
+                    tokens=["▁Тест", f"▁{idx}"],
+                    timestamps=[0.1, 0.5],
+                    text=f"Тест {idx}",
+                )
+
+        def decode_stream(self, stream):
+            batch_sizes.append(1)
+            stream.result = SimpleNamespace(
+                tokens=["▁Один"],
+                timestamps=[0.1],
+                text="Один",
+            )
+
+    _ModelCache.active_key = ("sherpa_parakeet", "/tmp/fake_parakeet", 4)
+    _ModelCache.active_engine = _FakeParakeetRecognizer()
+
+    sr = 16000
+    samples = np.ones(sr * 30, dtype=np.float32) * 0.05
+    # 5 separate speech islands (>0.4s apart, >18s spans prevented by explicit gaps)
+    diar = [DiarizationSegment(i * 5.0 + 0.5, i * 5.0 + 3.0, speaker=i % 2) for i in range(5)]
+
+    units = Transcriber._run_sherpa_parakeet(
+        samples=samples,
+        sample_rate=sr,
+        model_dir="/tmp/fake_parakeet",
+        diar_segments=diar,
+        threads=4,
+    )
+    # 5 chunks -> batch of 4 via decode_streams + remaining 1 via decode_stream
+    assert batch_sizes == [4, 1]
+    assert len(units) == 9
+    assert units[0].start < units[-1].start

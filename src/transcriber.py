@@ -1,4 +1,5 @@
 import bisect
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ctypes
 from dataclasses import dataclass
 import gc
@@ -100,44 +101,53 @@ def load_wav_16k_mono(wav_path: str, normalize_gain: bool = True) -> tuple[np.nd
     return np.ascontiguousarray(pcm, dtype=np.float32), sample_rate
 
 
+_TONE_WIN = 512
+_TONE_HOP = 256
+_TONE_HANN = np.hanning(_TONE_WIN).astype(np.float32)
+
+
 def is_narrowband_tone(seg_samples: np.ndarray, sample_rate: int = 16000) -> bool:
     """
     Detects synthetic single- or dual-frequency call-waiting / ringback / busy
     tones (e.g. Zoom, Teams, Telemost, telephony 425 Hz / 440+480 Hz beeps) so
     they are excluded before speaker clustering and ASR.
+    Vectorized over STFT frames via NumPy batched rfft for ~30x lower CPU overhead.
     """
-    win = 512
-    hop = 256
-    if sample_rate <= 0 or seg_samples.size < max(win, int(0.18 * sample_rate)):
+    if sample_rate <= 0 or seg_samples.size < max(_TONE_WIN, int(0.18 * sample_rate)):
         return False
 
-    freqs = np.fft.rfftfreq(win, d=1.0 / float(sample_rate))
+    freqs = np.fft.rfftfreq(_TONE_WIN, d=1.0 / float(sample_rate))
     band_mask = (freqs >= 150.0) & (freqs <= 3800.0)
     if int(np.count_nonzero(band_mask)) < 6:
         return False
 
-    hann = np.hanning(win).astype(np.float32)
-    top3_ratios: list[float] = []
-    flatnesses: list[float] = []
+    frames = np.lib.stride_tricks.sliding_window_view(seg_samples, _TONE_WIN)[::_TONE_HOP]
+    if frames.shape[0] < 4:
+        return False
+    if frames.shape[0] > 512:
+        frames = frames[:: max(1, frames.shape[0] // 256)]
 
-    for pos in range(0, len(seg_samples) - win + 1, hop):
-        frame = seg_samples[pos : pos + win]
-        if float(np.mean(frame * frame)) < 1e-6:
-            continue
-        spec = (np.abs(np.fft.rfft(frame * hann)) ** 2)[band_mask]
-        band_sum = float(np.sum(spec))
-        if band_sum <= 1e-10:
-            continue
-        top3 = float(np.sum(np.partition(spec, -3)[-3:]))
-        top3_ratios.append(top3 / band_sum)
-        geom_mean = float(np.exp(np.mean(np.log(spec + 1e-12))))
-        arith_mean = float(np.mean(spec)) + 1e-12
-        flatnesses.append(geom_mean / arith_mean)
-
-    if len(top3_ratios) < 4:
+    energy = np.mean(frames * frames, axis=1)
+    active = frames[energy >= 1e-6]
+    if active.shape[0] < 4:
         return False
 
+    spec = (np.abs(np.fft.rfft(active * _TONE_HANN, axis=1)) ** 2)[:, band_mask]
+    band_sums = np.sum(spec, axis=1)
+    valid_mask = band_sums > 1e-10
+    if int(np.count_nonzero(valid_mask)) < 4:
+        return False
+
+    spec = spec[valid_mask]
+    band_sums = band_sums[valid_mask]
+    top3 = np.sum(np.partition(spec, -3, axis=1)[:, -3:], axis=1)
+    top3_ratios = top3 / band_sums
+    geom_means = np.exp(np.mean(np.log(spec + 1e-12), axis=1))
+    arith_means = np.mean(spec, axis=1) + 1e-12
+    flatnesses = geom_means / arith_means
+
     return bool(np.median(top3_ratios) > 0.78 and np.median(flatnesses) < 0.02)
+
 
 
 _WORD_CHARS_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё가-힣]")
@@ -586,13 +596,15 @@ def build_speaker_asr_windows(
     max_same_speaker_sec: float = 27.0,
     merge_gap_sec: float = 1.8,
     pad_sec: float = 0.2,
+    split_speaker_turns: bool = True,
 ) -> list[tuple[float, float]]:
     """
-    Packs diarization segments into efficient <=27s Whisper windows while still
-    splitting substantial multi-sentence turns across different speakers (>=6s
-    followed by >=2.5s) for independent per-speaker language detection. Short
-    backchannels ('угу', 'да') are packed together to avoid wasting full 30s
-    Whisper Encoder passes on 1-second remarks.
+    Packs diarization segments into efficient <=28.5s Whisper windows.
+    When split_speaker_turns is True (default / GPU mode), substantial turns
+    across different speakers (>=6s followed by >=2.5s) are split; when False
+    (CPU mode), adjacent speech turns are packed densely up to max_same_speaker_sec
+    to eliminate 30-second Mel zero-padding waste while multi-speaker windows
+    use word_timestamps for exact speaker turn attribution.
     """
     if not diar_segments or total_dur <= 0.0:
         return []
@@ -613,7 +625,7 @@ def build_speaker_asr_windows(
         next_seg_dur = seg.end - seg.start
 
         same_speaker_ok = seg.speaker == prev_spk
-        short_exchange_ok = (cur_group_dur < 6.0) or (next_seg_dur < 2.5)
+        short_exchange_ok = (not split_speaker_turns) or (cur_group_dur < 6.0) or (next_seg_dur < 2.5)
 
         if (
             gap <= merge_gap_sec
@@ -648,6 +660,83 @@ def build_speaker_asr_windows(
             windows.append((w_start, w_end))
 
     return windows
+
+
+def subdivide_long_asr_windows(
+    windows: list[tuple[float, float]],
+    samples: np.ndarray,
+    sample_rate: int = 16000,
+    max_window_sec: float = 29.0,
+) -> list[tuple[float, float]]:
+    """
+    Splits any >max_window_sec monologue window at local 50ms RMS silence/breath
+    valleys so every Whisper window fits inside a single <=30s Encoder pass
+    without triggering redundant Silero VAD or hallucination re-seeks.
+    """
+    if not windows or sample_rate <= 0 or samples.size == 0:
+        return windows
+
+    win_samples = max(1, int(0.05 * sample_rate))
+    out: list[tuple[float, float]] = []
+
+    for w_start, w_end in windows:
+        if (w_end - w_start) <= max_window_sec:
+            out.append((w_start, w_end))
+            continue
+
+        cur = w_start
+        while (w_end - cur) > max_window_sec:
+            target_s = cur + max_window_sec - 2.0
+            search_lo = max(cur + 6.0, target_s - 4.0)
+            search_hi = min(w_end - 1.0, cur + max_window_sec - 0.2)
+            lo_idx = max(0, int(search_lo * sample_rate))
+            hi_idx = min(len(samples), int(search_hi * sample_rate))
+
+            if hi_idx - lo_idx > win_samples:
+                n_frames = (hi_idx - lo_idx) // win_samples
+                frames = samples[lo_idx : lo_idx + n_frames * win_samples].reshape(n_frames, win_samples)
+                energies = np.einsum("ij,ij->i", frames, frames)
+                best_f = int(np.argmin(energies))
+                split_pt = (lo_idx + best_f * win_samples + (win_samples // 2)) / float(sample_rate)
+            else:
+                split_pt = min(target_s, w_end)
+
+            if split_pt <= cur + 0.5:
+                split_pt = cur + max_window_sec
+            out.append((cur, min(split_pt, w_end)))
+            cur = split_pt
+
+        if w_end - cur >= 0.1:
+            out.append((cur, w_end))
+
+    return out
+
+
+def window_has_multiple_speakers(
+    w_start: float,
+    w_end: float,
+    diar_segments: Optional[list[DiarizationSegment]],
+    min_overlap_sec: float = 0.15,
+) -> bool:
+    """
+    Returns True if >=2 distinct diarized speakers overlap [w_start, w_end].
+    Single-speaker monologue windows skip cross-attention DTW word_timestamps
+    alignment because phrase-level segments already belong to one speaker.
+    """
+    if not diar_segments:
+        return True
+    seen: set[int] = set()
+    for seg in diar_segments:
+        if seg.end <= w_start:
+            continue
+        if seg.start >= w_end:
+            break
+        if (min(w_end, seg.end) - max(w_start, seg.start)) >= min_overlap_sec:
+            seen.add(seg.speaker)
+            if len(seen) >= 2:
+                return True
+    return False
+
 
 
 def build_vad_asr_windows(
@@ -928,7 +1017,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.2.0)",
+        "# Транскрибация интервью (Interview Anonymizer v4.3.0)",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -971,6 +1060,31 @@ class _ModelCache:
             cls.active_engine = factory()
             cls.active_key = key
             return cls.active_engine
+
+
+class _DiarizationCache:
+    """
+    Keeps warm pyannote segmentation + CAM++ voiceprint ONNX sessions (~34 MB)
+    so sequential jobs skip repeated disk loads and ONNX graph compilation.
+    """
+
+    lock = threading.Lock()
+    active_key: Optional[tuple] = None
+    active_pair = None
+
+    @classmethod
+    def get_or_create(cls, key: tuple, factory: Callable):
+        with cls.lock:
+            if cls.active_key == key and cls.active_pair is not None:
+                return cls.active_pair
+            if cls.active_pair is not None:
+                cls.active_pair = None
+                cls.active_key = None
+                gc.collect()
+            cls.active_pair = factory()
+            cls.active_key = key
+            return cls.active_pair
+
 
 
 _nvidia_libs_loaded = False
@@ -1102,12 +1216,12 @@ class Transcriber:
                 return None
             return raw_vec / nrm
 
-        max_win = 5 * sample_rate
-        if seg_wav.size <= 8 * sample_rate:
+        # CAM++ voiceprint accuracy saturates around ~3.2s; cap long segments to 2x 3.2s slices
+        if seg_wav.size <= int(4.5 * sample_rate):
             return _embed_slice(seg_wav)
 
-        # Average up to 3 evenly spaced 5s windows on long monologues
-        starts = np.linspace(0, seg_wav.size - max_win, num=3, dtype=int)
+        max_win = int(3.2 * sample_rate)
+        starts = np.linspace(0, seg_wav.size - max_win, num=2, dtype=int)
         sub_vecs = []
         for st in starts:
             v = _embed_slice(seg_wav[st : st + max_win])
@@ -1136,6 +1250,8 @@ class Transcriber:
             return []
 
         diar_threads = max(1, min(int(threads), 8))
+        emb_workers = min(4, max(1, diar_threads // 2))
+        emb_intra_threads = max(1, diar_threads // emb_workers)
         mode = (speaker_count or "auto").strip().lower()
 
         # Pass 1: High-recall speaker-turn boundary detection via pyannote-segmentation-3.0.
@@ -1143,28 +1259,46 @@ class Transcriber:
         # real speakers into 50+ clusters on long interviews; therefore we use a tight
         # local threshold here ONLY to prevent cross-speaker turn merges, then extract clean
         # full-turn CAM++ voiceprints and cluster via Anchor-Centroid clustering.
-        config = sherpa_onnx.OfflineSpeakerDiarizationConfig(
-            segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-                pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
-                    model=seg_model_path
-                ),
-                num_threads=diar_threads,
-                provider="cpu",
-            ),
-            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=emb_model_path,
-                num_threads=diar_threads,
-                provider="cpu",
-            ),
-            clustering=sherpa_onnx.FastClusteringConfig(
-                num_clusters=-1,
-                threshold=DIARIZATION_SEGMENTATION_THRESHOLD,
-            ),
-            min_duration_on=0.30,
-            min_duration_off=0.45,
+        diar_key = (
+            seg_model_path,
+            emb_model_path,
+            diar_threads,
+            emb_intra_threads,
+            DIARIZATION_SEGMENTATION_THRESHOLD,
         )
 
-        sd = sherpa_onnx.OfflineSpeakerDiarization(config)
+        def _create_diar_engines():
+            cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+                segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+                    pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                        model=seg_model_path
+                    ),
+                    num_threads=diar_threads,
+                    provider="cpu",
+                ),
+                embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                    model=emb_model_path,
+                    num_threads=diar_threads,
+                    provider="cpu",
+                ),
+                clustering=sherpa_onnx.FastClusteringConfig(
+                    num_clusters=-1,
+                    threshold=DIARIZATION_SEGMENTATION_THRESHOLD,
+                ),
+                min_duration_on=0.30,
+                min_duration_off=0.45,
+            )
+            sd_inst = sherpa_onnx.OfflineSpeakerDiarization(cfg)
+            ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
+                sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                    model=emb_model_path,
+                    num_threads=emb_intra_threads,
+                    provider="cpu",
+                )
+            )
+            return sd_inst, ext_inst
+
+        sd, extractor = _DiarizationCache.get_or_create(diar_key, _create_diar_engines)
         last_pct = 0
         last_log_t = 0.0
 
@@ -1222,22 +1356,41 @@ class Transcriber:
         if status_cb and len(pre_merged) > 30:
             status_cb("Диаризация спикеров: 90% (сопоставление голосовых отпечатков)...")
 
-        extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
-            sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=emb_model_path,
-                num_threads=diar_threads,
-                provider="cpu",
-            )
-        )
-        embeddings: list[Optional[np.ndarray]] = []
-        for seg in pre_merged:
-            if cancel_token:
-                cancel_token.check()
-            embeddings.append(
-                cls._extract_segment_embedding(
+        if emb_workers <= 1 or len(pre_merged) < 8:
+            embeddings: list[Optional[np.ndarray]] = []
+            for seg in pre_merged:
+                if cancel_token:
+                    cancel_token.check()
+                embeddings.append(
+                    cls._extract_segment_embedding(
+                        extractor, samples, seg.start, seg.end, sample_rate=16000
+                    )
+                )
+        else:
+            embeddings = [None] * len(pre_merged)
+
+            def _embed_idx(idx_seg: tuple[int, DiarizationSegment]) -> tuple[int, Optional[np.ndarray]]:
+                i, seg = idx_seg
+                if cancel_token:
+                    cancel_token.check()
+                vec = cls._extract_segment_embedding(
                     extractor, samples, seg.start, seg.end, sample_rate=16000
                 )
-            )
+                return i, vec
+
+            emb_pool = ThreadPoolExecutor(max_workers=emb_workers)
+            try:
+                futs = [emb_pool.submit(_embed_idx, (i, seg)) for i, seg in enumerate(pre_merged)]
+                for fut in as_completed(futs):
+                    if cancel_token:
+                        cancel_token.check()
+                    idx_out, vec_out = fut.result()
+                    embeddings[idx_out] = vec_out
+            except BaseException:
+                emb_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                emb_pool.shutdown(wait=True)
 
         return cluster_anchor_embeddings(
             segments=pre_merged,
@@ -1261,8 +1414,28 @@ class Transcriber:
         if cancel_token:
             cancel_token.check()
 
-        cpu_threads = max(1, int(threads)) if device == "cpu" else 1
-        cache_key = ("faster_whisper", profile_id, model_dir, device, compute_type, cpu_threads)
+        if device == "cpu":
+            total_threads = max(1, int(threads))
+            max_workers_cap = 2 if profile_id == "turbo" else 3
+            if total_threads >= 8:
+                num_workers = min(max_workers_cap, total_threads // 4)
+                cpu_threads = max(1, total_threads // num_workers)
+            else:
+                num_workers = 1
+                cpu_threads = total_threads
+        else:
+            num_workers = 1
+            cpu_threads = 1
+
+        cache_key = (
+            "faster_whisper",
+            profile_id,
+            model_dir,
+            device,
+            compute_type,
+            cpu_threads,
+            num_workers,
+        )
 
         model: WhisperModel = _ModelCache.get_or_create(
             cache_key,
@@ -1271,7 +1444,7 @@ class Transcriber:
                 device=device,
                 compute_type=compute_type,
                 cpu_threads=cpu_threads,
-                num_workers=1,
+                num_workers=num_workers,
             ),
         )
 
@@ -1282,8 +1455,23 @@ class Transcriber:
         if total_dur <= 0.0:
             return []
 
+        ordered_diar: Optional[list[DiarizationSegment]] = None
         if diar_segments:
-            windows = build_speaker_asr_windows(diar_segments, total_dur)
+            ordered_diar = sorted(
+                (s for s in diar_segments if s.end > s.start),
+                key=lambda s: (s.start, s.end),
+            )
+            windows = build_speaker_asr_windows(
+                ordered_diar,
+                total_dur,
+                max_same_speaker_sec=28.5 if device == "cpu" else 27.0,
+                merge_gap_sec=3.5 if device == "cpu" else 1.8,
+                split_speaker_turns=(device != "cpu"),
+            )
+            if windows:
+                windows = subdivide_long_asr_windows(
+                    windows, samples, sample_rate=sample_rate, max_window_sec=29.0
+                )
             used_diar_windows = bool(windows)
         else:
             windows = build_vad_asr_windows(samples, sample_rate=sample_rate)
@@ -1295,34 +1483,72 @@ class Transcriber:
             else:
                 return []
 
-        beam_size = 4 if device == "cuda" else 2
+        valid_windows: list[tuple[float, float, int, int]] = []
+        for w_start, w_end in windows:
+            s_idx = max(0, int(w_start * sample_rate))
+            e_idx = min(len(samples), int(w_end * sample_rate))
+            if e_idx - s_idx >= 800:
+                valid_windows.append((w_start, w_end, s_idx, e_idx))
+
+        if not valid_windows:
+            return []
+
+        beam_size = 4 if device == "cuda" else 1
+        temperatures = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) if device == "cuda" else (0.0, 0.4)
+        comp_ratio_thr = 2.2 if device == "cuda" else 2.4
         dev_tag = "GPU CUDA" if device == "cuda" else "CPU"
-        units: list[TimedUnit] = []
+
         last_pct = 0
         last_log_t = 0.0
+        prog_lock = threading.Lock()
 
-        for w_start, w_end in windows:
+        def _maybe_report_progress(progress_sec: float):
+            nonlocal last_pct, last_log_t
+            if not status_cb or total_dur <= 0:
+                return
+            pct = min(99, int((progress_sec / total_dur) * 100))
+            now = time.time()
+            with prog_lock:
+                if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
+                    last_pct = pct
+                    last_log_t = now
+                    msg = (
+                        f"Распознавание речи ({dev_tag}): {pct}% "
+                        f"({format_timestamp(progress_sec)} / {format_timestamp(total_dur)})..."
+                    )
+                else:
+                    msg = None
+            if msg:
+                status_cb(msg)
+
+        def _decode_single_window(win_item: tuple[float, float, int, int]) -> list[TimedUnit]:
+            w_start, w_end, s_idx, e_idx = win_item
             if cancel_token:
                 cancel_token.check()
 
-            s_idx = max(0, int(w_start * sample_rate))
-            e_idx = min(len(samples), int(w_end * sample_rate))
-            if e_idx - s_idx < 800:
-                continue
-
             win_dur = w_end - w_start
             use_vad = win_dur > 30.0
+            need_word_ts = (
+                True
+                if (device == "cuda" or not used_diar_windows)
+                else window_has_multiple_speakers(w_start, w_end, ordered_diar)
+            )
             transcribe_kwargs = dict(
-                language=None,
+                # Non-None default language + multilingual=True skips faster-whisper's
+                # discarded pre-encode detect_language() pass (saving a full 30s Encoder
+                # pass per window!) while generate_segments still runs model.detect_language()
+                # on encoder_output for every window across all 99 languages.
+                language="ru",
                 task="transcribe",
                 multilingual=True,
-                word_timestamps=True,
+                word_timestamps=need_word_ts,
                 vad_filter=use_vad,
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
-                compression_ratio_threshold=2.2,
+                compression_ratio_threshold=comp_ratio_thr,
                 log_prob_threshold=-1.0,
                 beam_size=beam_size,
+                temperature=temperatures,
             )
             if use_vad:
                 transcribe_kwargs["vad_parameters"] = dict(
@@ -1332,6 +1558,7 @@ class Transcriber:
 
             segments_iter, _ = model.transcribe(samples[s_idx:e_idx], **transcribe_kwargs)
 
+            win_units: list[TimedUnit] = []
             for seg in segments_iter:
                 if cancel_token:
                     cancel_token.check()
@@ -1355,7 +1582,7 @@ class Transcriber:
                 if seg.words:
                     for w in seg.words:
                         if w.word and w.word.strip() and not is_repetitive_noise_token(w.word):
-                            units.append(
+                            win_units.append(
                                 TimedUnit(
                                     start=w_start + float(w.start),
                                     end=min(w_end, w_start + float(w.end)),
@@ -1363,7 +1590,7 @@ class Transcriber:
                                 )
                             )
                 else:
-                    units.append(
+                    win_units.append(
                         TimedUnit(
                             start=abs_seg_start,
                             end=abs_seg_end,
@@ -1371,16 +1598,47 @@ class Transcriber:
                         )
                     )
 
-                if status_cb and total_dur > 0:
-                    pct = min(99, int((abs_seg_end / total_dur) * 100))
-                    now = time.time()
-                    if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
-                        last_pct = pct
-                        last_log_t = now
-                        status_cb(
-                            f"Распознавание речи ({dev_tag}): {pct}% ({format_timestamp(abs_seg_end)} / {format_timestamp(total_dur)})..."
-                        )
+                if num_workers <= 1:
+                    _maybe_report_progress(abs_seg_end)
 
+            return win_units
+
+        if num_workers <= 1 or len(valid_windows) <= 1:
+            units: list[TimedUnit] = []
+            for win_item in valid_windows:
+                units.extend(_decode_single_window(win_item))
+            return units
+
+        # Parallel multi-worker CTranslate2 CPU execution preserving deterministic window order
+        results_by_idx: list[Optional[list[TimedUnit]]] = [None] * len(valid_windows)
+        total_speech_span = sum(max(0.01, w_e - w_s) for w_s, w_e, _, _ in valid_windows)
+        done_speech_span = 0.0
+
+        asr_pool = ThreadPoolExecutor(max_workers=num_workers)
+        try:
+            future_to_idx = {
+                asr_pool.submit(_decode_single_window, win_item): idx
+                for idx, win_item in enumerate(valid_windows)
+            }
+            for fut in as_completed(future_to_idx):
+                if cancel_token:
+                    cancel_token.check()
+                w_idx = future_to_idx[fut]
+                results_by_idx[w_idx] = fut.result()
+                w_s, w_e, _, _ = valid_windows[w_idx]
+                done_speech_span += max(0.01, w_e - w_s)
+                est_pos = total_dur * min(1.0, done_speech_span / max(0.01, total_speech_span))
+                _maybe_report_progress(est_pos)
+        except BaseException:
+            asr_pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            asr_pool.shutdown(wait=True)
+
+        units = []
+        for win_units in results_by_idx:
+            if win_units:
+                units.extend(win_units)
         return units
 
     @classmethod
@@ -1488,43 +1746,64 @@ class Transcriber:
         if not chunks:
             return []
 
+        valid_chunks: list[tuple[float, float, int, int]] = []
+        for c_start, c_end in chunks:
+            s_idx = max(0, int(c_start * sample_rate))
+            e_idx = min(len(samples), int(c_end * sample_rate))
+            if e_idx - s_idx >= 800:
+                valid_chunks.append((c_start, c_end, s_idx, e_idx))
+
+        if not valid_chunks:
+            return []
+
         units: list[TimedUnit] = []
-        total_chunks = len(chunks)
+        total_chunks = len(valid_chunks)
+        batch_size = 4
         last_pct = -20
         last_log_t = time.time()
 
-        for idx, (c_start, c_end) in enumerate(chunks, start=1):
+        for b_start in range(0, total_chunks, batch_size):
             if cancel_token:
                 cancel_token.check()
 
-            s_idx = max(0, int(c_start * sample_rate))
-            e_idx = min(len(samples), int(c_end * sample_rate))
-            if e_idx - s_idx < 800:
-                continue
+            batch = valid_chunks[b_start : b_start + batch_size]
+            streams = []
+            for _, _, s_idx, e_idx in batch:
+                stream = recognizer.create_stream()
+                stream.accept_waveform(sample_rate, samples[s_idx:e_idx])
+                streams.append(stream)
 
-            stream = recognizer.create_stream()
-            stream.accept_waveform(sample_rate, samples[s_idx:e_idx])
-            recognizer.decode_stream(stream)
-            res = stream.result
+            if hasattr(recognizer, "decode_streams") and len(streams) > 1:
+                recognizer.decode_streams(streams)
+            else:
+                for stream in streams:
+                    recognizer.decode_stream(stream)
 
-            if res.tokens and res.timestamps and len(res.tokens) == len(res.timestamps):
-                units.extend(
-                    group_bpe_tokens_to_units(
-                        list(res.tokens), list(res.timestamps), c_start, c_end
+            if cancel_token:
+                cancel_token.check()
+
+            for (c_start, c_end, _, _), stream in zip(batch, streams):
+                res = stream.result
+                if res.tokens and res.timestamps and len(res.tokens) == len(res.timestamps):
+                    units.extend(
+                        group_bpe_tokens_to_units(
+                            list(res.tokens), list(res.timestamps), c_start, c_end
+                        )
                     )
-                )
-            elif res.text and res.text.strip():
-                units.append(TimedUnit(start=c_start, end=c_end, text=res.text.strip()))
+                elif res.text and res.text.strip():
+                    units.append(TimedUnit(start=c_start, end=c_end, text=res.text.strip()))
 
+            done_idx = b_start + len(batch)
             if status_cb and total_chunks > 0:
-                pct = min(99, int((idx * 100) / total_chunks))
+                pct = min(99, int((done_idx * 100) / total_chunks))
                 now = time.time()
                 if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
                     last_pct = pct
                     last_log_t = now
-                    status_cb(f"Распознавание речи (Parakeet): {pct}% ({idx}/{total_chunks})...")
+                    status_cb(f"Распознавание речи (Parakeet): {pct}% ({done_idx}/{total_chunks})...")
 
         return units
+
 
     @classmethod
     def transcribe_units_only(

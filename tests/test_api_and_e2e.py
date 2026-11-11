@@ -120,7 +120,8 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.2.0"
+    assert data["version"] == "4.3.0"
+
     assert data["transcription_default"] is True
     assert data["default_asr_model"] == "turbo"
     assert data["default_compute_device"] == "cpu"
@@ -603,3 +604,79 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
                 out_file = os.path.join("output", f"{tid}{suffix}")
                 if os.path.exists(out_file):
                     os.remove(out_file)
+
+
+def test_planar_yuv420p_video_processor_and_single_pass_concat_mux(tmp_path):
+    import ffmpeg
+    import numpy as np
+    from src.audio_processor import AudioProcessor
+    from src.video_processor import VideoProcessor
+
+    # 1. Verify planar YUV420p in-place mosaic blur modifies ROI and preserves outside pixels
+    vp = VideoProcessor()
+    w, h = 160, 120
+    vp._init_detector(w, h)
+    rng = np.random.RandomState(7)
+    yuv_frame = rng.randint(16, 235, size=(w * h * 3) // 2, dtype=np.uint8)
+    before = yuv_frame.copy()
+    vp._apply_blur(yuv_frame, 50, 30, 40, 40, w, h)
+    assert not np.array_equal(yuv_frame, before)
+    # Top-left corner outside padded ROI remains untouched
+    assert np.array_equal(yuv_frame[:w * 5], before[:w * 5])
+
+    # 2. Verify VideoProcessor.process handles odd input dimensions (e.g. 321x241 -> 320x240 yuv420p)
+    #    and single-pass AudioProcessor (.m4a) + FFmpegUtils.concat_and_mux produces valid H.264 + AAC MP4
+    odd_in = str(tmp_path / "odd_in.mp4")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=322x242:rate=15:duration=1.2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=1.2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            odd_in,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    chunk_out = str(tmp_path / "chunk_out.mp4")
+    # Pass odd orig_width/orig_height (321x241) to verify automatic even rounding (320x240)
+    ok_vp = vp.process(odd_in, chunk_out, fps="15/1", orig_width=321, orig_height=241, enc_threads=2)
+    assert ok_vp is True
+    assert os.path.isfile(chunk_out)
+
+    pitched_m4a = str(tmp_path / "audio_pitched.m4a")
+    ok_aud = AudioProcessor.process(odd_in, pitched_m4a, sample_rate=44100)
+    assert ok_aud is True
+    assert os.path.isfile(pitched_m4a)
+
+    concat_txt = str(tmp_path / "concat_list.txt")
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        f.write(f"file '{chunk_out}'\n")
+
+    final_mp4 = str(tmp_path / "final_muxed.mp4")
+    FFmpegUtils.concat_and_mux(concat_txt, pitched_m4a, final_mp4)
+    assert os.path.isfile(final_mp4)
+
+    probe = ffmpeg.probe(final_mp4)
+    streams = {s["codec_type"]: s for s in probe["streams"]}
+    assert streams["video"]["codec_name"] == "h264"
+    assert streams["video"]["pix_fmt"] == "yuv420p"
+    assert int(streams["video"]["width"]) == 320
+    assert int(streams["video"]["height"]) == 240
+    assert streams["audio"]["codec_name"] == "aac"

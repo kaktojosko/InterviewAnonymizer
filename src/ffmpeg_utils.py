@@ -91,34 +91,67 @@ class FFmpegUtils:
         audio_path: str | None,
         output_path: str,
         cancel_token: CancellationToken | None = None,
+        video_is_h264: bool = False,
     ):
-        is_h264 = False
-        try:
-            probe = ffmpeg.probe(video_path)
-            video_stream = next((s for s in probe.get('streams', []) if s['codec_type'] == 'video'), None)
-            if video_stream and video_stream.get('codec_name') == 'h264':
-                is_h264 = True
-        except Exception:
-            pass
+        is_h264 = video_is_h264
+        if not is_h264:
+            try:
+                probe = ffmpeg.probe(video_path)
+                video_stream = next((s for s in probe.get('streams', []) if s['codec_type'] == 'video'), None)
+                if video_stream and video_stream.get('codec_name') == 'h264':
+                    is_h264 = True
+            except Exception:
+                pass
 
         v = ffmpeg.input(video_path)
-        
+
         if is_h264:
             video_args = {
-                'c:v': 'copy'
+                'c:v': 'copy',
+                'movflags': '+faststart',
             }
         else:
             video_args = {
                 'c:v': 'libx264',
                 'preset': OUTPUT_VIDEO_PRESET,
-                'crf': str(OUTPUT_VIDEO_CRF)
+                'crf': str(OUTPUT_VIDEO_CRF),
+                'movflags': '+faststart',
             }
-        
+
         if audio_path and os.path.exists(audio_path):
             a = ffmpeg.input(audio_path)
-            spec = ffmpeg.output(v, a, output_path, **video_args, acodec='aac', audio_bitrate='128k')
+            if audio_path.lower().endswith(('.m4a', '.aac')):
+                audio_args = {'acodec': 'copy'}
+            else:
+                audio_args = {'acodec': 'aac', 'audio_bitrate': '128k'}
+            spec = ffmpeg.output(v.video, a.audio, output_path, **video_args, **audio_args)
         else:
-            spec = ffmpeg.output(v, output_path, **video_args)
+            spec = ffmpeg.output(v.video, output_path, **video_args)
+        FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
+
+    @staticmethod
+    def concat_and_mux(
+        input_list_path: str,
+        audio_path: str | None,
+        output_path: str,
+        cancel_token: CancellationToken | None = None,
+    ):
+        """
+        Concatenates H.264 video chunks and muxes audio in a single stream-copy
+        pass, avoiding intermediate multi-GB disk writes and sequential AAC encoding.
+        """
+        v = ffmpeg.input(input_list_path, format='concat', safe=0)
+        common_args = {'c:v': 'copy', 'movflags': '+faststart'}
+
+        if audio_path and os.path.exists(audio_path):
+            a = ffmpeg.input(audio_path)
+            if audio_path.lower().endswith(('.m4a', '.aac')):
+                audio_args = {'c:a': 'copy'}
+            else:
+                audio_args = {'c:a': 'aac', 'audio_bitrate': '128k'}
+            spec = ffmpeg.output(v.video, a.audio, output_path, **common_args, **audio_args)
+        else:
+            spec = ffmpeg.output(v.video, output_path, **common_args)
         FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
 
     @staticmethod
@@ -136,7 +169,7 @@ class FFmpegUtils:
             .output(output_pattern, map='0:v:0', c='copy', an=None, f='segment', segment_time=chunk_time, reset_timestamps=1)
         )
         FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
-        
+
     @staticmethod
     def concat_videos(
         input_list_path: str,
@@ -151,6 +184,7 @@ class FFmpegUtils:
             .output(output_path, c='copy')
         )
         FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
+
 
     @staticmethod
     def extract_transcription_audio(

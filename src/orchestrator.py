@@ -17,6 +17,7 @@ from src.video_processor import VideoProcessor
 from src.config import (
     ASR_MODEL_PROFILES,
     CHUNK_DURATION_SECONDS,
+    CPU_COUNT,
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
     MAX_ALLOWED_WORKERS,
@@ -43,6 +44,7 @@ def process_chunk(
     fps_str: str,
     width: int,
     height: int,
+    enc_threads: int = 2,
     log_queue=None,
     cancel_event=None,
 ) -> tuple[bool, float]:
@@ -62,6 +64,7 @@ def process_chunk(
         fps=fps_str,
         orig_width=width,
         orig_height=height,
+        enc_threads=enc_threads,
         cancel_event=ev,
     )
     return success, time.time() - start_time
@@ -100,7 +103,9 @@ class Orchestrator:
         workers = max(1, worker_count or MAX_WORKERS)
         requested_device = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
 
-        audio_pitched_path = os.path.join(job_dir, "audio_pitched.wav")
+        # Pre-encode pitch-shifted audio directly to AAC (.m4a) in the background
+        # during video blurring so final muxing is an instant stream copy!
+        audio_pitched_path = os.path.join(job_dir, "audio_pitched.m4a")
         audio_16k_path = os.path.join(job_dir, "audio_16k.wav")
         if transcribe and not transcript_path:
             stem, _ = os.path.splitext(output_path)
@@ -193,28 +198,35 @@ class Orchestrator:
                         )
 
             input_chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
+            list_file_path = None
+            video_blurred_path = None
 
             if not input_chunks:
-                # Fallback
+                # Fallback for clips where segmenter produced 0 chunks
                 update("Распознавание лиц и блюр (Быстрый режим для короткого видео)...")
                 video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
                 vp = VideoProcessor()
                 fallback_ev = threading.Event()
                 if cancel_token is not None:
                     cancel_token.register_cancel_callback(fallback_ev.set)
-                vp.process(
+                enc_threads = max(1, min(4, CPU_COUNT))
+                ok = vp.process(
                     input_path,
                     video_blurred_path,
                     fps=fps_str,
                     orig_width=width,
                     orig_height=height,
+                    enc_threads=enc_threads,
                     cancel_event=fallback_ev,
                 )
                 if cancel_token is not None:
                     cancel_token.check()
+                if not ok:
+                    raise RuntimeError("Ошибка обработки видео")
             else:
                 # 3. Process chunks in parallel via 'spawn' (avoids Linux fork() deadlocks with CUDA / ONNX Runtime)
                 active_workers = max(1, min(workers, len(input_chunks)))
+                enc_threads = max(1, min(4, CPU_COUNT // active_workers))
                 update(f"Распознавание лиц и блюр (Потоков: {active_workers})...")
                 t0 = time.time()
                 processed_chunks_dir = os.path.join(job_dir, "processed_chunks")
@@ -258,7 +270,9 @@ class Orchestrator:
                         if cancel_token is not None:
                             cancel_token.check()
                         out_chunk = os.path.join(processed_chunks_dir, f"out_{idx:04d}.mp4")
-                        f = executor.submit(process_chunk, chunk, out_chunk, fps_str, width, height)
+                        f = executor.submit(
+                            process_chunk, chunk, out_chunk, fps_str, width, height, enc_threads
+                        )
                         futures_map[f] = out_chunk
 
                     output_chunks = []
@@ -309,24 +323,13 @@ class Orchestrator:
 
                 update(f"[Profile] All chunks processed in {time.time() - t0:.2f}s")
 
-                # 4. Concat processed chunks
-                if cancel_token is not None:
-                    cancel_token.check()
-                update("Склейка обработанных кусков...")
-                t0 = time.time()
                 list_file_path = os.path.join(job_dir, "concat_list.txt")
                 with open(list_file_path, "w") as f:
                     for out_chunk in sorted(output_chunks):
                         safe_path = out_chunk.replace('\\', '/')
                         f.write(f"file '{safe_path}'\n")
 
-                video_blurred_path = os.path.join(job_dir, "video_blurred.mp4")
-                FFmpegUtils.concat_videos(
-                    list_file_path, video_blurred_path, cancel_token=cancel_token
-                )
-                update(f"[Profile] Concat chunks finished in {time.time() - t0:.2f}s")
-
-            # 5. Wait for Audio
+            # 4. Wait for background pitch-shifted AAC audio
             if cancel_token is not None:
                 cancel_token.check()
             final_audio_path = None
@@ -341,23 +344,43 @@ class Orchestrator:
             if transcribe_extract_future is not None:
                 raw_wav_ready = bool(transcribe_extract_future.result())
 
-            # 6. Mux final result
+            # 5. Single-pass stream-copy concat & mux of final MP4
             if cancel_token is not None:
                 cancel_token.check()
-            update("Сборка финального видео...")
-            t0 = time.time()
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            FFmpegUtils.mux(
-                video_blurred_path, final_audio_path, output_path, cancel_token=cancel_token
-            )
+            t0 = time.time()
+            if list_file_path is not None:
+                update("Склейка чанков и сборка финального видео...")
+                FFmpegUtils.concat_and_mux(
+                    list_file_path, final_audio_path, output_path, cancel_token=cancel_token
+                )
+            else:
+                update("Сборка финального видео...")
+                FFmpegUtils.mux(
+                    video_blurred_path,
+                    final_audio_path,
+                    output_path,
+                    cancel_token=cancel_token,
+                    video_is_h264=True,
+                )
             update(f"[Profile] Mux finished in {time.time() - t0:.2f}s")
 
-            # 7. Local Auto-Transcription with Speaker Diarization (if enabled)
+            # 6. Local Auto-Transcription with Speaker Diarization (if enabled)
             transcript_ready = False
             if transcribe and transcript_path:
                 if cancel_token is not None:
                     cancel_token.check()
                 from src.transcriber import Transcriber, format_transcript_txt
+
+                # Once video blurring is complete, all CPU cores are free: if the user left
+                # workers at the default >=4 (kept moderate to cap video-worker RAM), allow
+                # post-mux CPU ASR & diarization to utilize available cores while still
+                # respecting explicit low-CPU caps (1..3).
+                post_video_threads = (
+                    workers
+                    if workers < 4
+                    else max(workers, min(MAX_ALLOWED_WORKERS, max(4, CPU_COUNT - 2)))
+                )
 
                 gpu_asr_state = None
                 if parallel_gpu_future is not None:
@@ -379,7 +402,7 @@ class Orchestrator:
                         f.write(empty_txt)
                     transcript_ready = True
                 elif parallel_gpu_future is not None and gpu_asr_state is not None:
-                    diar_cpu_threads = min(8, max(workers, MAX_ALLOWED_WORKERS))
+                    diar_cpu_threads = min(8, max(post_video_threads, MAX_ALLOWED_WORKERS))
                     Transcriber.diarize_and_write_transcript(
                         asr_state=gpu_asr_state,
                         output_txt_path=transcript_path,
@@ -396,12 +419,13 @@ class Orchestrator:
                         output_txt_path=transcript_path,
                         asr_model=asr_model,
                         speaker_count=speaker_count,
-                        threads=workers,
+                        threads=post_video_threads,
                         compute_device=requested_device,
                         status_cb=update,
                         cancel_token=cancel_token,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
+
         finally:
             if cancel_token is not None and cancel_token.is_cancelled():
                 pending = [
