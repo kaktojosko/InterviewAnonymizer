@@ -262,7 +262,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.6.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v5.0.0)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -393,6 +393,25 @@ def test_clean_hallucinated_text_strips_ringback_stutters_and_preserves_real_spe
         clean_hallucinated_text("Нет, в целом все понятненько, все хорошо. Okay.")
         == "Нет, в целом все понятненько, все хорошо. Okay."
     )
+
+    # Long real English & Russian monologues (>160-240 chars) naturally have unique/total <= 0.16
+    # because alphabets are finite (26/33 letters); they must NEVER be discarded.
+    long_en = (
+        "Good morning! For our backend architecture, we use PostgreSQL for storage, "
+        "Kafka for event streaming, and Redis for caching. Authentication relies on "
+        "OAuth with JSON Web Tokens."
+    )
+    assert clean_hallucinated_text(long_en) == long_en
+
+    long_ru = (
+        "Добрый день! В архитектуре нашего высоконагруженного сервиса мы используем "
+        "микросервисы, реляционную базу данных PostgreSQL, брокер сообщений Kafka и "
+        "распределённый кэш Redis. Авторизация пользователей работает через протокол "
+        "OAuth и токены JWT, а все контракты описаны в OpenAPI."
+    )
+    assert clean_hallucinated_text(long_ru) == long_ru
+    assert clean_hallucinated_text("ду ду ду ду ду ду ду ду ду") == ""
+
 
 
 def test_align_units_drops_noise_turn_without_consuming_speaker_one():
@@ -1593,6 +1612,837 @@ def test_transcribe_dual_track_files_separates_speaker_1_deterministically(tmp_p
     assert "Спикер 1: Мы используем gRPC и PostgreSQL." in lines[1]
     assert "Спикер 3: А как насчёт OAuth 2?" in lines[2]
     assert "Спикер 4: Спасибо, всё понятно." in lines[3]
+
+
+def test_run_onnx_asr_gpu_batching_overlap_dedup_and_cpu_fallback(monkeypatch):
+    from types import SimpleNamespace
+
+    sr = 16000
+    rng = np.random.RandomState(500)
+    samples_35 = rng.normal(0.0, 0.12, sr * 35).astype(np.float32)
+
+    monkeypatch.setattr(
+        tr_mod,
+        "get_speech_timestamps",
+        lambda audio, vad_options=None, sampling_rate=16000, **kw: [{"start": 0, "end": len(audio)}],
+    )
+
+    loaded_calls = []
+    batch_sizes_seen = []
+
+    class _FakeOnnxAsrModel:
+        def __init__(self, fail_once_on_cuda: bool = False):
+            self.fail_once_on_cuda = fail_once_on_cuda
+            self.calls = 0
+
+        def with_timestamps(self):
+            return self
+
+        def recognize(self, waveforms, sample_rate=16000):
+            if self.fail_once_on_cuda:
+                raise RuntimeError("CUDAExecutionProvider out of memory")
+            if isinstance(waveforms, list):
+                batch_sizes_seen.append(len(waveforms))
+                results = []
+                for idx, wav in enumerate(waveforms):
+                    dur = len(wav) / float(sample_rate)
+                    if idx == 0:
+                        # Chunk 0 (0..20s, keep_end=19.25s): emit interior token + overlap tail at 19.6s
+                        results.append(
+                            SimpleNamespace(
+                                text="Привет стык",
+                                tokens=["▁Привет", "▁стык"],
+                                timestamps=[5.0, 19.6],
+                                logprobs=[-0.1, -0.1],
+                            )
+                        )
+                    else:
+                        # Chunk 1 (18.5..35.0s, dur=16.5s): return empty to trigger bisection retry!
+                        results.append(SimpleNamespace(text="", tokens=[], timestamps=[], logprobs=[]))
+                return results
+            # Single-chunk bisection calls
+            self.calls += 1
+            if self.calls == 1:
+                # Left half (18.5..26.75s): token before keep_start (18.7s -> dropped) + boundary word at 19.6s (rel=1.1s)
+                return SimpleNamespace(
+                    text="дубль стык второй",
+                    tokens=["▁дубль", "▁стык", "▁второй"],
+                    timestamps=[0.2, 1.1, 4.0],
+                    logprobs=[-0.1, -0.1, -0.1],
+                )
+            return SimpleNamespace(
+                text="финал",
+                tokens=["▁финал"],
+                timestamps=[2.5],
+                logprobs=[-0.1],
+            )
+
+    def _fake_load_model(model_name, path=None, quantization=None, sess_options=None, providers=None):
+        loaded_calls.append(
+            {
+                "model_name": model_name,
+                "path": path,
+                "quantization": quantization,
+                "providers": list(providers or []),
+            }
+        )
+        is_cuda = "CUDAExecutionProvider" in (providers or [])
+        return _FakeOnnxAsrModel(fail_once_on_cuda=is_cuda)
+
+    fake_onnx_asr_mod = SimpleNamespace(load_model=_fake_load_model)
+    monkeypatch.setattr(tr_mod, "onnx_asr", fake_onnx_asr_mod)
+    monkeypatch.setattr(
+        tr_mod,
+        "resolve_onnx_provider",
+        lambda req, status_cb=None: (
+            ("cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"])
+            if req == "cuda"
+            else ("cpu", ["CPUExecutionProvider"])
+        ),
+    )
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    logs = []
+    # Request CUDA -> simulated CUDA error -> MUST transparently fall back to CPU and complete!
+    units = Transcriber._run_onnx_asr(
+        samples=samples_35,
+        sample_rate=sr,
+        model_dir="/tmp/fake_gigaam_fp32",
+        profile_id="gigaam-v3",
+        diar_segments=[DiarizationSegment(0.0, 35.0, speaker=0)],
+        threads=4,
+        compute_device="cuda",
+        status_cb=logs.append,
+    )
+
+    assert len(loaded_calls) == 2
+    assert loaded_calls[0]["model_name"] == "gigaam-v3-e2e-rnnt"
+    assert loaded_calls[0]["quantization"] is None
+    assert loaded_calls[0]["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert loaded_calls[1]["providers"] == ["CPUExecutionProvider"]
+    assert any("переключение" in m and "на CPU" in m for m in logs)
+    assert batch_sizes_seen == [2]
+    assert [u.text.strip() for u in units] == ["Привет", "стык", "второй", "финал"]
+
+
+def test_denoise_speech_gtcrn_preserves_sample_length_and_falls_back_safely(monkeypatch):
+    from types import SimpleNamespace
+
+    sr = 16000
+    # 32.3 seconds -> 3 GTCRN blocks (15s + 15s + 2.3s)
+    orig = np.linspace(-0.3, 0.3, int(sr * 32.3), dtype=np.float32)
+
+    monkeypatch.setattr(
+        ModelManager,
+        "ensure_denoiser_model",
+        classmethod(lambda cls, status_cb=None: "/tmp/fake_gtcrn_simple.onnx"),
+    )
+
+    block_lengths = []
+
+    class _FakeDenoiser:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def __call__(self, samples_list, sample_rate):
+            block_lengths.append(len(samples_list))
+            # Slightly attenuate signal to prove denoiser ran and slightly vary length to verify exact trimming/padding
+            arr = np.asarray(samples_list, dtype=np.float32) * 0.5
+            return SimpleNamespace(samples=arr.tolist(), sample_rate=sample_rate)
+
+    monkeypatch.setattr(tr_mod.sherpa_onnx, "OfflineSpeechDenoiser", _FakeDenoiser)
+    tr_mod._ModelCache.denoiser_key = None
+    tr_mod._ModelCache.denoiser_engine = None
+
+    logs = []
+    out = Transcriber._denoise_speech(orig, sample_rate=sr, threads=2, status_cb=logs.append)
+    assert out.shape == orig.shape
+    assert out.dtype == np.float32
+    assert len(block_lengths) == 3
+    assert np.allclose(out, orig * 0.5, atol=1e-5)
+    assert any("GTCRN" in m for m in logs)
+
+    # Error resilience: if denoiser fails at runtime, MUST return original samples untouched!
+    class _BrokenDenoiser:
+        def __init__(self, cfg):
+            pass
+
+        def __call__(self, samples_list, sample_rate):
+            raise RuntimeError("simulated GTCRN failure")
+
+    monkeypatch.setattr(tr_mod.sherpa_onnx, "OfflineSpeechDenoiser", _BrokenDenoiser)
+    tr_mod._ModelCache.denoiser_key = None
+    tr_mod._ModelCache.denoiser_engine = None
+
+    err_logs = []
+    fallback = Transcriber._denoise_speech(orig[:sr], sample_rate=sr, threads=2, status_cb=err_logs.append)
+    assert np.array_equal(fallback, orig[:sr])
+    assert any("исходный звук" in m for m in err_logs)
+
+
+def test_llm_postprocessor_restores_terms_preserves_timestamps_and_guards_corruption(tmp_path, monkeypatch):
+    import json
+    import httpx
+    import src.llm_postprocessor as llm_mod
+    from src.llm_postprocessor import polish_turns_with_local_llm
+
+    turns = [
+        SpeakerTurn(1.0, 5.5, "Спикер 1", "Мы перевели сервис с реста на GPC и настроили ауф 2."),
+        SpeakerTurn(6.0, 11.2, "Спикер 2", "А постгрес и камунда у вас в кубере крутятся?"),
+    ]
+
+    # Case 1: Valid Qwen3-style response with <think> block and ```json fence -> terms restored, timestamps intact
+    class _FakeResp:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    def _make_fake_client(reply_contents: list[str]):
+        idx = {"i": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, headers=None, json=None):
+                content = reply_contents[min(idx["i"], len(reply_contents) - 1)]
+                idx["i"] += 1
+                return _FakeResp({"choices": [{"message": {"content": content}}]})
+
+        return _FakeClient
+
+    qwen_content = (
+        "<think>Исправляю IT-термины по словарю: GPC -> gRPC, ауф 2 -> OAuth 2.</think>\n"
+        "```json\n"
+        + json.dumps(
+            {
+                "turns": [
+                    {"id": 0, "text": "Мы перевели сервис с REST на gRPC и настроили OAuth 2."},
+                    {"id": 1, "text": "А PostgreSQL и Camunda у вас в Kubernetes крутятся?"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+        + "\n```"
+    )
+    monkeypatch.setattr(llm_mod.httpx, "Client", _make_fake_client([qwen_content]))
+
+    out_txt = str(tmp_path / "interview_transcript.txt")
+    fin = Transcriber._finalize_and_write_transcript(
+        turns=turns,
+        duration_sec=12.0,
+        model_name="GigaAM v3 E2E RNN-T (FP32)",
+        num_speakers=2,
+        output_txt_path=out_txt,
+        custom_prompt="REST, gRPC, OAuth 2, PostgreSQL, Camunda, Kubernetes",
+        llm_polish=True,
+        llm_base_url="http://localhost:11434/v1",
+        llm_model="qwen3:8b",
+    )
+    assert fin["llm_applied"] is True
+    assert fin["raw_transcript_path"] is not None
+    assert os.path.isfile(fin["raw_transcript_path"])
+    # Timestamps and speaker labels are 100% preserved
+    assert fin["turns"][0].start == 1.0 and fin["turns"][0].end == 5.5 and fin["turns"][0].speaker_label == "Спикер 1"
+    assert fin["turns"][1].start == 6.0 and fin["turns"][1].end == 11.2 and fin["turns"][1].speaker_label == "Спикер 2"
+    assert "gRPC" in fin["turns"][0].text and "OAuth 2" in fin["turns"][0].text
+    assert "PostgreSQL" in fin["turns"][1].text and "Kubernetes" in fin["turns"][1].text
+
+    final_txt = open(out_txt, encoding="utf-8").read()
+    raw_txt = open(fin["raw_transcript_path"], encoding="utf-8").read()
+    assert "LLM-корректура (qwen3:8b" in final_txt
+    assert "gRPC" in final_txt
+    assert "LLM-корректура" not in raw_txt
+
+    # Case 2: Corrupted LLM output (meta-leak + wrong length) -> guardrail rejects batch & preserves raw ASR!
+    corrupted = json.dumps(
+        {
+            "turns": [
+                {"id": 0, "text": "Вот исправленный текст: Мы перевели сервис."},
+                {"id": 1, "text": "Ок."},
+            ]
+        },
+        ensure_ascii=False,
+    )
+    monkeypatch.setattr(llm_mod.httpx, "Client", _make_fake_client([corrupted]))
+    bad_logs = []
+    guarded_turns, stats_bad = polish_turns_with_local_llm(
+        turns=turns, base_url="http://localhost:11434/v1", model="qwen3:8b", status_cb=bad_logs.append
+    )
+    assert stats_bad["applied"] is False
+    assert stats_bad["batches_ok"] == 0
+    assert stats_bad["batches_total"] == 1
+    assert any("не прошёл валидацию" in m for m in bad_logs)
+    assert [t.text for t in guarded_turns] == [t.text for t in turns]
+
+    # Case 3: Local Ollama offline (ConnectError) -> safe immediate fallback without crashing!
+    class _OfflineClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            raise httpx.ConnectError("Connection refused")
+
+    monkeypatch.setattr(llm_mod.httpx, "Client", _OfflineClient)
+    offline_logs = []
+    safe_turns, stats_off = polish_turns_with_local_llm(
+        turns=turns,
+        base_url="http://localhost:11434/v1",
+        model="qwen3:8b",
+        status_cb=offline_logs.append,
+    )
+    assert stats_off["applied"] is False
+    assert stats_off["batches_ok"] == 0
+    assert [t.text for t in safe_turns] == [t.text for t in turns]
+    assert any("ошибка на батче" in m and "Connection refused" in m for m in offline_logs)
+
+
+def test_run_onnx_asr_canary_1b_v2_passes_language_and_non_overlapping_chunks(monkeypatch):
+    from types import SimpleNamespace
+
+    sr = 16000
+    samples_30 = np.ones(sr * 30, dtype=np.float32) * 0.05
+    loaded_calls = []
+    recognize_calls = []
+
+    class _FakeCanaryModel:
+        def with_timestamps(self):
+            raise AssertionError("Canary 1B v2 AED must NOT call with_timestamps() when has_word_timestamps=False")
+
+        def recognize(self, batch_wavs, sample_rate=16000, **kwargs):
+            is_batch = isinstance(batch_wavs, list)
+            n = len(batch_wavs) if is_batch else 1
+            recognize_calls.append({"batch_len": n, "kwargs": dict(kwargs)})
+            text = (
+                "Hello world. Second sentence!"
+                if kwargs.get("language") == "en"
+                else "Привет, меня зовут Анна. Давайте обсудим архитектуру!"
+            )
+            return [text for _ in range(n)] if is_batch else text
+
+    def _fake_load_model(model_name, path=None, quantization=None, sess_options=None, providers=None):
+        loaded_calls.append(
+            {
+                "model_name": model_name,
+                "path": path,
+                "quantization": quantization,
+                "providers": list(providers or []),
+            }
+        )
+        return _FakeCanaryModel()
+
+    monkeypatch.setattr(tr_mod, "onnx_asr", SimpleNamespace(load_model=_fake_load_model))
+    monkeypatch.setattr(
+        tr_mod,
+        "resolve_onnx_provider",
+        lambda req, status_cb=None: (
+            ("cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"])
+            if req == "cuda"
+            else ("cpu", ["CPUExecutionProvider"])
+        ),
+    )
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    diar = [
+        DiarizationSegment(0.5, 11.5, speaker=0),
+        DiarizationSegment(13.0, 26.0, speaker=1),
+    ]
+    # 1. language="auto" MUST map to "ru" (Canary 1B v2 has no <|auto|> token) and enable pnc=True
+    units_ru = Transcriber._run_onnx_asr(
+        samples=samples_30,
+        sample_rate=sr,
+        model_dir="/tmp/fake_canary_fp32",
+        profile_id="canary-1b-v2",
+        diar_segments=diar,
+        threads=4,
+        compute_device="cuda",
+        language="auto",
+    )
+    assert len(loaded_calls) == 1
+    assert loaded_calls[0]["model_name"] == "nemo-canary-1b-v2"
+    assert loaded_calls[0]["quantization"] is None
+    assert loaded_calls[0]["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    assert len(recognize_calls) == 1
+    assert recognize_calls[0]["batch_len"] == 2
+    assert recognize_calls[0]["kwargs"] == {"language": "ru", "target_language": "ru", "pnc": True}
+    # 2 chunks x 2 sentences proportionally split -> 4 TimedUnits in chronological order
+    assert len(units_ru) == 4
+    assert [u.text.strip() for u in units_ru[:2]] == ["Привет, меня зовут Анна.", "Давайте обсудим архитектуру!"]
+    assert all(units_ru[i].start < units_ru[i + 1].start for i in range(len(units_ru) - 1))
+
+    # 2. language="en" passes language="en", target_language="en", pnc=True
+    recognize_calls.clear()
+    units_en = Transcriber._run_onnx_asr(
+        samples=samples_30,
+        sample_rate=sr,
+        model_dir="/tmp/fake_canary_fp32",
+        profile_id="canary-1b-v2",
+        diar_segments=[DiarizationSegment(1.0, 8.0, speaker=0)],
+        threads=4,
+        compute_device="cuda",
+        language="en",
+    )
+    assert recognize_calls[0]["kwargs"] == {"language": "en", "target_language": "en", "pnc": True}
+    assert [u.text.strip() for u in units_en] == ["Hello world.", "Second sentence!"]
+
+
+def test_llm_postprocessor_cloud_deepseek_qwen_auth_header_and_401_abort(monkeypatch):
+    import json
+    import httpx
+    import src.llm_postprocessor as llm_mod
+    from src.llm_postprocessor import polish_turns_with_local_llm
+
+    secret_key = "sk-cloud-secret-do-not-log-999"
+    turns = [
+        SpeakerTurn(0.5, 4.0, "Спикер 1", "Мы развернули кубер и переехали на GPC."),
+        SpeakerTurn(4.5, 9.0, "Спикер 2", "А постгрес с кафкой тоже подняли?"),
+    ]
+    seen_requests = []
+
+    class _FakeOkResp:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._payload
+
+    class _CloudClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            seen_requests.append({"url": url, "headers": dict(headers or {}), "model": (json or {}).get("model")})
+            return _FakeOkResp(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"turns": ['
+                                    '{"id": 0, "text": "Мы развернули Kubernetes и переехали на gRPC."}, '
+                                    '{"id": 1, "text": "А PostgreSQL с Kafka тоже подняли?"}'
+                                    ']}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _CloudClient())
+
+    # 1. DeepSeek Cloud API
+    ds_logs = []
+    out_ds, stats_ds = polish_turns_with_local_llm(
+        turns=turns,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        api_key=secret_key,
+        custom_prompt="Kubernetes, gRPC, PostgreSQL, Kafka",
+        status_cb=ds_logs.append,
+    )
+    assert stats_ds["applied"] is True
+    assert stats_ds["is_cloud"] is True
+    assert seen_requests[-1]["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert seen_requests[-1]["headers"]["Authorization"] == f"Bearer {secret_key}"
+    assert seen_requests[-1]["model"] == "deepseek-chat"
+    assert "gRPC" in out_ds[0].text and "PostgreSQL" in out_ds[1].text
+    assert any("облачный API" in m for m in ds_logs)
+    assert all(secret_key not in m for m in ds_logs)
+
+    # 2. Qwen Cloud (DashScope OpenAI-compatible)
+    qw_logs = []
+    out_qw, stats_qw = polish_turns_with_local_llm(
+        turns=turns,
+        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        model="qwen-plus",
+        api_key=secret_key,
+        status_cb=qw_logs.append,
+    )
+    assert stats_qw["applied"] is True
+    assert stats_qw["is_cloud"] is True
+    assert seen_requests[-1]["url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+    assert seen_requests[-1]["headers"]["Authorization"] == f"Bearer {secret_key}"
+    assert seen_requests[-1]["model"] == "qwen-plus"
+    assert all(secret_key not in m for m in qw_logs)
+
+    # 3. HTTP 401 on multi-batch cloud call aborts immediately without hammering remaining batches or leaking key
+    many_turns = [
+        SpeakerTurn(float(i * 3), float(i * 3 + 2), "Спикер 1", f"Реплика номер {i} про GPC.")
+        for i in range(6)
+    ]
+    auth_attempts = {"count": 0}
+
+    class _AuthFailClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            auth_attempts["count"] += 1
+            req = httpx.Request("POST", url)
+            resp = httpx.Response(401, request=req)
+            raise httpx.HTTPStatusError("401 Unauthorized", request=req, response=resp)
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _AuthFailClient())
+    auth_logs = []
+    safe_turns, stats_401 = polish_turns_with_local_llm(
+        turns=many_turns,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        api_key=secret_key,
+        batch_size=2,
+        status_cb=auth_logs.append,
+    )
+    assert auth_attempts["count"] == 1  # Fast-aborted after batch 1 instead of 3 failed calls
+    assert stats_401["applied"] is False
+    assert stats_401["is_cloud"] is True
+    assert [t.text for t in safe_turns] == [t.text for t in many_turns]
+    assert any("401" in m and "API-ключ" in m for m in auth_logs)
+    assert all(secret_key not in m for m in auth_logs)
+
+
+def test_canary_qwen_25b_speech_llm_engine_prefill_decode_and_repetition_guard(tmp_path, monkeypatch):
+    import json
+    import src.canary_qwen_asr as cq_mod
+    from src.canary_qwen_asr import CanaryQwenSpeechLlm, decode_gpt2_byte_bpe, detect_repetition_loop_trim
+
+    model_dir = tmp_path / "canary_qwen_25b"
+    model_dir.mkdir()
+    cfg = {
+        "model_type": "speech-llm",
+        "features_size": 128,
+        "preprocessor": "nemo128",
+        "hidden_size": 8,
+        "num_layers": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "eos_token_ids": [99],
+        "max_sequence_length": 64,
+        "prompt_prefix_ids": [1, 2],
+        "prompt_suffix_ids": [3],
+    }
+    vocab = {
+        "<|im_start|>": 1,
+        "Transcribe": 2,
+        "<|im_end|>": 3,
+        "Hello": 10,
+        ",": 11,
+        "Ġworld": 12,
+        "!": 13,
+        "ĠSecond": 14,
+        "ĠâĢĶ": 15,
+        "Ġsentence": 16,
+        ".": 17,
+        "Ġloop": 20,
+        "Ġrepeat": 21,
+        "<|endoftext|>": 99,
+    }
+    (model_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    (model_dir / "vocab.json").write_text(json.dumps(vocab), encoding="utf-8")
+    for fname in ("encoder_int8.onnx", "embed_tokens_int8.onnx", "decoder_int8.onnx"):
+        (model_dir / fname).write_bytes(b"fake_onnx")
+
+    # 1. Pure helper checks
+    id_to_tok = {idx: tok for tok, idx in vocab.items()}
+    assert decode_gpt2_byte_bpe([10, 11, 12, 13, 15, 99], id_to_tok, {99}) == "Hello, world! —"
+    assert detect_repetition_loop_trim([10, 20, 21, 20, 21, 20, 21]) == 3
+
+    # 2. Mock ONNX Runtime sessions with strict shape/mask/KV-cache contract verification
+    state = {
+        "mode": "normal",  # normal -> Hello, world! Second — sentence. | loop -> 20, 21 forever
+        "decode_step": 0,
+        "prefill_checks": [],
+        "decoder_calls": 0,
+    }
+    normal_seq = [10, 11, 12, 13, 14, 15, 16, 17, 99]
+    loop_seq = [10, 20, 21, 20, 21, 20, 21, 20, 21, 20, 21]
+
+    class _FakeEncoderSess:
+        def run(self, out_names, feed):
+            feats = feed["input_features"]
+            flens = feed["input_features_lens"]
+            assert feats.ndim == 3 and feats.shape[0] == 1 and feats.shape[1] == 128
+            assert int(flens[0]) <= feats.shape[2]
+            # Return 5 padded frames with valid length 3 -> runner must trim to 3!
+            return [np.ones((1, 5, 8), dtype=np.float32), np.array([3], dtype=np.int64)]
+
+    class _FakeEmbedSess:
+        def run(self, out_names, feed):
+            ids = feed["input_ids"]
+            assert ids.ndim == 2 and ids.shape[0] == 1 and ids.dtype == np.int64
+            return [np.zeros((1, ids.shape[1], 8), dtype=np.float32)]
+
+    class _FakeDecoderSess:
+        def run(self, out_names, feed):
+            state["decoder_calls"] += 1
+            embeds = feed["inputs_embeds"]
+            attn_bias = feed["attn_bias"]
+            pos_ids = feed["position_ids"]
+            p0_k = feed["past_key_values.0.key"]
+            past_len = int(p0_k.shape[2])
+            seq_len = int(embeds.shape[1])
+            total_len = past_len + seq_len
+
+            assert attn_bias.shape == (1, 1, seq_len, total_len)
+            assert pos_ids.shape == (1, seq_len)
+
+            if past_len == 0:
+                # Prefill: 2 prefix + 3 trimmed audio + 1 suffix = 6 tokens
+                assert seq_len == 6
+                # Strict causal upper triangle mask check
+                assert float(attn_bias[0, 0, 0, 0]) == 0.0
+                assert float(attn_bias[0, 0, 0, 1]) < -1e8
+                assert float(attn_bias[0, 0, 5, 5]) == 0.0
+                state["prefill_checks"].append(seq_len)
+                state["decode_step"] = 0
+            else:
+                assert seq_len == 1
+                assert int(pos_ids[0, 0]) == past_len
+                assert np.all(attn_bias == 0.0)
+
+            seq_src = normal_seq if state["mode"] == "normal" else loop_seq
+            tok = seq_src[min(state["decode_step"], len(seq_src) - 1)]
+            state["decode_step"] += 1
+
+            logits = np.full((1, seq_len, 128), -10.0, dtype=np.float32)
+            logits[0, -1, tok] = 10.0
+            presents = [
+                np.zeros((1, 2, total_len, 4), dtype=np.float32)
+                for _ in range(cfg["num_layers"] * 2)
+            ]
+            return [logits, *presents]
+
+    def _fake_ort_session(path, sess_options=None, providers=None):
+        assert providers == ["CPUExecutionProvider"]
+        name = os.path.basename(path)
+        if name.startswith("encoder"):
+            return _FakeEncoderSess()
+        if name.startswith("embed_tokens"):
+            return _FakeEmbedSess()
+        if name.startswith("decoder"):
+            return _FakeDecoderSess()
+        raise AssertionError(f"Unexpected ONNX artifact: {name}")
+
+    monkeypatch.setattr(cq_mod.ort, "InferenceSession", _fake_ort_session)
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    # Part A: End-to-end Transcriber._run_onnx_canary_qwen with Russian language warning + proportional sentence split
+    sr = 16000
+    samples = np.ones(sr * 10, dtype=np.float32) * 0.05
+    logs = []
+    units = Transcriber._run_onnx_canary_qwen(
+        samples=samples,
+        sample_rate=sr,
+        model_dir=str(model_dir),
+        profile_id="canary-qwen-2.5b",
+        diar_segments=[DiarizationSegment(1.0, 6.0, speaker=0)],
+        threads=4,
+        status_cb=logs.append,
+        language="ru",
+    )
+    assert state["prefill_checks"] == [6]
+    assert [u.text.strip() for u in units] == ["Hello, world!", "Second — sentence."]
+    assert units[0].start < units[1].start
+    assert any("только на английском" in m for m in logs)
+
+    # Part B: Repetition-loop guard truncates degenerate loop cleanly without hitting max_sequence_length
+    state["mode"] = "loop"
+    state["decoder_calls"] = 0
+    engine = CanaryQwenSpeechLlm(model_dir=str(model_dir), threads=2)
+    loop_text = engine.recognize_chunk(samples[: sr * 3], sample_rate=sr)
+    assert loop_text == "Hello loop repeat"
+    assert state["decoder_calls"] <= 8
+
+
+def test_per_model_tuned_decoding_params_hotwords_ctc_batch_and_llm_json_fallback(monkeypatch):
+    from types import SimpleNamespace
+    import httpx
+    import src.llm_postprocessor as llm_mod
+    from src.canary_qwen_asr import CanaryQwenSpeechLlm
+    from src.config import ASR_MODEL_PROFILES
+    from src.llm_postprocessor import polish_turns_with_local_llm
+
+    # 1. Verify Breeze-ASR-25 & Large-v3-RU receive their model-specific decode_params + hotwords
+    seen_calls = []
+
+    class _FakeWhisperCapture:
+        def __init__(self, model_dir, **kwargs):
+            pass
+
+        def transcribe(self, audio_slice, **kwargs):
+            seen_calls.append(dict(kwargs))
+            seg = SimpleNamespace(
+                start=0.1,
+                end=1.5,
+                text=" Используем gRPC и OAuth 2.",
+                words=[SimpleNamespace(start=0.1, end=1.4, word=" Используем gRPC и OAuth 2.")],
+                no_speech_prob=0.05,
+                avg_logprob=-0.2,
+                compression_ratio=1.2,
+            )
+            return [seg], SimpleNamespace(language="ru")
+
+    monkeypatch.setattr(tr_mod, "WhisperModel", _FakeWhisperCapture)
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    sr = 16000
+    wav_4s = np.ones(sr * 4, dtype=np.float32) * 0.05
+    diar_1 = [DiarizationSegment(0.2, 3.5, speaker=0)]
+
+    Transcriber._decode_whisper_windows(
+        samples=wav_4s,
+        sample_rate=sr,
+        model_dir="/tmp/fake_breeze",
+        profile_id="breeze-asr-25",
+        device="cpu",
+        compute_type="int8",
+        diar_segments=diar_1,
+        threads=4,
+        status_cb=None,
+        language="ru",
+        custom_prompt="Собеседование системного аналитика: REST, gRPC, OAuth 2, JWT",
+    )
+    breeze_kw = seen_calls[-1]
+    assert breeze_kw["beam_size"] == 3
+    assert breeze_kw["best_of"] == 3
+    assert breeze_kw["patience"] == pytest.approx(1.2)
+    assert breeze_kw["repetition_penalty"] == pytest.approx(1.05)
+    assert breeze_kw["no_repeat_ngram_size"] == 4
+    assert breeze_kw["no_speech_threshold"] == pytest.approx(0.58)
+    assert breeze_kw["compression_ratio_threshold"] == pytest.approx(2.3)
+    assert breeze_kw["log_prob_threshold"] == pytest.approx(-0.95)
+    assert breeze_kw["hotwords"] == "REST, gRPC, OAuth 2, JWT"
+
+    Transcriber._decode_whisper_windows(
+        samples=wav_4s,
+        sample_rate=sr,
+        model_dir="/tmp/fake_v3ru",
+        profile_id="large-v3-ru",
+        device="cpu",
+        compute_type="int8",
+        diar_segments=diar_1,
+        threads=4,
+        status_cb=None,
+        language="ru",
+        custom_prompt="",
+    )
+    v3ru_kw = seen_calls[-1]
+    assert v3ru_kw["beam_size"] == 3
+    assert v3ru_kw["patience"] == pytest.approx(1.1)
+    assert v3ru_kw["repetition_penalty"] == pytest.approx(1.10)
+    assert v3ru_kw["compression_ratio_threshold"] == pytest.approx(2.2)
+    assert v3ru_kw["log_prob_threshold"] == pytest.approx(-0.90)
+    assert v3ru_kw["hallucination_silence_threshold"] == pytest.approx(1.2)
+    assert "hotwords" not in v3ru_kw
+
+    # 2. Verify ONNX profile tuning invariants (CTC higher batch, INT8 shorter chunk, Canary 26s)
+    assert ASR_MODEL_PROFILES["gigaam-v3-ctc"]["batch_size_cuda"] == 16
+    assert ASR_MODEL_PROFILES["gigaam-v3-ctc"]["batch_size_cpu"] == 6
+    assert ASR_MODEL_PROFILES["gigaam-v3"]["batch_size_cuda"] == 8
+    assert ASR_MODEL_PROFILES["gigaam-v3-int8"]["max_chunk_sec"] == 18.0
+    assert ASR_MODEL_PROFILES["canary-1b-v2"]["max_chunk_sec"] == 26.0
+    assert ASR_MODEL_PROFILES["parakeet"]["max_chunk_sec"] == 20.0
+
+    # 3. Verify Canary-Qwen sign-aware repetition penalty suppresses borderline repeated token
+    logits = np.array([1.00, 0.98, -2.0], dtype=np.float32)
+    # Without penalty token 0 wins; with 1.05 penalty on recent token 0 (1.00/1.05 = 0.952 < 0.98), token 1 wins!
+    assert CanaryQwenSpeechLlm._select_next_token(logits, [0], repetition_penalty=1.0) == 0
+    assert CanaryQwenSpeechLlm._select_next_token(logits, [0], repetition_penalty=1.05) == 1
+
+    # 4. Verify GTCRN denoiser is cached across back-to-back calls
+    init_count = {"n": 0}
+
+    class _CountingDenoiser:
+        def __init__(self, cfg):
+            init_count["n"] += 1
+
+        def __call__(self, blk, sr_in):
+            return SimpleNamespace(samples=blk, sample_rate=sr_in)
+
+    monkeypatch.setattr(tr_mod.sherpa_onnx, "OfflineSpeechDenoiser", _CountingDenoiser)
+    monkeypatch.setattr(
+        ModelManager,
+        "ensure_denoiser_model",
+        classmethod(lambda cls, status_cb=None: "/tmp/fake_gtcrn_cached.onnx"),
+    )
+    _ModelCache.denoiser_key = None
+    _ModelCache.denoiser_engine = None
+    Transcriber._denoise_speech(wav_4s, sample_rate=sr, threads=2)
+    Transcriber._denoise_speech(wav_4s, sample_rate=sr, threads=2)
+    assert init_count["n"] == 1
+
+    # 5. Verify LLM postprocessor sends temperature=0.05 + response_format json_object & retries on HTTP 400
+    llm_bodies = []
+
+    class _FallbackJsonClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            llm_bodies.append(dict(json or {}))
+            if "response_format" in (json or {}):
+                req = httpx.Request("POST", url)
+                raise httpx.HTTPStatusError("400 unsupported response_format", request=req, response=httpx.Response(400, request=req))
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "choices": [{"message": {"content": '{"turns": [{"id": 0, "text": "Мы используем gRPC."}]}'}}]
+                },
+            )
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _FallbackJsonClient())
+    out_turns, stats = polish_turns_with_local_llm(
+        turns=[SpeakerTurn(0.0, 2.0, "Спикер 1", "Мы используем GPC.")],
+        base_url="http://localhost:11434/v1",
+        model="qwen3:8b",
+    )
+    assert stats["applied"] is True
+    assert out_turns[0].text == "Мы используем gRPC."
+    assert len(llm_bodies) == 2
+    assert llm_bodies[0]["temperature"] == pytest.approx(0.05)
+    assert llm_bodies[0]["top_p"] == pytest.approx(0.9)
+    assert llm_bodies[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in llm_bodies[1]
+
+
+
+
 
 
 

@@ -2,7 +2,7 @@ import os
 import multiprocessing
 
 # Base paths
-APP_VERSION = "4.6.0"
+APP_VERSION = "5.0.0"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
 AUDIO_CACHE_DIR = os.path.join(TMP_BASE_DIR, "audio_cache")
@@ -11,13 +11,19 @@ MODELS_DIR = os.environ.get("MODELS_DIR", os.path.join(BASE_DIR, "models"))
 PRELOADED_MODELS_DIR = os.environ.get("PRELOADED_MODELS_DIR", "/opt/preloaded_models")
 
 # Video Processing Settings
-FACE_PADDING_PERCENT_X = 0.35
-FACE_PADDING_PERCENT_Y = 0.35
-YUNET_MIN_CONFIDENCE = 0.3
+FACE_PADDING_PERCENT_X = 0.40
+FACE_PADDING_PERCENT_Y = 0.40
+YUNET_MIN_CONFIDENCE = 0.25
+YUNET_TARGET_HEIGHT = 576
 
-# Detect faces every N frames. In between, use interpolation.
-# Higher = faster, but less accurate tracking for fast movements.
-DETECT_EVERY_N_FRAMES = 28
+# Base face detection cadence: detect every 18 frames (~0.6s at 30fps).
+# When window drags, layout switches, fast face motion, or face count changes occur
+# within a batch, VideoProcessor recursively bisects the buffer down to
+# ADAPTIVE_MIN_DETECT_STEP (2 frames) so faces stay 100% anonymized in motion.
+DETECT_EVERY_N_FRAMES = 18
+ADAPTIVE_MIN_DETECT_STEP = 2
+MOTION_DIFF_PIXEL_THRESHOLD = 18
+MOTION_CHANGED_RATIO_TRIGGER = 0.06
 
 # Cap the normalized output stream used by the processor.
 # 60 FPS doubles CPU work for little benefit on interview/webcam footage.
@@ -79,22 +85,149 @@ if DEFAULT_ASR_LANGUAGE not in ASR_LANGUAGE_OPTIONS:
 ASR_MODEL_PROFILES = {
     "gigaam-v3": {
         "id": "gigaam-v3",
-        "label": "GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)",
-        "short_name": "GigaAM v3 e2e RNN-T (RU, INT8)",
-        "engine": "sherpa_transducer",
-        "repo_id": "csukuangfj/sherpa-onnx-nemo-transducer-punct-giga-am-v3-russian-2025-12-16",
-        "encoder_file": "encoder.int8.onnx",
-        "decoder_file": "decoder.onnx",
-        "joiner_file": "joiner.onnx",
-        "tokens_file": "tokens.txt",
-        "feature_dim": 64,
+        "label": "GigaAM v3 FP32 — эталон для русского (RU, GPU/CPU, 892 МБ)",
+        "short_name": "GigaAM v3 E2E RNN-T (FP32)",
+        "engine": "onnx_asr",
+        "onnx_asr_model": "gigaam-v3-e2e-rnnt",
+        "quantization": None,
+        "repo_id": "istupakov/gigaam-v3-onnx",
         "max_chunk_sec": 20.0,
-        "overlap_sec": 1.5,
-        "required_files": ["encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
-        "allow_patterns": ["encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
-        "min_total_bytes": 180_000_000,
-        "supports_cuda": False,
+        "overlap_sec": 1.6,
+        "batch_size_cuda": 8,
+        "batch_size_cpu": 4,
+        "required_files": [
+            "config.json",
+            "v3_e2e_rnnt_encoder.onnx",
+            "v3_e2e_rnnt_decoder.onnx",
+            "v3_e2e_rnnt_joint.onnx",
+            "v3_e2e_rnnt_vocab.txt",
+        ],
+        "allow_patterns": [
+            "config.json",
+            "v3_e2e_rnnt.yaml",
+            "v3_e2e_rnnt_encoder.onnx",
+            "v3_e2e_rnnt_decoder.onnx",
+            "v3_e2e_rnnt_joint.onnx",
+            "v3_e2e_rnnt_vocab.txt",
+        ],
+        "min_total_bytes": 750_000_000,
+        "supports_cuda": True,
         "fixed_language": "ru",
+    },
+    "gigaam-v3-ctc": {
+        "id": "gigaam-v3-ctc",
+        "label": "GigaAM v3 CTC FP32 — турбо для русского (до 240× GPU, 886 МБ)",
+        "short_name": "GigaAM v3 E2E CTC (FP32)",
+        "engine": "onnx_asr",
+        "onnx_asr_model": "gigaam-v3-e2e-ctc",
+        "quantization": None,
+        "repo_id": "istupakov/gigaam-v3-onnx",
+        "max_chunk_sec": 20.0,
+        "overlap_sec": 1.6,
+        "batch_size_cuda": 16,
+        "batch_size_cpu": 6,
+        "required_files": [
+            "config.json",
+            "v3_e2e_ctc.onnx",
+            "v3_e2e_ctc_vocab.txt",
+        ],
+        "allow_patterns": [
+            "config.json",
+            "v3_e2e_ctc.yaml",
+            "v3_e2e_ctc.onnx",
+            "v3_e2e_ctc_vocab.txt",
+        ],
+        "min_total_bytes": 750_000_000,
+        "supports_cuda": True,
+        "fixed_language": "ru",
+    },
+    "breeze-asr-25": {
+        "id": "breeze-asr-25",
+        "label": "Breeze-ASR-25 — лучший для RU+EN IT-речи с латиницей (3.1 ГБ)",
+        "short_name": "MediaTek Breeze-ASR-25 (CT2)",
+        "engine": "faster_whisper",
+        "repo_id": "SoybeanMilk/faster-whisper-Breeze-ASR-25",
+        "decode_params": {
+            "beam_size_cpu": 3,
+            "beam_size_cuda": 5,
+            "patience": 1.2,
+            "repetition_penalty": 1.05,
+            "no_repeat_ngram_size": 4,
+            "no_speech_threshold": 0.58,
+            "compression_ratio_threshold": 2.3,
+            "log_prob_threshold": -0.95,
+            "hallucination_silence_threshold": 1.5,
+            "temperatures": (0.0, 0.2, 0.4),
+            "max_window_sec": 28.0,
+            "use_hotwords": True,
+        },
+        "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
+        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
+        "min_total_bytes": 2_500_000_000,
+        "supports_cuda": True,
+        "default_language": "ru",
+    },
+    "canary-1b-v2": {
+        "id": "canary-1b-v2",
+        "label": "Canary 1B v2 — 25 языков + пунктуация (NVIDIA, GPU/CPU, 3.9 ГБ)",
+        "short_name": "NVIDIA Canary 1B v2 (FP32)",
+        "engine": "onnx_asr",
+        "onnx_asr_model": "nemo-canary-1b-v2",
+        "quantization": None,
+        "repo_id": "istupakov/canary-1b-v2-onnx",
+        "max_chunk_sec": 26.0,
+        "overlap_sec": 0.0,
+        "batch_size_cuda": 4,
+        "batch_size_cpu": 1,
+        "has_word_timestamps": False,
+        "passes_language": True,
+        "required_files": [
+            "config.json",
+            "encoder-model.onnx",
+            "encoder-model.onnx.data",
+            "decoder-model.onnx",
+            "vocab.txt",
+        ],
+        "allow_patterns": [
+            "config.json",
+            "encoder-model.onnx",
+            "encoder-model.onnx.data",
+            "decoder-model.onnx",
+            "vocab.txt",
+        ],
+        "min_total_bytes": 3_500_000_000,
+        "supports_cuda": True,
+        "default_language": "ru",
+    },
+    "canary-qwen-2.5b": {
+        "id": "canary-qwen-2.5b",
+        "label": "Canary-Qwen 2.5B — топ-1 для English (EN ONLY, INT8 CPU, 2.9 ГБ)",
+        "short_name": "NVIDIA Canary-Qwen 2.5B (INT8, EN)",
+        "engine": "onnx_canary_qwen",
+        "repo_id": "OpenVoiceOS/canary-qwen-2.5b-onnx",
+        "max_chunk_sec": 28.0,
+        "overlap_sec": 0.0,
+        "has_word_timestamps": False,
+        "repetition_penalty": 1.05,
+        "edge_pad_sec": 0.12,
+        "required_files": [
+            "config.json",
+            "vocab.json",
+            "encoder_int8.onnx",
+            "embed_tokens_int8.onnx",
+            "decoder_int8.onnx",
+        ],
+        "allow_patterns": [
+            "config.json",
+            "vocab.json",
+            "encoder_int8.onnx",
+            "embed_tokens_int8.onnx",
+            "decoder_int8.onnx",
+        ],
+        "min_total_bytes": 2_500_000_000,
+        "supports_cuda": False,
+        "fixed_language": "en",
+        "default_language": "en",
     },
     "large-v3-ru": {
         "id": "large-v3-ru",
@@ -102,6 +235,20 @@ ASR_MODEL_PROFILES = {
         "short_name": "Whisper Large v3 Russian",
         "engine": "faster_whisper",
         "repo_id": "bzikst/faster-whisper-large-v3-russian",
+        "decode_params": {
+            "beam_size_cpu": 3,
+            "beam_size_cuda": 5,
+            "patience": 1.1,
+            "repetition_penalty": 1.10,
+            "no_repeat_ngram_size": 4,
+            "no_speech_threshold": 0.62,
+            "compression_ratio_threshold": 2.2,
+            "log_prob_threshold": -0.90,
+            "hallucination_silence_threshold": 1.2,
+            "temperatures": (0.0, 0.2, 0.4),
+            "max_window_sec": 28.0,
+            "use_hotwords": True,
+        },
         "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
         "min_total_bytes": 2_500_000_000,
@@ -114,6 +261,20 @@ ASR_MODEL_PROFILES = {
         "short_name": "Whisper Large v3 Turbo (INT8)",
         "engine": "faster_whisper",
         "repo_id": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+        "decode_params": {
+            "beam_size_cpu": 2,
+            "beam_size_cuda": 5,
+            "patience": 1.0,
+            "repetition_penalty": 1.08,
+            "no_repeat_ngram_size": 4,
+            "no_speech_threshold": 0.60,
+            "compression_ratio_threshold": 2.4,
+            "log_prob_threshold": -1.0,
+            "hallucination_silence_threshold": 1.5,
+            "temperatures": (0.0, 0.2, 0.4),
+            "max_window_sec": 28.5,
+            "use_hotwords": True,
+        },
         "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
         "min_total_bytes": 600_000_000,
@@ -125,10 +286,54 @@ ASR_MODEL_PROFILES = {
         "short_name": "Whisper Large v3",
         "engine": "faster_whisper",
         "repo_id": "Systran/faster-whisper-large-v3",
+        "decode_params": {
+            "beam_size_cpu": 3,
+            "beam_size_cuda": 5,
+            "patience": 1.1,
+            "repetition_penalty": 1.10,
+            "no_repeat_ngram_size": 4,
+            "no_speech_threshold": 0.62,
+            "compression_ratio_threshold": 2.2,
+            "log_prob_threshold": -0.90,
+            "hallucination_silence_threshold": 1.2,
+            "temperatures": (0.0, 0.2, 0.4),
+            "max_window_sec": 28.0,
+            "use_hotwords": True,
+        },
         "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
         "min_total_bytes": 2_500_000_000,
         "supports_cuda": True,
+    },
+    "gigaam-v3-int8": {
+        "id": "gigaam-v3-int8",
+        "label": "GigaAM v3 INT8 — лёгкая для русского на CPU (232 МБ)",
+        "short_name": "GigaAM v3 E2E RNN-T (INT8, CPU)",
+        "engine": "onnx_asr",
+        "onnx_asr_model": "gigaam-v3-e2e-rnnt",
+        "quantization": "int8",
+        "repo_id": "istupakov/gigaam-v3-onnx",
+        "max_chunk_sec": 18.0,
+        "overlap_sec": 1.6,
+        "batch_size_cpu": 4,
+        "required_files": [
+            "config.json",
+            "v3_e2e_rnnt_encoder.int8.onnx",
+            "v3_e2e_rnnt_decoder.int8.onnx",
+            "v3_e2e_rnnt_joint.int8.onnx",
+            "v3_e2e_rnnt_vocab.txt",
+        ],
+        "allow_patterns": [
+            "config.json",
+            "v3_e2e_rnnt.yaml",
+            "v3_e2e_rnnt_encoder.int8.onnx",
+            "v3_e2e_rnnt_decoder.int8.onnx",
+            "v3_e2e_rnnt_joint.int8.onnx",
+            "v3_e2e_rnnt_vocab.txt",
+        ],
+        "min_total_bytes": 180_000_000,
+        "supports_cuda": False,
+        "fixed_language": "ru",
     },
     "parakeet": {
         "id": "parakeet",
@@ -141,7 +346,9 @@ ASR_MODEL_PROFILES = {
         "joiner_file": "joiner.int8.onnx",
         "tokens_file": "tokens.txt",
         "feature_dim": 80,
-        "max_chunk_sec": 18.0,
+        "max_chunk_sec": 20.0,
+        "overlap_sec": 1.5,
+        "batch_size_cpu": 4,
         "required_files": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
         "allow_patterns": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
         "min_total_bytes": 400_000_000,
@@ -153,6 +360,20 @@ ASR_MODEL_PROFILES = {
         "short_name": "Whisper Small (INT8)",
         "engine": "faster_whisper",
         "repo_id": "Systran/faster-whisper-small",
+        "decode_params": {
+            "beam_size_cpu": 2,
+            "beam_size_cuda": 5,
+            "patience": 1.0,
+            "repetition_penalty": 1.06,
+            "no_repeat_ngram_size": 4,
+            "no_speech_threshold": 0.60,
+            "compression_ratio_threshold": 2.4,
+            "log_prob_threshold": -1.05,
+            "hallucination_silence_threshold": 1.5,
+            "temperatures": (0.0, 0.2, 0.4),
+            "max_window_sec": 28.5,
+            "use_hotwords": True,
+        },
         "required_files": ["model.bin", "config.json", "tokenizer.json"],
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
         "min_total_bytes": 180_000_000,
@@ -162,6 +383,59 @@ ASR_MODEL_PROFILES = {
 
 if DEFAULT_ASR_MODEL not in ASR_MODEL_PROFILES:
     DEFAULT_ASR_MODEL = "gigaam-v3"
+
+# Optional lightweight GTCRN neural speech denoiser (~535 KB ONNX via sherpa-onnx)
+DENOISER_MODEL = {
+    "filename": "gtcrn_simple.onnx",
+    "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx",
+    "min_bytes": 400_000,
+}
+DENOISE_ENABLED_DEFAULT = os.environ.get("DENOISE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# Optional Stage 4 OpenAI-compatible LLM transcript post-editing (local Ollama / LM Studio OR cloud DeepSeek / Qwen)
+_LOCAL_LLM_HOST = "host.docker.internal" if os.path.exists("/.dockerenv") else "localhost"
+LLM_POLISH_ENABLED_DEFAULT = os.environ.get("LLM_POLISH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+DEFAULT_LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL",
+    f"http://{_LOCAL_LLM_HOST}:11434/v1",
+).strip()
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:8b").strip()
+DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
+
+LLM_PROVIDER_PRESETS = {
+    "ollama_local": {
+        "id": "ollama_local",
+        "label": "Ollama (локально)",
+        "base_url": f"http://{_LOCAL_LLM_HOST}:11434/v1",
+        "model": "qwen3:8b",
+        "requires_api_key": False,
+        "is_cloud": False,
+    },
+    "lmstudio_local": {
+        "id": "lmstudio_local",
+        "label": "LM Studio (локально)",
+        "base_url": f"http://{_LOCAL_LLM_HOST}:1234/v1",
+        "model": "qwen3-8b",
+        "requires_api_key": False,
+        "is_cloud": False,
+    },
+    "deepseek_cloud": {
+        "id": "deepseek_cloud",
+        "label": "DeepSeek API (облако)",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+        "requires_api_key": True,
+        "is_cloud": True,
+    },
+    "qwen_cloud": {
+        "id": "qwen_cloud",
+        "label": "Qwen Cloud (DashScope)",
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+        "requires_api_key": True,
+        "is_cloud": True,
+    },
+}
 
 COMPUTE_DEVICE_OPTIONS = ["cpu", "cuda"]
 DEFAULT_COMPUTE_DEVICE = os.environ.get("DEFAULT_COMPUTE_DEVICE", "cpu").strip().lower()

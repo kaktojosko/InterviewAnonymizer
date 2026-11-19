@@ -16,9 +16,15 @@ import wave
 
 import ctranslate2
 import numpy as np
+import onnxruntime as ort
 import sherpa_onnx
 from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+try:
+    import onnx_asr
+except ImportError:  # pragma: no cover
+    onnx_asr = None
 
 from src.cancellation import CancellationToken
 from src.config import (
@@ -30,14 +36,20 @@ from src.config import (
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_DIARIZATION_SENSITIVITY,
+    DEFAULT_LLM_API_KEY,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DENOISE_ENABLED_DEFAULT,
     DIARIZATION_CENTROID_SIM_THRESHOLD,
     DIARIZATION_MERGE_GAP_SEC,
     DIARIZATION_MIN_SEGMENT_SEC,
     DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
     DIARIZATION_SEGMENTATION_THRESHOLD,
     DIARIZATION_SENSITIVITY_PROFILES,
+    LLM_POLISH_ENABLED_DEFAULT,
     TRANSCRIPT_PAUSE_BREAK_SEC,
 )
+from src.llm_postprocessor import polish_turns_with_local_llm
 from src.model_manager import ModelManager
 
 
@@ -223,9 +235,10 @@ def clean_hallucinated_text(text: str) -> str:
     letters = "".join(_WORD_CHARS_RE.findall(t)).lower()
     if not letters:
         return ""
-    if is_repetitive_noise_token(letters):
+    unique_count = len(set(letters))
+    if len(kept_words) <= 1 and is_repetitive_noise_token(letters):
         return ""
-    if len(letters) >= 16 and (len(set(letters)) / float(len(letters))) <= 0.16:
+    if len(letters) >= 16 and unique_count <= 5:
         return ""
 
     return t.strip()
@@ -1855,6 +1868,8 @@ class _ModelCache:
     lock = threading.Lock()
     active_key: Optional[tuple] = None
     active_engine = None
+    denoiser_key: Optional[tuple] = None
+    denoiser_engine = None
 
     @classmethod
     def get_or_create(cls, key: tuple, factory: Callable):
@@ -1868,6 +1883,15 @@ class _ModelCache:
             cls.active_engine = factory()
             cls.active_key = key
             return cls.active_engine
+
+    @classmethod
+    def get_or_create_denoiser(cls, key: tuple, factory: Callable):
+        with cls.lock:
+            if cls.denoiser_key == key and cls.denoiser_engine is not None:
+                return cls.denoiser_engine
+            cls.denoiser_engine = factory()
+            cls.denoiser_key = key
+            return cls.denoiser_engine
 
 
 class _DiarizationCache:
@@ -1898,13 +1922,15 @@ class _DiarizationCache:
 _nvidia_libs_loaded = False
 _cublas_preloaded = False
 _cuda_probe_ok = False
+_onnx_cuda_probe_ok: Optional[bool] = None
 
 
 def _preload_nvidia_pip_libs() -> None:
     """
-    Ensures pip-installed NVIDIA cuBLAS shared libraries (nvidia-cublas-cu12)
-    are visible to CTranslate2's dynamic dlopen() both in local virtualenvs and
-    inside Docker containers without requiring manual LD_LIBRARY_PATH exports.
+    Ensures pip-installed NVIDIA shared libraries (nvidia-cublas-cu12,
+    nvidia-cudnn-cu12, nvidia-cuda-runtime-cu12, nvidia-cufft-cu12, etc.)
+    are visible to CTranslate2 and ONNX Runtime CUDAExecutionProvider both in
+    local virtualenvs and inside Docker containers without manual LD_LIBRARY_PATH.
     """
     global _nvidia_libs_loaded, _cublas_preloaded
     if _nvidia_libs_loaded:
@@ -1919,8 +1945,35 @@ def _preload_nvidia_pip_libs() -> None:
     for pattern in ("lib/python*/site-packages", "Lib/site-packages"):
         search_roots.extend(glob.glob(os.path.join(sys.prefix, pattern)))
 
+    nvidia_subdirs = (
+        "cuda_runtime",
+        "nvjitlink",
+        "cublas",
+        "cuda_nvrtc",
+        "cufft",
+        "curand",
+        "cusparse",
+        "cudnn",
+    )
+    so_patterns = (
+        "libcudart.so*",
+        "libnvJitLink.so*",
+        "libcublasLt.so*",
+        "libcublas.so*",
+        "libnvrtc.so*",
+        "libcufft.so*",
+        "libcurand.so*",
+        "libcusparse.so*",
+        "libcudnn.so*",
+        "libcudnn_ops.so*",
+        "libcudnn_cnn.so*",
+        "libcudnn_graph.so*",
+        "libcudnn_engines*.so*",
+        "libcudnn_heuristic.so*",
+    )
+
     for root in search_roots:
-        for sub in ("cublas", "cuda_nvrtc"):
+        for sub in nvidia_subdirs:
             lib_dir = os.path.join(root, "nvidia", sub, "lib")
             bin_dir = os.path.join(root, "nvidia", sub, "bin")
             for cand_dir in (lib_dir, bin_dir):
@@ -1932,8 +1985,7 @@ def _preload_nvidia_pip_libs() -> None:
                     except OSError:
                         pass
                 else:
-                    # Load cublasLt before cublas with RTLD_GLOBAL so soname lookup succeeds
-                    for pat in ("libcublasLt.so*", "libcublas.so*", "libnvrtc.so*"):
+                    for pat in so_patterns:
                         for so_path in sorted(glob.glob(os.path.join(cand_dir, pat))):
                             try:
                                 ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
@@ -1964,6 +2016,63 @@ def probe_cuda_available() -> bool:
         return True
     except Exception:
         return False
+
+
+def probe_onnx_cuda_available() -> bool:
+    """
+    Returns True if onnxruntime-gpu's CUDAExecutionProvider is installed AND
+    an NVIDIA GPU is accessible in the current environment (enabling GPU CUDA
+    acceleration for GigaAM v3 FP32 RNN-T / CTC via onnx-asr).
+    """
+    global _onnx_cuda_probe_ok
+    if _onnx_cuda_probe_ok is not None:
+        return _onnx_cuda_probe_ok
+    _preload_nvidia_pip_libs()
+    try:
+        providers = ort.get_available_providers()
+        if "CUDAExecutionProvider" not in providers:
+            _onnx_cuda_probe_ok = False
+            return False
+        # Confirm an actual CUDA GPU device is present (e.g. inside Docker --gpus all)
+        if ctranslate2.get_cuda_device_count() <= 0:
+            _onnx_cuda_probe_ok = False
+            return False
+        if hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls()
+            except Exception:
+                pass
+        _onnx_cuda_probe_ok = True
+        return True
+    except Exception:
+        _onnx_cuda_probe_ok = False
+        return False
+
+
+def resolve_onnx_provider(
+    requested_device: Optional[str] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
+) -> tuple[str, list[str]]:
+    """
+    Resolves user-selected compute device into ('cuda' | 'cpu', providers_list)
+    for ONNX Runtime / onnx-asr models (GigaAM v3 FP32, GigaAM v3 CTC).
+    """
+    req = (requested_device or os.environ.get("ASR_DEVICE") or DEFAULT_COMPUTE_DEVICE).strip().lower()
+    if req not in COMPUTE_DEVICE_OPTIONS and req != "auto":
+        req = DEFAULT_COMPUTE_DEVICE
+
+    if req == "cpu":
+        return "cpu", ["CPUExecutionProvider"]
+
+    if probe_onnx_cuda_available():
+        return "cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    if req == "cuda" and status_cb:
+        status_cb(
+            "ONNX Runtime CUDA недоступен (установите GPU-сборку docker-compose.gpu.yml или onnxruntime-gpu) — "
+            "выполнение GigaAM v3 на CPU..."
+        )
+    return "cpu", ["CPUExecutionProvider"]
 
 
 def resolve_compute_device(
@@ -2536,7 +2645,7 @@ class Transcriber:
 
         if device == "cpu":
             total_threads = max(1, int(threads))
-            if profile_id in ("large-v3", "large-v3-ru"):
+            if profile_id in ("large-v3", "large-v3-ru", "breeze-asr-25"):
                 max_workers_cap = 1
             elif profile_id == "turbo":
                 max_workers_cap = 2
@@ -2580,6 +2689,10 @@ class Transcriber:
         if total_dur <= 0.0:
             return []
 
+        profile_cfg = ASR_MODEL_PROFILES.get(profile_id, {})
+        decode_cfg = profile_cfg.get("decode_params", {})
+        max_win_sec = float(decode_cfg.get("max_window_sec", 28.5))
+
         ordered_diar: Optional[list[DiarizationSegment]] = None
         if diar_segments:
             ordered_diar = sorted(
@@ -2589,20 +2702,22 @@ class Transcriber:
             windows = build_speaker_asr_windows(
                 ordered_diar,
                 total_dur,
-                max_same_speaker_sec=26.5,
+                max_same_speaker_sec=min(26.5, max_win_sec - 1.5),
                 merge_gap_sec=2.0 if device == "cpu" else 1.6,
                 split_speaker_turns=(device != "cpu"),
             )
             if windows:
                 windows = subdivide_long_asr_windows(
-                    windows, samples, sample_rate=sample_rate, max_window_sec=28.5
+                    windows, samples, sample_rate=sample_rate, max_window_sec=max_win_sec
                 )
                 windows = _augment_windows_with_vad(
-                    windows, samples, sample_rate=sample_rate, max_window_sec=28.5
+                    windows, samples, sample_rate=sample_rate, max_window_sec=max_win_sec
                 )
             used_diar_windows = bool(windows)
         else:
-            windows = build_vad_asr_windows(samples, sample_rate=sample_rate)
+            windows = build_vad_asr_windows(
+                samples, sample_rate=sample_rate, max_window_sec=min(26.0, max_win_sec)
+            )
             used_diar_windows = False
 
         if not windows:
@@ -2629,19 +2744,39 @@ class Transcriber:
             profile_id=profile_id,
         )
         cleaned_custom_prompt = " ".join((custom_prompt or "").split())[:320]
+        # Extract clean comma-separated terms for CTranslate2 beam-boosting hotwords
+        # (strips descriptive lead-ins like 'Собеседование системного аналитика:')
+        hotwords_str: Optional[str] = None
+        if cleaned_custom_prompt and bool(decode_cfg.get("use_hotwords", True)):
+            hw_src = (
+                cleaned_custom_prompt.split(":", 1)[1].strip()
+                if ":" in cleaned_custom_prompt
+                else cleaned_custom_prompt
+            )
+            if hw_src:
+                hotwords_str = hw_src[:220]
+
         if status_cb:
             mode_desc = "мультиязычный авто" if use_multilingual else f"фиксированный ({resolved_lang})"
-            prompt_note = " + пользовательский словарь" if cleaned_custom_prompt else ""
+            prompt_note = " + пользовательский словарь (hotwords)" if hotwords_str else (
+                " + пользовательский словарь" if cleaned_custom_prompt else ""
+            )
             status_cb(f"Язык распознавания Whisper: {mode_desc}{prompt_note}")
 
+        default_cpu_beam = 3 if profile_id in ("large-v3", "large-v3-ru", "breeze-asr-25") else 2
         if device == "cuda":
-            beam_size = 5
-        elif profile_id in ("large-v3", "large-v3-ru"):
-            beam_size = 3
+            beam_size = int(decode_cfg.get("beam_size_cuda", 5))
         else:
-            beam_size = 2
-        temperatures = (0.0, 0.2, 0.4)
-        comp_ratio_thr = 2.4
+            beam_size = int(decode_cfg.get("beam_size_cpu", default_cpu_beam))
+        patience = float(decode_cfg.get("patience", 1.0))
+        rep_penalty = float(decode_cfg.get("repetition_penalty", 1.08))
+        no_repeat_ngram = int(decode_cfg.get("no_repeat_ngram_size", 4))
+        no_speech_thr = float(decode_cfg.get("no_speech_threshold", 0.6))
+        comp_ratio_thr = float(decode_cfg.get("compression_ratio_threshold", 2.4))
+        log_prob_thr = float(decode_cfg.get("log_prob_threshold", -1.0))
+        hall_silence_thr = float(decode_cfg.get("hallucination_silence_threshold", 1.5))
+        temperatures = tuple(decode_cfg.get("temperatures", (0.0, 0.2, 0.4)))
+        seg_comp_cap = max(2.4, comp_ratio_thr + 0.2)
         dev_tag = "GPU CUDA" if device == "cuda" else "CPU"
 
         last_pct = 0
@@ -2697,14 +2832,20 @@ class Transcriber:
                 vad_filter=use_vad,
                 condition_on_previous_text=False,
                 initial_prompt=win_prompt,
-                no_speech_threshold=0.6,
+                suppress_blank=True,
+                no_speech_threshold=no_speech_thr,
                 compression_ratio_threshold=comp_ratio_thr,
-                log_prob_threshold=-1.0,
-                repetition_penalty=1.08,
-                hallucination_silence_threshold=1.5,
+                log_prob_threshold=log_prob_thr,
+                repetition_penalty=rep_penalty,
+                no_repeat_ngram_size=no_repeat_ngram,
+                hallucination_silence_threshold=hall_silence_thr,
                 beam_size=beam_size,
+                best_of=beam_size,
+                patience=patience,
                 temperature=temperatures,
             )
+            if hotwords_str:
+                transcribe_kwargs["hotwords"] = hotwords_str
             if use_vad:
                 transcribe_kwargs["vad_parameters"] = dict(
                     min_silence_duration_ms=350, speech_pad_ms=220
@@ -2725,9 +2866,9 @@ class Transcriber:
                 seg_logprob = float(getattr(seg, "avg_logprob", 0.0) or 0.0)
                 seg_comp_ratio = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
 
-                if seg_no_speech > 0.78 and seg_logprob < -1.0:
+                if seg_no_speech > 0.78 and seg_logprob < log_prob_thr:
                     continue
-                if seg_comp_ratio > 2.6:
+                if seg_comp_ratio > seg_comp_cap:
                     continue
 
                 if not used_diar_windows:
@@ -3016,7 +3157,7 @@ class Transcriber:
 
         units: list[TimedUnit] = []
         total_chunks = len(valid_chunks)
-        batch_size = 4
+        batch_size = max(1, int(profile.get("batch_size_cpu", 4)))
         last_pct = -20
         last_log_t = time.time()
 
@@ -3062,7 +3203,7 @@ class Transcriber:
                 # Fault-isolated retry if an energetic speech chunk returned empty output
                 if not chunk_units and (c_end - c_start) >= 1.2:
                     chunk_rms = float(np.sqrt(np.mean(chunk_wav * chunk_wav))) if chunk_wav.size else 0.0
-                    if chunk_rms > 0.015:
+                    if chunk_rms > 0.010:
                         chunk_units = _decode_single_fallback(c_start, c_end, s_idx, e_idx)
 
                 has_left_ov = k_start > c_start + 1e-4
@@ -3110,6 +3251,483 @@ class Transcriber:
         )
 
     @classmethod
+    def _denoise_speech(
+        cls,
+        samples: np.ndarray,
+        sample_rate: int = 16000,
+        denoiser_path: Optional[str] = None,
+        threads: int = 4,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+    ) -> np.ndarray:
+        """
+        Optional lightweight GTCRN neural speech enhancement (~535 KB ONNX via
+        sherpa-onnx). Cleans background hum, fan noise, and laptop-mic hiss in
+        15s blocks with 80ms linear overlap-add crossfading while strictly
+        preserving exact sample count (zero boundary clicks, zero timestamp drift).
+        """
+        if cancel_token:
+            cancel_token.check()
+        if samples.size < 800:
+            return samples
+        try:
+            model_path = denoiser_path or ModelManager.ensure_denoiser_model(status_cb=status_cb)
+            eff_threads = max(1, min(int(threads), 4))
+            t0 = time.time()
+            if status_cb:
+                status_cb("Шумоподавление речи (GTCRN ONNX)...")
+
+            def _create_denoiser():
+                cfg = sherpa_onnx.OfflineSpeechDenoiserConfig(
+                    model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                        gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(model=model_path),
+                        num_threads=eff_threads,
+                        provider="cpu",
+                    )
+                )
+                return sherpa_onnx.OfflineSpeechDenoiser(cfg)
+
+            denoiser = _ModelCache.get_or_create_denoiser(
+                ("gtcrn", model_path, eff_threads),
+                _create_denoiser,
+            )
+
+            block_n = max(sample_rate, 15 * sample_rate)
+            fade_n = min(block_n // 8, max(0, int(0.08 * sample_rate)))
+            step_n = max(1, block_n - fade_n)
+            cleaned = np.zeros(samples.size, dtype=np.float32)
+
+            pos = 0
+            while pos < samples.size:
+                if cancel_token:
+                    cancel_token.check()
+                end = min(samples.size, pos + block_n)
+                blk = np.ascontiguousarray(samples[pos:end], dtype=np.float32)
+                res = denoiser(blk, int(sample_rate))
+                arr = np.asarray(res.samples, dtype=np.float32).reshape(-1)
+                if arr.size > blk.size:
+                    arr = arr[: blk.size]
+                elif arr.size < blk.size:
+                    arr = np.pad(arr, (0, blk.size - arr.size), mode="constant")
+
+                if pos == 0:
+                    cleaned[0:end] = arr
+                else:
+                    ov = min(fade_n, arr.size, samples.size - pos)
+                    if ov > 0:
+                        w = np.linspace(0.0, 1.0, ov, dtype=np.float32)
+                        cleaned[pos : pos + ov] = cleaned[pos : pos + ov] * (1.0 - w) + arr[:ov] * w
+                    if arr.size > ov:
+                        cleaned[pos + ov : end] = arr[ov:]
+
+                if end >= samples.size:
+                    break
+                pos += step_n
+
+            cleaned = np.ascontiguousarray(cleaned, dtype=np.float32)
+            if status_cb:
+                status_cb(f"[Profile] Шумоподавление GTCRN завершено за {time.time() - t0:.2f}s")
+            return cleaned
+        except Exception as exc:
+            if status_cb:
+                status_cb(f"Предупреждение: шумоподавление GTCRN пропущено ({exc}), используется исходный звук.")
+            return samples
+
+    @classmethod
+    def _run_onnx_asr(
+        cls,
+        samples: np.ndarray,
+        sample_rate: int,
+        model_dir: str,
+        profile_id: str = "gigaam-v3",
+        diar_segments: Optional[list[DiarizationSegment]] = None,
+        threads: int = 4,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
+    ) -> list[TimedUnit]:
+        """
+        Runs full-precision FP32 / INT8 ONNX ASR models via onnx-asr
+        (GigaAM v3 E2E RNN-T/CTC FP32, GigaAM v3 INT8, NVIDIA Canary 1B v2)
+        on NVIDIA GPU (CUDAExecutionProvider) or CPU (CPUExecutionProvider).
+        Models with word timestamps use <=20s Silero VAD + 1.5s sliding overlap
+        chunking; AED models without word timestamps (Canary 1B v2) use
+        speaker-turn / breath-valley non-overlapping windows with explicit
+        language + punctuation flags.
+        """
+        if cancel_token:
+            cancel_token.check()
+        if onnx_asr is None:
+            raise RuntimeError("Пакет onnx-asr не установлен. Выполните: pip install onnx-asr")
+
+        profile = ASR_MODEL_PROFILES.get(profile_id, {})
+        onnx_model_name = str(profile.get("onnx_asr_model", "gigaam-v3-e2e-rnnt"))
+        quantization = profile.get("quantization", None)
+        max_chunk_sec = float(profile.get("max_chunk_sec", 20.0))
+        overlap_sec = float(profile.get("overlap_sec", 1.5))
+        has_word_timestamps = bool(profile.get("has_word_timestamps", True))
+        passes_language = bool(profile.get("passes_language", False))
+        progress_tag = profile.get("short_name", profile_id)
+
+        req_dev = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
+        if not profile.get("supports_cuda", False):
+            eff_dev, providers = "cpu", ["CPUExecutionProvider"]
+        else:
+            eff_dev, providers = resolve_onnx_provider(req_dev, status_cb=status_cb)
+
+        recognize_kwargs: dict = {}
+        if passes_language:
+            lang_clean = (language or DEFAULT_ASR_LANGUAGE).strip().lower()
+            # Canary AED requires a concrete ISO language token (no <|auto|> token)
+            eff_lang = "en" if lang_clean == "en" else "ru"
+            recognize_kwargs = {
+                "language": eff_lang,
+                "target_language": eff_lang,
+                "pnc": True,
+            }
+
+        if has_word_timestamps:
+            chunks = build_longform_asr_chunks(
+                samples=samples,
+                sample_rate=sample_rate,
+                diar_segments=diar_segments,
+                max_chunk_sec=max_chunk_sec,
+                overlap_sec=overlap_sec,
+                use_silero_vad=True,
+            )
+        else:
+            # AED models without frame-level token timestamps (e.g. Canary 1B v2) MUST
+            # split cleanly along speaker turns / pause valleys with zero overlap so
+            # speakers don't merge inside one chunk and boundary words never duplicate.
+            if diar_segments:
+                ordered_diar = sorted(diar_segments, key=lambda s: (s.start, s.end))
+                wins = build_speaker_asr_windows(
+                    ordered_diar,
+                    total_dur=len(samples) / float(sample_rate) if sample_rate > 0 else 0.0,
+                    max_same_speaker_sec=max_chunk_sec,
+                    merge_gap_sec=1.2,
+                    pad_sec=0.14,
+                    split_speaker_turns=True,
+                )
+                wins = _augment_windows_with_vad(
+                    wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
+                )
+                wins = subdivide_long_asr_windows(
+                    wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
+                )
+            else:
+                wins = build_vad_asr_windows(
+                    samples,
+                    sample_rate=sample_rate,
+                    max_window_sec=max_chunk_sec,
+                    merge_gap_sec=0.9,
+                    pad_sec=0.14,
+                )
+            chunks = [(ws, we, ws, we) for ws, we in wins]
+
+        if not chunks:
+            return []
+
+        valid_chunks: list[tuple[float, float, float, float, int, int]] = []
+        for c_start, c_end, k_start, k_end in chunks:
+            s_idx = max(0, int(c_start * sample_rate))
+            e_idx = min(len(samples), int(c_end * sample_rate))
+            if e_idx - s_idx >= 800:
+                valid_chunks.append((c_start, c_end, k_start, k_end, s_idx, e_idx))
+        if not valid_chunks:
+            return []
+
+        def _load_engine(dev_name: str, prov_list: list[str]):
+            asr_threads = max(1, int(threads)) if dev_name == "cpu" else min(2, max(1, int(threads)))
+            cache_key = ("onnx_asr", profile_id, model_dir, dev_name, asr_threads)
+
+            def _factory():
+                sess_opts = ort.SessionOptions()
+                sess_opts.intra_op_num_threads = asr_threads
+                sess_opts.inter_op_num_threads = 1
+                sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                loaded = onnx_asr.load_model(
+                    onnx_model_name,
+                    path=model_dir,
+                    quantization=quantization,
+                    sess_options=sess_opts,
+                    providers=prov_list,
+                )
+                return loaded.with_timestamps() if has_word_timestamps else loaded
+
+            return _ModelCache.get_or_create(cache_key, _factory)
+
+        def _split_chunk_text_proportionally(text: str, c_start: float, c_end: float) -> list[TimedUnit]:
+            cleaned = clean_hallucinated_text(text.strip())
+            if not cleaned:
+                return []
+            parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", cleaned) if p.strip()]
+            if len(parts) <= 1:
+                return [TimedUnit(start=c_start, end=c_end, text=f" {cleaned}")]
+            total_chars = max(1, sum(len(p) for p in parts))
+            span = max(0.05, c_end - c_start)
+            cur = c_start
+            out_parts: list[TimedUnit] = []
+            for idx, p in enumerate(parts):
+                p_end = c_end if idx == len(parts) - 1 else min(c_end, cur + span * (len(p) / total_chars))
+                out_parts.append(TimedUnit(start=cur, end=max(cur + 0.02, p_end), text=f" {p}"))
+                cur = p_end
+            return out_parts
+
+        def _extract_result_units(res, c_start: float, c_end: float) -> list[TimedUnit]:
+            out_u: list[TimedUnit] = []
+            if isinstance(res, str):
+                if res.strip():
+                    out_u.extend(_split_chunk_text_proportionally(res, c_start, c_end))
+                return out_u
+            toks = getattr(res, "tokens", None)
+            ts = getattr(res, "timestamps", None)
+            txt = getattr(res, "text", None)
+            if toks and ts and len(toks) == len(ts):
+                chunk_units = group_bpe_tokens_to_units(list(toks), list(ts), c_start, c_end)
+                for u in chunk_units:
+                    if u.text and u.text.strip() and not is_repetitive_noise_token(u.text):
+                        out_u.append(u)
+            elif txt and str(txt).strip():
+                out_u.extend(_split_chunk_text_proportionally(str(txt), c_start, c_end))
+            return out_u
+
+        def _decode_with_device(dev_name: str, prov_list: list[str]) -> list[TimedUnit]:
+            model = _load_engine(dev_name, prov_list)
+            if dev_name == "cuda":
+                default_bs = 8 if has_word_timestamps else 4
+                batch_size = max(1, int(profile.get("batch_size_cuda", default_bs)))
+            else:
+                default_bs = 4 if has_word_timestamps else 1
+                batch_size = max(1, int(profile.get("batch_size_cpu", default_bs)))
+            total_chunks = len(valid_chunks)
+            out_units: list[TimedUnit] = []
+            last_pct = -20
+            last_log_t = time.time()
+
+            def _single_retry(c_start: float, c_end: float, s_idx: int, e_idx: int) -> list[TimedUnit]:
+                dur = c_end - c_start
+                if dur > 10.0:
+                    mid_s = 0.5 * (c_start + c_end)
+                    mid_idx = max(s_idx + 800, min(e_idx - 800, int(mid_s * sample_rate)))
+                    sub_spans = [(c_start, mid_s, s_idx, mid_idx), (mid_s, c_end, mid_idx, e_idx)]
+                else:
+                    sub_spans = [(c_start, c_end, s_idx, e_idx)]
+                rescued: list[TimedUnit] = []
+                for sub_s, sub_e, sub_si, sub_ei in sub_spans:
+                    if cancel_token:
+                        cancel_token.check()
+                    if sub_ei - sub_si < 800:
+                        continue
+                    try:
+                        sub_wav = normalize_chunk_level(samples[sub_si:sub_ei])
+                        sub_res = model.recognize(sub_wav, sample_rate=sample_rate, **recognize_kwargs)
+                        rescued.extend(_extract_result_units(sub_res, sub_s, sub_e))
+                    except Exception:
+                        continue
+                return rescued
+
+            for b_start in range(0, total_chunks, batch_size):
+                if cancel_token:
+                    cancel_token.check()
+
+                batch = valid_chunks[b_start : b_start + batch_size]
+                chunk_wavs = [normalize_chunk_level(samples[si:ei]) for _, _, _, _, si, ei in batch]
+
+                batch_results: list = []
+                try:
+                    if len(chunk_wavs) == 1:
+                        batch_results = [
+                            model.recognize(chunk_wavs[0], sample_rate=sample_rate, **recognize_kwargs)
+                        ]
+                    else:
+                        raw_res = model.recognize(chunk_wavs, sample_rate=sample_rate, **recognize_kwargs)
+                        batch_results = list(raw_res) if isinstance(raw_res, (list, tuple)) else [raw_res]
+                except Exception as batch_exc:
+                    if dev_name == "cuda" and b_start == 0:
+                        raise batch_exc
+                    batch_results = []
+                    for wav_arr in chunk_wavs:
+                        if cancel_token:
+                            cancel_token.check()
+                        try:
+                            batch_results.append(
+                                model.recognize(wav_arr, sample_rate=sample_rate, **recognize_kwargs)
+                            )
+                        except Exception:
+                            batch_results.append(None)
+
+                if cancel_token:
+                    cancel_token.check()
+
+                for (c_start, c_end, k_start, k_end, s_idx, e_idx), res, wav_arr in zip(
+                    batch, batch_results, chunk_wavs
+                ):
+                    chunk_units = _extract_result_units(res, c_start, c_end) if res is not None else []
+                    if not chunk_units and (c_end - c_start) >= 1.2:
+                        chunk_rms = float(np.sqrt(np.mean(wav_arr * wav_arr))) if wav_arr.size else 0.0
+                        if chunk_rms > 0.010:
+                            chunk_units = _single_retry(c_start, c_end, s_idx, e_idx)
+
+                    has_left_ov = k_start > c_start + 1e-4
+                    has_right_ov = k_end < c_end - 1e-4
+                    for u in chunk_units:
+                        if has_left_ov or has_right_ov:
+                            mid = 0.5 * (u.start + u.end)
+                            if has_left_ov and mid < k_start:
+                                continue
+                            if has_right_ov and mid >= k_end:
+                                continue
+                        out_units.append(u)
+
+                done_idx = b_start + len(batch)
+                if status_cb and total_chunks > 0:
+                    pct = min(99, int((done_idx * 100) / total_chunks))
+                    now = time.time()
+                    if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
+                        last_pct = pct
+                        last_log_t = now
+                        status_cb(f"Распознавание речи ({progress_tag}): {pct}% ({done_idx}/{total_chunks})...")
+
+            return out_units
+
+        try:
+            return _decode_with_device(eff_dev, providers)
+        except Exception as gpu_err:
+            if eff_dev == "cuda":
+                if status_cb:
+                    status_cb(
+                        f"Ошибка ONNX Runtime CUDA ({gpu_err}) — автоматическое переключение {progress_tag} на CPU..."
+                    )
+                return _decode_with_device("cpu", ["CPUExecutionProvider"])
+            raise
+
+    @classmethod
+    def _run_onnx_canary_qwen(
+        cls,
+        samples: np.ndarray,
+        sample_rate: int,
+        model_dir: str,
+        profile_id: str = "canary-qwen-2.5b",
+        diar_segments: Optional[list[DiarizationSegment]] = None,
+        threads: int = 4,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+        language: str = "en",
+    ) -> list[TimedUnit]:
+        """
+        Runs NVIDIA Canary-Qwen 2.5B (INT8 ONNX Speech-LLM: FastConformer + Qwen3-1.7B)
+        locally via ONNX Runtime without PyTorch/NeMo. English-only SOTA (#1 Open ASR).
+        """
+        from src.canary_qwen_asr import CanaryQwenSpeechLlm
+
+        if cancel_token:
+            cancel_token.check()
+
+        profile = ASR_MODEL_PROFILES.get(profile_id, {})
+        max_chunk_sec = float(profile.get("max_chunk_sec", 28.0))
+        rep_penalty = float(profile.get("repetition_penalty", 1.05))
+        edge_pad_sec = float(profile.get("edge_pad_sec", 0.12))
+        progress_tag = profile.get("short_name", profile_id)
+
+        lang_clean = (language or "en").strip().lower()
+        if lang_clean == "ru" and status_cb:
+            status_cb(
+                "Внимание: NVIDIA Canary-Qwen 2.5B обучена только на английском языке (EN); "
+                "для русской речи рекомендуются GigaAM v3, Breeze-ASR-25 или Canary 1B v2."
+            )
+
+        if diar_segments:
+            ordered_diar = sorted(diar_segments, key=lambda s: (s.start, s.end))
+            wins = build_speaker_asr_windows(
+                ordered_diar,
+                total_dur=len(samples) / float(sample_rate) if sample_rate > 0 else 0.0,
+                max_same_speaker_sec=max_chunk_sec,
+                merge_gap_sec=1.2,
+                pad_sec=0.14,
+                split_speaker_turns=True,
+            )
+            wins = _augment_windows_with_vad(
+                wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
+            )
+            wins = subdivide_long_asr_windows(
+                wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
+            )
+        else:
+            wins = build_vad_asr_windows(
+                samples,
+                sample_rate=sample_rate,
+                max_window_sec=max_chunk_sec,
+                merge_gap_sec=0.9,
+                pad_sec=0.14,
+            )
+
+        valid_chunks: list[tuple[float, float, int, int]] = []
+        for ws, we in wins:
+            s_idx = max(0, int(ws * sample_rate))
+            e_idx = min(len(samples), int(we * sample_rate))
+            if e_idx - s_idx >= 800:
+                valid_chunks.append((ws, we, s_idx, e_idx))
+        if not valid_chunks:
+            return []
+
+        asr_threads = max(1, int(threads))
+        cache_key = ("onnx_canary_qwen", profile_id, model_dir, asr_threads, rep_penalty, edge_pad_sec)
+        model: CanaryQwenSpeechLlm = _ModelCache.get_or_create(
+            cache_key,
+            lambda: CanaryQwenSpeechLlm(
+                model_dir=model_dir,
+                threads=asr_threads,
+                providers=["CPUExecutionProvider"],
+                prefer_int8=True,
+                repetition_penalty=rep_penalty,
+                edge_pad_sec=edge_pad_sec,
+            ),
+        )
+
+        def _split_sentences(text: str, c_start: float, c_end: float) -> list[TimedUnit]:
+            cleaned = clean_hallucinated_text(text.strip())
+            if not cleaned:
+                return []
+            parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", cleaned) if p.strip()]
+            if len(parts) <= 1:
+                return [TimedUnit(start=c_start, end=c_end, text=f" {cleaned}")]
+            total_chars = max(1, sum(len(p) for p in parts))
+            span = max(0.05, c_end - c_start)
+            cur = c_start
+            out_parts: list[TimedUnit] = []
+            for idx, p in enumerate(parts):
+                p_end = c_end if idx == len(parts) - 1 else min(c_end, cur + span * (len(p) / total_chars))
+                out_parts.append(TimedUnit(start=cur, end=max(cur + 0.02, p_end), text=f" {p}"))
+                cur = p_end
+            return out_parts
+
+        out_units: list[TimedUnit] = []
+        total_chunks = len(valid_chunks)
+        last_pct = -20
+        last_log_t = time.time()
+
+        for idx, (c_start, c_end, s_idx, e_idx) in enumerate(valid_chunks, start=1):
+            if cancel_token:
+                cancel_token.check()
+            chunk_wav = normalize_chunk_level(samples[s_idx:e_idx])
+            text = model.recognize_chunk(chunk_wav, sample_rate=sample_rate, cancel_token=cancel_token)
+            if text and text.strip():
+                out_units.extend(_split_sentences(text, c_start, c_end))
+
+            pct = int(idx * 100 / max(1, total_chunks))
+            now = time.time()
+            if status_cb and (pct >= last_pct + 20 or idx == total_chunks or now - last_log_t >= 5.0):
+                last_pct = pct
+                last_log_t = now
+                status_cb(f"Транскрибация ({progress_tag}, CPU): {pct}% ({idx}/{total_chunks})...")
+
+        out_units.sort(key=lambda u: (u.start, u.end))
+        return out_units
+
+    @classmethod
     def _run_asr_engine(
         cls,
         samples: np.ndarray,
@@ -3144,11 +3762,55 @@ class Transcriber:
                 language=language,
                 custom_prompt=custom_prompt,
             )
+        if profile["engine"] == "onnx_asr":
+            if profile.get("supports_cuda", False):
+                eff_dev, _ = resolve_onnx_provider(req_dev)
+            else:
+                eff_dev = "cpu"
+                if req_dev == "cuda" and status_cb:
+                    status_cb(
+                        f"Модель {profile['short_name']} работает на CPU; "
+                        "для GPU CUDA выберите GigaAM v3 FP32, GigaAM v3 CTC FP32, Canary 1B v2 или Whisper/Breeze."
+                    )
+            dev_label = "GPU CUDA" if eff_dev == "cuda" else "CPU"
+            if status_cb:
+                status_cb(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
+            return cls._run_onnx_asr(
+                samples=samples,
+                sample_rate=sample_rate,
+                model_dir=asr_dir,
+                profile_id=profile_id,
+                diar_segments=diar_segments,
+                threads=threads,
+                compute_device=req_dev,
+                status_cb=status_cb,
+                cancel_token=cancel_token,
+                language=language,
+            )
+        if profile["engine"] == "onnx_canary_qwen":
+            if req_dev == "cuda" and status_cb:
+                status_cb(
+                    f"Модель {profile['short_name']} использует динамический INT8 ONNX на CPU (~3.5× real-time); "
+                    "для GPU CUDA доступны GigaAM v3 FP32, Canary 1B v2, Breeze-ASR-25 и Whisper."
+                )
+            if status_cb:
+                status_cb(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
+            return cls._run_onnx_canary_qwen(
+                samples=samples,
+                sample_rate=sample_rate,
+                model_dir=asr_dir,
+                profile_id=profile_id,
+                diar_segments=diar_segments,
+                threads=threads,
+                status_cb=status_cb,
+                cancel_token=cancel_token,
+                language=language,
+            )
         if profile["engine"] in ("sherpa_transducer", "sherpa_parakeet"):
             if req_dev == "cuda" and status_cb:
                 status_cb(
                     f"Модель {profile['short_name']} работает на CPU (ONNX INT8); "
-                    "для GPU CUDA доступны Whisper Large v3 RU, Turbo и Large v3."
+                    "для GPU CUDA доступны GigaAM v3 FP32, GigaAM v3 CTC FP32, Breeze-ASR-25 и Whisper."
                 )
             if status_cb:
                 status_cb(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
@@ -3164,6 +3826,89 @@ class Transcriber:
             )
         raise ValueError(f"Unsupported engine: {profile['engine']}")
 
+    @staticmethod
+    def _finalize_and_write_transcript(
+        turns: list[SpeakerTurn],
+        duration_sec: float,
+        model_name: str,
+        num_speakers: int,
+        output_txt_path: str,
+        custom_prompt: str = "",
+        base_note: Optional[str] = None,
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+    ) -> dict:
+        final_turns = list(turns)
+        if custom_prompt and custom_prompt.strip():
+            final_turns = [
+                SpeakerTurn(
+                    t.start,
+                    t.end,
+                    t.speaker_label,
+                    apply_custom_glossary_terms(t.text, custom_prompt),
+                )
+                for t in final_turns
+            ]
+
+        notes: list[str] = []
+        if base_note:
+            notes.append(base_note)
+
+        llm_applied = False
+        raw_backup_path: Optional[str] = None
+
+        if llm_polish and final_turns:
+            raw_text = format_transcript_txt(
+                turns=final_turns,
+                duration_sec=duration_sec,
+                model_name=model_name,
+                num_speakers=num_speakers,
+                note="\n".join(notes) if notes else None,
+            )
+            stem, ext = os.path.splitext(output_txt_path)
+            raw_backup_path = f"{stem}_raw{ext or '.txt'}"
+            try:
+                with open(raw_backup_path, "w", encoding="utf-8") as rf:
+                    rf.write(raw_text)
+            except OSError:
+                raw_backup_path = None
+
+            polished_turns, llm_stats = polish_turns_with_local_llm(
+                turns=final_turns,
+                base_url=llm_base_url,
+                model=llm_model,
+                custom_prompt=custom_prompt,
+                api_key=llm_api_key,
+                status_cb=status_cb,
+                cancel_token=cancel_token,
+            )
+            if llm_stats.get("applied"):
+                final_turns = polished_turns
+                llm_applied = True
+                notes.append(
+                    f"# Постобработка: LLM-корректура ({llm_model}, исправлено реплик: {llm_stats.get('changed_turns', 0)})"
+                )
+
+        transcript_text = format_transcript_txt(
+            turns=final_turns,
+            duration_sec=duration_sec,
+            model_name=model_name,
+            num_speakers=num_speakers,
+            note="\n".join(notes) if notes else None,
+        )
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(transcript_text)
+
+        return {
+            "turns": final_turns,
+            "llm_applied": llm_applied,
+            "raw_transcript_path": raw_backup_path,
+        }
+
     @classmethod
     def transcribe_units_only(
         cls,
@@ -3175,11 +3920,13 @@ class Transcriber:
         cancel_token: Optional[CancellationToken] = None,
         language: str = DEFAULT_ASR_LANGUAGE,
         custom_prompt: str = "",
+        denoise: bool = DENOISE_ENABLED_DEFAULT,
     ) -> dict:
         """
-        Phase A of hardware-decoupled GPU mode: runs Silero VAD + Whisper on
-        CUDA immediately during CPU video blurring, without competing with CPU
-        video workers by deferring CPU speaker diarization until Phase B.
+        Phase A of hardware-decoupled GPU mode: runs Silero VAD + GPU ASR
+        (Whisper/Breeze on CTranslate2 CUDA OR GigaAM v3 FP32/CTC on ONNX Runtime CUDA)
+        immediately during CPU video blurring, without competing with CPU video workers
+        by deferring CPU speaker diarization until Phase B.
         """
         def update(msg: str):
             if status_cb:
@@ -3210,29 +3957,73 @@ class Transcriber:
                 "elapsed_asr": time.time() - t0,
             }
 
+        asr_samples = (
+            cls._denoise_speech(
+                samples,
+                sample_rate=sample_rate,
+                threads=max(1, min(2, threads)),
+                status_cb=update,
+                cancel_token=cancel_token,
+            )
+            if denoise
+            else samples
+        )
+
         asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
         if cancel_token:
             cancel_token.check()
 
         req_dev = (compute_device or "cuda").strip().lower()
-        eff_dev, eff_ctype = resolve_compute_device(req_dev)
-        dev_label = f"GPU CUDA ({eff_ctype})" if eff_dev == "cuda" else "CPU"
-        update(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
-
         t_asr = time.time()
-        units = cls._run_faster_whisper(
-            samples=samples,
-            sample_rate=sample_rate,
-            model_dir=asr_dir,
-            profile_id=profile_id,
-            diar_segments=None,
-            threads=threads,
-            compute_device=req_dev,
-            status_cb=update,
-            cancel_token=cancel_token,
-            language=language,
-            custom_prompt=custom_prompt,
-        )
+        if profile["engine"] == "faster_whisper":
+            eff_dev, eff_ctype = resolve_compute_device(req_dev)
+            dev_label = f"GPU CUDA ({eff_ctype})" if eff_dev == "cuda" else "CPU"
+            update(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
+            units = cls._run_faster_whisper(
+                samples=asr_samples,
+                sample_rate=sample_rate,
+                model_dir=asr_dir,
+                profile_id=profile_id,
+                diar_segments=None,
+                threads=threads,
+                compute_device=req_dev,
+                status_cb=update,
+                cancel_token=cancel_token,
+                language=language,
+                custom_prompt=custom_prompt,
+            )
+        elif profile["engine"] == "onnx_asr":
+            eff_dev, _ = resolve_onnx_provider(req_dev)
+            dev_label = "GPU CUDA (FP32)" if eff_dev == "cuda" else "CPU"
+            update(f"Локальная транскрибация речи ({profile['short_name']}, {dev_label})...")
+            units = cls._run_onnx_asr(
+                samples=asr_samples,
+                sample_rate=sample_rate,
+                model_dir=asr_dir,
+                profile_id=profile_id,
+                diar_segments=None,
+                threads=threads,
+                compute_device=req_dev,
+                status_cb=update,
+                cancel_token=cancel_token,
+                language=language,
+            )
+        else:
+            units = cls._run_asr_engine(
+                samples=asr_samples,
+                sample_rate=sample_rate,
+                profile_id=profile_id,
+                profile=profile,
+                asr_dir=asr_dir,
+                diar_segments=None,
+                threads=threads,
+                compute_device=req_dev,
+                language=language,
+                custom_prompt=custom_prompt,
+                status_cb=update,
+                cancel_token=cancel_token,
+            )
+
         elapsed_asr = time.time() - t_asr
         update(f"[Profile] GPU ASR завершена за {elapsed_asr:.2f}s (единиц текста: {len(units)})")
 
@@ -3257,11 +4048,15 @@ class Transcriber:
         cancel_token: Optional[CancellationToken] = None,
         diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
         custom_prompt: str = "",
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         """
         Phase B of hardware-decoupled GPU mode: runs CPU speaker diarization
         using uncontested CPU cores after video blurring completes, then aligns
-        the pre-computed GPU Whisper words to speaker turns and writes .txt.
+        the pre-computed GPU ASR words to speaker turns and writes .txt.
         """
         def update(msg: str):
             if status_cb:
@@ -3340,29 +4135,32 @@ class Transcriber:
             speaker_centroids=speaker_centroids,
             embedding_extractor=emb_extractor,
         )
-        if eff_prompt and eff_prompt.strip():
-            turns = [
-                SpeakerTurn(t.start, t.end, t.speaker_label, apply_custom_glossary_terms(t.text, eff_prompt))
-                for t in turns
-            ]
-        transcript_text = format_transcript_txt(
+        fin = cls._finalize_and_write_transcript(
             turns=turns,
             duration_sec=duration_sec,
             model_name=profile["short_name"],
             num_speakers=final_speaker_count,
+            output_txt_path=output_txt_path,
+            custom_prompt=eff_prompt,
+            llm_polish=llm_polish,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
+            status_cb=update,
+            cancel_token=cancel_token,
         )
-        with open(output_txt_path, "w", encoding="utf-8") as f:
-            f.write(transcript_text)
 
         total_elapsed = elapsed_asr + (time.time() - t0)
         update(
-            f"[Profile] Транскрипт сохранён ({len(turns)} реплик, спикеров: {final_speaker_count}) "
+            f"[Profile] Транскрипт сохранён ({len(fin['turns'])} реплик, спикеров: {final_speaker_count}) "
             f"за {total_elapsed:.2f}s"
         )
         return {
             "num_speakers": final_speaker_count,
-            "num_turns": len(turns),
+            "num_turns": len(fin["turns"]),
             "elapsed": total_elapsed,
+            "llm_applied": fin["llm_applied"],
+            "raw_transcript_path": fin["raw_transcript_path"],
         }
 
     @classmethod
@@ -3380,10 +4178,16 @@ class Transcriber:
         language: str = DEFAULT_ASR_LANGUAGE,
         custom_prompt: str = "",
         diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+        denoise: bool = DENOISE_ENABLED_DEFAULT,
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         """
-        Runs local speaker diarization + speech recognition on a 16 kHz mono WAV
-        file and writes the formatted role-split transcript to output_txt_path.
+        Runs local speaker diarization + speech recognition (+ optional GTCRN
+        denoising and local LLM polish) on a 16 kHz mono WAV file and writes
+        the formatted role-split transcript to output_txt_path.
         """
         def update(msg: str):
             if status_cb:
@@ -3425,7 +4229,7 @@ class Transcriber:
         if cancel_token:
             cancel_token.check()
 
-        # 2. Speaker Diarization
+        # 2. Speaker Diarization (always on original voice timbre for clean CAM++ embeddings)
         eff_diar_threads = diar_threads if diar_threads is not None else threads
         update(
             f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, "
@@ -3454,10 +4258,23 @@ class Transcriber:
             f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
         )
 
+        # Optional neural speech denoising before ASR (original timbre stays intact for diarization)
+        asr_samples = (
+            cls._denoise_speech(
+                samples,
+                sample_rate=sample_rate,
+                threads=threads,
+                status_cb=update,
+                cancel_token=cancel_token,
+            )
+            if denoise
+            else samples
+        )
+
         # 3. Speech Recognition
         t_asr = time.time()
         units = cls._run_asr_engine(
-            samples=samples,
+            samples=asr_samples,
             sample_rate=sample_rate,
             profile_id=profile_id,
             profile=profile,
@@ -3475,7 +4292,7 @@ class Transcriber:
         if cancel_token:
             cancel_token.check()
 
-        # 4. Align words/units to speaker roles and write UTF-8 .txt
+        # 4. Align words/units to speaker roles, apply optional Stage 4 LLM polish, write UTF-8 .txt
         turns, final_speaker_count = align_units_to_speakers(
             units,
             diar_segments,
@@ -3484,30 +4301,32 @@ class Transcriber:
             speaker_centroids=speaker_centroids,
             embedding_extractor=emb_extractor,
         )
-        if custom_prompt and custom_prompt.strip():
-            turns = [
-                SpeakerTurn(t.start, t.end, t.speaker_label, apply_custom_glossary_terms(t.text, custom_prompt))
-                for t in turns
-            ]
-        transcript_text = format_transcript_txt(
+        fin = cls._finalize_and_write_transcript(
             turns=turns,
             duration_sec=duration_sec,
             model_name=profile["short_name"],
             num_speakers=final_speaker_count,
+            output_txt_path=output_txt_path,
+            custom_prompt=custom_prompt,
+            llm_polish=llm_polish,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
+            status_cb=update,
+            cancel_token=cancel_token,
         )
-
-        with open(output_txt_path, "w", encoding="utf-8") as f:
-            f.write(transcript_text)
 
         total_elapsed = time.time() - t0
         update(
-            f"[Profile] Транскрипт сохранён ({len(turns)} реплик, спикеров: {final_speaker_count}) "
+            f"[Profile] Транскрипт сохранён ({len(fin['turns'])} реплик, спикеров: {final_speaker_count}) "
             f"за {total_elapsed:.2f}s"
         )
         return {
             "num_speakers": final_speaker_count,
-            "num_turns": len(turns),
+            "num_turns": len(fin["turns"]),
             "elapsed": total_elapsed,
+            "llm_applied": fin["llm_applied"],
+            "raw_transcript_path": fin["raw_transcript_path"],
         }
 
     @classmethod
@@ -3526,6 +4345,11 @@ class Transcriber:
         language: str = DEFAULT_ASR_LANGUAGE,
         custom_prompt: str = "",
         diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+        denoise: bool = DENOISE_ENABLED_DEFAULT,
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         """
         Dual-track OBS / virtual-mixer transcription pipeline:
@@ -3577,9 +4401,14 @@ class Transcriber:
         # Track 1: Deterministic Speaker 1 (Candidate Mic) — no diarization needed!
         t1_turns: list[SpeakerTurn] = []
         if samples1.size >= 1600:
+            asr_samples1 = (
+                cls._denoise_speech(samples1, sample_rate=sr1, threads=threads, status_cb=update, cancel_token=cancel_token)
+                if denoise
+                else samples1
+            )
             update("Дорожка 1 (Спикер 1 / микрофон): распознавание речи без диаризации...")
             t1_units = cls._run_asr_engine(
-                samples=samples1,
+                samples=asr_samples1,
                 sample_rate=sr1,
                 profile_id=profile_id,
                 profile=profile,
@@ -3605,7 +4434,6 @@ class Transcriber:
 
         # Track 2: Diarize interviewers independently (no contamination from Speaker 1!)
         t2_turns: list[SpeakerTurn] = []
-        t2_spk_count = 0
         if samples2.size >= 1600:
             mode_clean = (speaker_count or "auto").strip().lower()
             if mode_clean.isdigit() and int(mode_clean) >= 2:
@@ -3638,8 +4466,13 @@ class Transcriber:
             else:
                 diar_segments2, speaker_centroids2, emb_extractor2 = diar_out, None, None
 
+            asr_samples2 = (
+                cls._denoise_speech(samples2, sample_rate=sr2, threads=threads, status_cb=update, cancel_token=cancel_token)
+                if denoise
+                else samples2
+            )
             t2_units = cls._run_asr_engine(
-                samples=samples2,
+                samples=asr_samples2,
                 sample_rate=sr2,
                 profile_id=profile_id,
                 profile=profile,
@@ -3652,7 +4485,7 @@ class Transcriber:
                 status_cb=update,
                 cancel_token=cancel_token,
             )
-            raw_t2_turns, t2_spk_count = align_units_to_speakers(
+            raw_t2_turns, _ = align_units_to_speakers(
                 t2_units,
                 diar_segments2,
                 samples=samples2,
@@ -3672,38 +4505,40 @@ class Transcriber:
             cancel_token.check()
 
         merged_turns = sorted(t1_turns + t2_turns, key=lambda t: (t.start, t.end))
-        if custom_prompt and custom_prompt.strip():
-            merged_turns = [
-                SpeakerTurn(
-                    t.start, t.end, t.speaker_label, apply_custom_glossary_terms(t.text, custom_prompt)
-                )
-                for t in merged_turns
-            ]
         final_speaker_count = len({t.speaker_label for t in merged_turns})
         track_note = (
             "# Режим дорожек: раздельный (Дорожка 1 = Спикер 1, Дорожка 2 = диаризация собеседников)"
         )
-        transcript_text = format_transcript_txt(
+        fin = cls._finalize_and_write_transcript(
             turns=merged_turns,
             duration_sec=duration_sec,
             model_name=profile["short_name"],
             num_speakers=final_speaker_count,
-            note=track_note,
+            output_txt_path=output_txt_path,
+            custom_prompt=custom_prompt,
+            base_note=track_note,
+            llm_polish=llm_polish,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=llm_api_key,
+            status_cb=update,
+            cancel_token=cancel_token,
         )
-        with open(output_txt_path, "w", encoding="utf-8") as f:
-            f.write(transcript_text)
 
         total_elapsed = time.time() - t0
         update(
-            f"[Profile] Двухдорожечный транскрипт сохранён ({len(merged_turns)} реплик, "
+            f"[Profile] Двухдорожечный транскрипт сохранён ({len(fin['turns'])} реплик, "
             f"спикеров: {final_speaker_count}) за {total_elapsed:.2f}s"
         )
         return {
             "num_speakers": final_speaker_count,
-            "num_turns": len(merged_turns),
+            "num_turns": len(fin["turns"]),
             "elapsed": total_elapsed,
             "dual_track": True,
+            "llm_applied": fin["llm_applied"],
+            "raw_transcript_path": fin["raw_transcript_path"],
         }
+
 
 
 

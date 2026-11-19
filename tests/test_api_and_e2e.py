@@ -83,6 +83,8 @@ def test_cli_arg_parser():
     assert args_default.audio_tracks == "auto"
     assert args_default.prompt == ""
     assert args_default.device == "cpu"
+    assert args_default.denoise is False
+    assert args_default.llm_polish is False
     assert args_default.transcript_output is None
 
     args_custom = parser.parse_args(
@@ -95,7 +97,7 @@ def test_cli_arg_parser():
             "dialog.txt",
             "--no-transcribe",
             "--asr-model",
-            "large-v3-ru",
+            "breeze-asr-25",
             "--language",
             "auto",
             "--speakers",
@@ -108,18 +110,31 @@ def test_cli_arg_parser():
             "REST, gRPC, OAuth 2",
             "--device",
             "cuda",
+            "--denoise",
+            "--llm-polish",
+            "--llm-url",
+            "http://localhost:1234/v1",
+            "--llm-model",
+            "qwen3:14b",
+            "--llm-api-key",
+            "local-key",
             "-w",
             "1",
         ]
     )
     assert args_custom.no_transcribe is True
-    assert args_custom.asr_model == "large-v3-ru"
+    assert args_custom.asr_model == "breeze-asr-25"
     assert args_custom.language == "auto"
     assert args_custom.speakers == "4"
     assert args_custom.sensitivity == "high"
     assert args_custom.audio_tracks == "separate"
     assert args_custom.prompt == "REST, gRPC, OAuth 2"
     assert args_custom.device == "cuda"
+    assert args_custom.denoise is True
+    assert args_custom.llm_polish is True
+    assert args_custom.llm_url == "http://localhost:1234/v1"
+    assert args_custom.llm_model == "qwen3:14b"
+    assert args_custom.llm_api_key == "local-key"
     assert args_custom.transcript_output == "dialog.txt"
     assert args_custom.workers == 1
 
@@ -142,7 +157,21 @@ def test_api_root_and_config():
     assert "audioTracksSelect" in root_resp.text
     assert "customPromptInput" in root_resp.text
     assert "promptPresets" in root_resp.text
+    assert "denoiseToggle" in root_resp.text
+    assert "llmPolishToggle" in root_resp.text
+    assert "llmPresets" in root_resp.text
+    assert "llmBaseUrlInput" in root_resp.text
+    assert "llmModelInput" in root_resp.text
+    assert "llmApiKeyInput" in root_resp.text
+    assert "llmPrivacyHint" in root_resp.text
+    assert "canary-1b-v2" in root_resp.text
+    assert "canary-qwen-2.5b" in root_resp.text
     assert "postCustomPromptInput" in root_resp.text
+    assert "postDenoiseToggle" in root_resp.text
+    assert "postLlmPolishToggle" in root_resp.text
+    assert "postLlmPresets" in root_resp.text
+    assert "postLlmApiKeyInput" in root_resp.text
+    assert "postLlmPrivacyHint" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
     assert "postTranscribeBtn" in root_resp.text
     assert "recordingsSection" in root_resp.text
@@ -152,7 +181,7 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.6.0"
+    assert data["version"] == "5.0.0"
 
     assert data["default_job_mode"] == "anonymize"
     assert [m["id"] for m in data["job_modes"]] == ["anonymize", "transcribe_only"]
@@ -162,9 +191,51 @@ def test_api_root_and_config():
     assert [l["id"] for l in data["languages"]] == ["ru", "auto", "en"]
     assert data["default_compute_device"] == "cpu"
     assert isinstance(data["cuda_available"], bool)
+    assert isinstance(data["ct2_cuda_available"], bool)
+    assert isinstance(data["onnx_cuda_available"], bool)
     assert [d["id"] for d in data["compute_devices"]] == ["cpu", "cuda"]
     model_ids = [m["id"] for m in data["asr_models"]]
-    assert model_ids == ["gigaam-v3", "large-v3-ru", "turbo", "large-v3", "parakeet", "small"]
+    assert model_ids == [
+        "gigaam-v3",
+        "gigaam-v3-ctc",
+        "breeze-asr-25",
+        "canary-1b-v2",
+        "canary-qwen-2.5b",
+        "large-v3-ru",
+        "turbo",
+        "large-v3",
+        "gigaam-v3-int8",
+        "parakeet",
+        "small",
+    ]
+    giga_meta = next(m for m in data["asr_models"] if m["id"] == "gigaam-v3")
+    assert giga_meta["engine"] == "onnx_asr"
+    assert giga_meta["supports_cuda"] is True
+    breeze_meta = next(m for m in data["asr_models"] if m["id"] == "breeze-asr-25")
+    assert breeze_meta["engine"] == "faster_whisper"
+    assert breeze_meta["supports_cuda"] is True
+    canary_meta = next(m for m in data["asr_models"] if m["id"] == "canary-1b-v2")
+    assert canary_meta["engine"] == "onnx_asr"
+    assert canary_meta["supports_cuda"] is True
+    cq_meta = next(m for m in data["asr_models"] if m["id"] == "canary-qwen-2.5b")
+    assert cq_meta["engine"] == "onnx_canary_qwen"
+    assert cq_meta["supports_cuda"] is False
+    assert cq_meta["fixed_language"] == "en"
+    assert data["denoise_default"] is False
+    assert data["llm_polish_default"] is False
+    assert "base_url" in data["llm_defaults"]
+    assert "model" in data["llm_defaults"]
+    assert "api_key" not in data["llm_defaults"]
+    llm_preset_ids = [p["id"] for p in data["llm_presets"]]
+    assert llm_preset_ids == ["ollama_local", "lmstudio_local", "deepseek_cloud", "qwen_cloud"]
+    ds_preset = next(p for p in data["llm_presets"] if p["id"] == "deepseek_cloud")
+    assert ds_preset["base_url"] == "https://api.deepseek.com/v1"
+    assert ds_preset["model"] == "deepseek-chat"
+    assert ds_preset["is_cloud"] is True
+    qw_preset = next(p for p in data["llm_presets"] if p["id"] == "qwen_cloud")
+    assert qw_preset["base_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert qw_preset["model"] == "qwen-plus"
+    assert qw_preset["is_cloud"] is True
     assert data["speaker_options"] == ["auto", "2", "3", "4", "5", "6", "4+"]
     assert data["default_diarization_sensitivity"] == "normal"
     assert [s["id"] for s in data["diarization_sensitivities"]] == ["normal", "high", "low"]
@@ -246,6 +317,27 @@ def test_api_upload_validation_errors():
         data={"transcribe": "maybe"},
     )
     assert r_bool.status_code == 400
+
+    r_denoise = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"denoise": "maybe"},
+    )
+    assert r_denoise.status_code == 400
+
+    r_llm_bool = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"llm_polish": "maybe"},
+    )
+    assert r_llm_bool.status_code == 400
+
+    r_llm_url = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"llm_base_url": "ftp://evil.local/v1"},
+    )
+    assert r_llm_url.status_code == 400
 
 
 def test_extract_transcription_audio_16k_mono(tmp_path):
@@ -352,6 +444,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         cancel_token=None,
         language: str = "ru",
         custom_prompt: str = "",
+        **kwargs,
     ):
         events.append(("gpu_asr", compute_device, threads))
         if status_cb:
@@ -376,6 +469,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         cancel_token=None,
         diarization_sensitivity: str = "normal",
         custom_prompt: str = "",
+        **kwargs,
     ):
         events.append(("cpu_diarize", speaker_count, threads))
         if status_cb:
@@ -608,6 +702,7 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         language: str = "ru",
         custom_prompt: str = "",
         diarization_sensitivity: str = "normal",
+        **kwargs,
     ):
         assert os.path.isfile(wav_path)
         turns = [
@@ -1271,6 +1366,7 @@ def test_post_recording_separate_transcription_cache_fallback_and_recordings_api
         language: str = "ru",
         custom_prompt: str = "",
         diarization_sensitivity: str = "normal",
+        **kwargs,
     ):
         calls.append({"wav_path": wav_path, "asr_model": asr_model, "language": language, "speakers": speaker_count})
         turns = [SpeakerTurn(0.1, 1.2, "Спикер 1", f"Модель {asr_model} ({language})")]
@@ -1499,6 +1595,7 @@ def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, m
         language: str = "ru",
         custom_prompt: str = "",
         diarization_sensitivity: str = "normal",
+        **kwargs,
     ):
         seen_models.append((asr_model, language))
         turns = [SpeakerTurn(0.0, 1.0, "Спикер 1", "Тест только транскрибации.")]
@@ -2152,6 +2249,7 @@ def test_dual_track_obs_mp4_automatic_split_and_mix_e2e(tmp_path, monkeypatch):
         language: str = "ru",
         custom_prompt: str = "",
         diarization_sensitivity: str = "normal",
+        **kwargs,
     ):
         assert os.path.isfile(track1_wav_path)
         assert os.path.isfile(track2_wav_path)
@@ -2195,6 +2293,7 @@ def test_dual_track_obs_mp4_automatic_split_and_mix_e2e(tmp_path, monkeypatch):
         language: str = "ru",
         custom_prompt: str = "",
         diarization_sensitivity: str = "normal",
+        **kwargs,
     ):
         assert os.path.isfile(wav_path)
         single_calls.append({"wav": wav_path, "prompt": custom_prompt, "sensitivity": diarization_sensitivity})
@@ -2721,6 +2820,811 @@ vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
     )
     assert proc.returncode == 0, f"Node v4.6 UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "FRONTEND_V46_GLOSSARY_SENSITIVITY_TRACKS_OK" in proc.stdout
+
+
+def test_orchestrator_parallel_gpu_mode_for_onnx_asr_gigaam_v3(tmp_path, monkeypatch):
+    import numpy as np
+    import src.transcriber as tr_mod
+    from app import _audio_cache_path
+    from src.transcriber import TimedUnit
+
+    in_mp4 = str(tmp_path / "gigaam_gpu_input.mp4")
+    out_mp4 = str(tmp_path / "gigaam_gpu_output.mp4")
+    out_txt = str(tmp_path / "gigaam_gpu_transcript.txt")
+    _generate_test_mp4(in_mp4, duration_sec=1.6, with_audio=True)
+
+    phase_a_calls = []
+    phase_b_calls = []
+
+    def _mock_units_only(cls, wav_path, asr_model="gigaam-v3", compute_device="cuda", denoise=False, **kwargs):
+        phase_a_calls.append({"asr_model": asr_model, "compute_device": compute_device, "denoise": denoise})
+        return {
+            "samples": np.ones(16000, dtype=np.float32) * 0.1,
+            "sample_rate": 16000,
+            "duration_sec": 1.6,
+            "units": [TimedUnit(0.1, 1.0, " GigaAM GPU OK")],
+            "profile_id": asr_model,
+            "custom_prompt": kwargs.get("custom_prompt", ""),
+            "elapsed_asr": 0.01,
+        }
+
+    def _mock_diar_write(
+        cls,
+        asr_state,
+        output_txt_path,
+        llm_polish=False,
+        llm_base_url="",
+        llm_model="",
+        **kwargs,
+    ):
+        phase_b_calls.append(
+            {
+                "profile_id": asr_state["profile_id"],
+                "llm_polish": llm_polish,
+                "llm_base_url": llm_base_url,
+                "llm_model": llm_model,
+            }
+        )
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write("[00:00:00 - 00:00:01] Спикер 1: GigaAM GPU OK\n")
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.02, "llm_applied": llm_polish}
+
+    # Even when CTranslate2 CUDA is False, ONNX CUDA True MUST activate parallel GPU mode for gigaam-v3!
+    monkeypatch.setattr(tr_mod, "probe_cuda_available", lambda: False)
+    monkeypatch.setattr(tr_mod, "probe_onnx_cuda_available", lambda: True)
+    monkeypatch.setattr(Transcriber, "transcribe_units_only", classmethod(_mock_units_only))
+    monkeypatch.setattr(Transcriber, "diarize_and_write_transcript", classmethod(_mock_diar_write))
+
+    iom = IOManager()
+    job_dir = iom.create_job_dir()
+    try:
+        res = Orchestrator.process_video_job(
+            input_path=in_mp4,
+            output_path=out_mp4,
+            job_dir=job_dir,
+            worker_count=1,
+            transcribe=True,
+            transcript_path=out_txt,
+            asr_model="gigaam-v3",
+            compute_device="cuda",
+            denoise=True,
+            llm_polish=True,
+            llm_base_url="http://localhost:11434/v1",
+            llm_model="qwen3:8b",
+        )
+        assert res["video_ready"] is True
+        assert res["transcript_ready"] is True
+        assert phase_a_calls == [{"asr_model": "gigaam-v3", "compute_device": "cuda", "denoise": True}]
+        assert phase_b_calls == [
+            {
+                "profile_id": "gigaam-v3",
+                "llm_polish": True,
+                "llm_base_url": "http://localhost:11434/v1",
+                "llm_model": "qwen3:8b",
+            }
+        ]
+    finally:
+        iom.cleanup_job_dir(job_dir)
+
+    # Also verify API transcribe_only forwards denoise, llm_polish, & cloud llm_api_key (never leaked!) AND preserves staged *_raw.txt backup!
+    api_calls = []
+    secret_api_key = "sk-deepseek-secret-never-leak-777"
+
+    def _mock_tr_with_raw_backup(cls, wav_path, output_txt_path, **kwargs):
+        api_calls.append(
+            {
+                "asr_model": kwargs.get("asr_model"),
+                "denoise": kwargs.get("denoise"),
+                "llm_polish": kwargs.get("llm_polish"),
+                "llm_base_url": kwargs.get("llm_base_url"),
+                "llm_model": kwargs.get("llm_model"),
+                "llm_api_key": kwargs.get("llm_api_key"),
+            }
+        )
+        raw_p = os.path.splitext(output_txt_path)[0] + "_raw.txt"
+        with open(raw_p, "w", encoding="utf-8") as rf:
+            rf.write("RAW_PRE_LLM_BACKUP\n")
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write("POLISHED_FINAL_TRANSCRIPT\n")
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01, "llm_applied": True, "raw_transcript_path": raw_p}
+
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_tr_with_raw_backup))
+
+    client = TestClient(app)
+    tid = None
+    try:
+        with open(in_mp4, "rb") as f:
+            resp = client.post(
+                "/api/upload",
+                files={"file": ("v50_test.mp4", f, "video/mp4")},
+                data={
+                    "mode": "transcribe_only",
+                    "workers": "1",
+                    "asr_model": "canary-1b-v2",
+                    "denoise": "true",
+                    "llm_polish": "true",
+                    "llm_base_url": "https://api.deepseek.com/v1",
+                    "llm_model": "deepseek-chat",
+                    "llm_api_key": secret_api_key,
+                },
+            )
+        assert resp.status_code == 200
+        assert secret_api_key not in resp.text
+        body = resp.json()
+        tid = body["task_id"]
+        assert body["asr_model"] == "canary-1b-v2"
+        assert body["denoise"] is True
+        assert body["llm_polish"] is True
+        assert body["llm_base_url"] == "https://api.deepseek.com/v1"
+        assert body["llm_model"] == "deepseek-chat"
+        assert "llm_api_key" not in body
+
+        st_resp = client.get(f"/api/status/{tid}")
+        assert secret_api_key not in st_resp.text
+        st = st_resp.json()
+        assert st["status"] == "completed"
+        assert "llm_api_key" not in tasks[tid]
+        assert secret_api_key not in str(tasks[tid])
+        assert api_calls == [
+            {
+                "asr_model": "canary-1b-v2",
+                "denoise": True,
+                "llm_polish": True,
+                "llm_base_url": "https://api.deepseek.com/v1",
+                "llm_model": "deepseek-chat",
+                "llm_api_key": secret_api_key,
+            }
+        ]
+        raw_out = os.path.join("output", f"{tid}_transcript_raw.txt")
+        final_out = os.path.join("output", f"{tid}_transcript.txt")
+        assert os.path.isfile(final_out)
+        assert os.path.isfile(raw_out)
+        assert open(raw_out, encoding="utf-8").read().strip() == "RAW_PRE_LLM_BACKUP"
+        assert open(final_out, encoding="utf-8").read().strip() == "POLISHED_FINAL_TRANSCRIPT"
+    finally:
+        if tid:
+            tasks.pop(tid, None)
+            for p in (
+                os.path.join("output", f"{tid}_transcript.txt"),
+                os.path.join("output", f"{tid}_transcript_raw.txt"),
+                _audio_cache_path(tid),
+            ):
+                if os.path.exists(p):
+                    os.remove(p)
+
+
+def test_frontend_v50_gpu_gigaam_denoise_and_llm_polish_controls():
+    """
+    Executes static/script.js in Node.js to verify v5.0.0 frontend features:
+      1. When onnx_cuda_available=true, selecting GPU (CUDA) keeps gigaam-v3 (FP32) and canary-1b-v2 selected.
+      2. Selecting CPU-only gigaam-v3-int8 and switching to GPU (CUDA) auto-upgrades to gigaam-v3.
+      3. When onnx_cuda_available=false and ct2_cuda_available=true, GPU (CUDA) switches gigaam-v3 -> breeze-asr-25.
+      4. denoiseToggle & llmPolishToggle default OFF; enabling llmPolishToggle reveals #llmConfigWrap,
+         clicking DeepSeek API / Qwen Cloud preset chips fills URL + model & flips #llmPrivacyHint to .is-cloud,
+         API key stays ONLY in sessionStorage (never localStorage), and both /api/upload and /api/transcribe/{tid}
+         submit denoise, llm_polish, llm_base_url, llm_model, and llm_api_key.
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
+    const storage = new Map();
+    const localStorage = {
+        getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+        setItem: (k, v) => storage.set(k, String(v)),
+    };
+    const sessStorage = new Map();
+    const sessionStorage = {
+        getItem: (k) => (sessStorage.has(k) ? sessStorage.get(k) : null),
+        setItem: (k, v) => sessStorage.set(k, String(v)),
+        removeItem: (k) => sessStorage.delete(k),
+    };
+
+    class ClassList {
+        constructor(el, initial = []) { this.el = el; this.set = new Set(initial.filter(Boolean)); }
+        add(...cls) { cls.forEach((c) => this.set.add(c)); }
+        remove(...cls) { cls.forEach((c) => this.set.delete(c)); }
+        contains(c) { return this.set.has(c); }
+        toggle(c, force) {
+            const next = force !== undefined ? Boolean(force) : !this.set.has(c);
+            if (next) this.set.add(c); else this.set.delete(c);
+            return next;
+        }
+    }
+
+    class FakeEvent {
+        constructor(type, opts = {}) {
+            this.type = type;
+            this.bubbles = Boolean(opts.bubbles);
+            this.defaultPrevented = false;
+            this.propagationStopped = false;
+        }
+        preventDefault() { this.defaultPrevented = true; }
+        stopPropagation() { this.propagationStopped = true; }
+    }
+
+    const byId = new Map();
+    let activeElement = null;
+
+    class FakeElement {
+        constructor(tagName, { id = '', classes = [], attrs = {}, dataset = {}, text = '' } = {}) {
+            this.tagName = tagName.toUpperCase();
+            this.id = id;
+            if (id) byId.set(id, this);
+            this.classList = new ClassList(this, classes);
+            this.attrs = { ...attrs };
+            this.dataset = { ...dataset };
+            this.children = [];
+            this.parentNode = null;
+            this.listeners = {};
+            this._textContent = text;
+            this._innerHTML = '';
+            this.disabled = false;
+            this.checked = Boolean(attrs.checked);
+            this.title = '';
+            this.accept = attrs.accept || '';
+            this.tabIndex = 0;
+            this.scrollTop = 0;
+            this.scrollHeight = 100;
+            this.files = [];
+            this._value = attrs.value !== undefined ? String(attrs.value) : '';
+            this.selected = Boolean(attrs.selected);
+            this.onclick = null;
+        }
+        get className() { return Array.from(this.classList.set).join(' '); }
+        set className(v) { this.classList = new ClassList(this, String(v).split(/\s+/)); }
+        get textContent() {
+            if (this.children.length === 0) return this._textContent;
+            return this._textContent + this.children.map((c) => c.textContent).join('');
+        }
+        set textContent(v) { this._textContent = String(v); this.children = []; }
+        get innerHTML() { return this._innerHTML; }
+        set innerHTML(v) {
+            this._innerHTML = String(v);
+            if (v === '') {
+                this.children.forEach((c) => { c.parentNode = null; });
+                this.children = [];
+            }
+        }
+        get options() { return this.children.filter((c) => c.tagName === 'OPTION'); }
+        get selectedIndex() {
+            const opts = this.options;
+            const idx = opts.findIndex((o) => o.value === this.value);
+            return idx >= 0 ? idx : 0;
+        }
+        get value() {
+            if (this.tagName === 'SELECT') {
+                const opts = this.options;
+                if (this._value && opts.some((o) => o.value === this._value)) return this._value;
+                const sel = opts.find((o) => o.selected) || opts[0];
+                return sel ? sel.value : '';
+            }
+            return this._value;
+        }
+        set value(v) { this._value = String(v); }
+        setAttribute(k, v) { this.attrs[k] = String(v); }
+        getAttribute(k) { return this.attrs[k] ?? null; }
+        appendChild(child) {
+            if (child.parentNode) {
+                const idx = child.parentNode.children.indexOf(child);
+                if (idx >= 0) child.parentNode.children.splice(idx, 1);
+            }
+            child.parentNode = this;
+            this.children.push(child);
+            return child;
+        }
+        insertBefore(newNode, refNode) {
+            if (newNode.parentNode) {
+                const oldIdx = newNode.parentNode.children.indexOf(newNode);
+                if (oldIdx >= 0) newNode.parentNode.children.splice(oldIdx, 1);
+            }
+            newNode.parentNode = this;
+            const idx = this.children.indexOf(refNode);
+            if (idx >= 0) this.children.splice(idx, 0, newNode);
+            else this.children.push(newNode);
+            return newNode;
+        }
+        addEventListener(type, fn) {
+            if (!this.listeners[type]) this.listeners[type] = [];
+            this.listeners[type].push(fn);
+        }
+        dispatchEvent(evt) {
+            (this.listeners[evt.type] || []).forEach((fn) => fn.call(this, evt));
+            if (evt.type === 'click' && typeof this.onclick === 'function') this.onclick.call(this, evt);
+            if (evt.bubbles && !evt.propagationStopped) {
+                if (this.parentNode) this.parentNode.dispatchEvent(evt);
+                else documentObj.dispatchEvent(evt);
+            }
+            return !evt.defaultPrevented;
+        }
+        click() { this.dispatchEvent(new FakeEvent('click', { bubbles: true })); }
+        focus() { activeElement = this; }
+        matchesSelector(sel) {
+            if (sel === '.sun-icon') return this.classList.contains('sun-icon');
+            if (sel === '.moon-icon') return this.classList.contains('moon-icon');
+            if (sel === '.prompt-chip') return this.classList.contains('prompt-chip');
+            if (sel === '[data-llm-preset]') {
+                return Boolean((this.dataset && this.dataset.llmPreset) || this.attrs['data-llm-preset']);
+            }
+            const lm = sel.match(/^label\[for="(.+)"\]$/);
+            if (lm) return this.tagName === 'LABEL' && this.attrs.for === lm[1];
+            if (sel === '.clay-select-option:not(:disabled)') return this.classList.contains('clay-select-option') && !this.disabled;
+            if (sel === '.clay-select-option.is-selected:not(:disabled)') {
+                return this.classList.contains('clay-select-option') && this.classList.contains('is-selected') && !this.disabled;
+            }
+            return false;
+        }
+        querySelectorAll(sel) {
+            const out = [];
+            const walk = (n) => { n.children.forEach((ch) => { if (ch.matchesSelector(sel)) out.push(ch); walk(ch); }); };
+            walk(this);
+            return out;
+        }
+        querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+    }
+
+    const root = new FakeElement('div', { id: 'root' });
+    const makeSelect = (id, opts) => {
+        const container = new FakeElement('div');
+        const sel = new FakeElement('select', { id, classes: ['worker-select'] });
+        opts.forEach(([val, text, selected]) => sel.appendChild(new FakeElement('option', { attrs: { value: val, selected }, text })));
+        container.appendChild(sel);
+        root.appendChild(container);
+        return sel;
+    };
+    const makeLlmPresets = (containerId) => {
+        const wrap = new FakeElement('div', { id: containerId, classes: ['prompt-presets'] });
+        const btns = {};
+        ['ollama_local', 'lmstudio_local', 'deepseek_cloud', 'qwen_cloud'].forEach((pid) => {
+            const b = new FakeElement('button', {
+                classes: ['prompt-chip'],
+                attrs: { 'data-llm-preset': pid },
+                dataset: { llmPreset: pid },
+                text: pid,
+            });
+            wrap.appendChild(b);
+            btns[pid] = b;
+        });
+        return { wrap, btns };
+    };
+
+    const themeBtn = root.appendChild(new FakeElement('button', { id: 'themeToggle' }));
+    themeBtn.appendChild(new FakeElement('svg', { classes: ['sun-icon', 'hidden'] }));
+    themeBtn.appendChild(new FakeElement('svg', { classes: ['moon-icon', 'hidden'] }));
+
+    const uploadPanel = root.appendChild(new FakeElement('div', { id: 'uploadPanel' }));
+    uploadPanel.appendChild(new FakeElement('button', { id: 'modeAnonymizeBtn', classes: ['mode-tab', 'is-active'] }));
+    uploadPanel.appendChild(new FakeElement('button', { id: 'modeTranscribeOnlyBtn', classes: ['mode-tab'] }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'dropZone' }));
+    uploadPanel.appendChild(new FakeElement('h2', { id: 'dropZoneTitle' }));
+    uploadPanel.appendChild(new FakeElement('p', { id: 'dropZoneHint' }));
+    const fileInput = uploadPanel.appendChild(new FakeElement('input', { id: 'fileInput', attrs: { accept: '.mp4' } }));
+    uploadPanel.appendChild(new FakeElement('span', { id: 'workerValue', text: '4' }));
+    makeSelect('workerSelect', [['1', '1'], ['4', '4', true], ['custom', 'Другое']]);
+    uploadPanel.appendChild(new FakeElement('div', { id: 'customWorkerWrap', classes: ['hidden'] }));
+    uploadPanel.appendChild(new FakeElement('input', { id: 'customWorkerInput' }));
+    uploadPanel.appendChild(new FakeElement('p', { id: 'workerLimitText' }));
+    uploadPanel.appendChild(new FakeElement('input', { id: 'transcribeToggle', attrs: { checked: true } }));
+    uploadPanel.appendChild(new FakeElement('label', { id: 'transcribeSwitchWrap' }));
+    uploadPanel.appendChild(new FakeElement('span', { id: 'transcribeStateBadge', text: 'Вкл' }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
+    const transcribeHintText = uploadPanel.appendChild(new FakeElement('p', { id: 'transcribeHintText' }));
+
+    const modelOpts = [
+        ['gigaam-v3', 'GigaAM v3 FP32', true],
+        ['gigaam-v3-ctc', 'GigaAM v3 CTC FP32'],
+        ['breeze-asr-25', 'Breeze-ASR-25'],
+        ['canary-1b-v2', 'Canary 1B v2'],
+        ['canary-qwen-2.5b', 'Canary-Qwen 2.5B'],
+        ['large-v3-ru', 'Whisper Large v3 RU'],
+        ['gigaam-v3-int8', 'GigaAM v3 INT8'],
+    ];
+    const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто'], ['en', 'English (EN)']];
+    const devOpts = [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']];
+    const spkOpts = [['auto', 'Авто', true], ['2', '2']];
+    const sensOpts = [['normal', 'Обычная', true], ['high', 'Высокая']];
+    const trackOpts = [['auto', 'Авто', true], ['separate', 'Раздельно']];
+
+    const asrModelSelect = makeSelect('asrModelSelect', modelOpts);
+    makeSelect('languageSelect', langOpts);
+    const computeDeviceSelect = makeSelect('computeDeviceSelect', devOpts);
+    makeSelect('speakerCountSelect', spkOpts);
+    makeSelect('diarizationSensitivitySelect', sensOpts);
+    makeSelect('audioTracksSelect', trackOpts);
+    uploadPanel.appendChild(new FakeElement('textarea', { id: 'customPromptInput' }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'promptPresets' }));
+    const denoiseToggle = uploadPanel.appendChild(new FakeElement('input', { id: 'denoiseToggle' }));
+    const llmPolishToggle = uploadPanel.appendChild(new FakeElement('input', { id: 'llmPolishToggle' }));
+    const llmConfigWrap = uploadPanel.appendChild(new FakeElement('div', { id: 'llmConfigWrap', classes: ['hidden'] }));
+    const mainLlmPresets = makeLlmPresets('llmPresets');
+    llmConfigWrap.appendChild(mainLlmPresets.wrap);
+    const llmBaseUrlInput = llmConfigWrap.appendChild(new FakeElement('input', { id: 'llmBaseUrlInput' }));
+    const llmModelInput = llmConfigWrap.appendChild(new FakeElement('input', { id: 'llmModelInput' }));
+    const llmApiKeyInput = llmConfigWrap.appendChild(new FakeElement('input', { id: 'llmApiKeyInput' }));
+    const llmPrivacyHint = llmConfigWrap.appendChild(new FakeElement('p', { id: 'llmPrivacyHint' }));
+
+    uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsSection', classes: ['hidden'] }));
+    uploadPanel.appendChild(new FakeElement('span', { id: 'recordingsCount' }));
+    uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsList' }));
+
+    const statusPanel = root.appendChild(new FakeElement('div', { id: 'statusPanel', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'spinner' }));
+    statusPanel.appendChild(new FakeElement('svg', { id: 'successIcon', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('svg', { id: 'cancelIcon', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('h2', { id: 'statusText' }));
+    statusPanel.appendChild(new FakeElement('p', { id: 'statusSubText' }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'debugLog', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'cancelBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'downloadBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'downloadTranscriptBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeSection', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'togglePostTranscribeBtn', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeForm', classes: ['hidden'] }));
+    statusPanel.appendChild(new FakeElement('span', { id: 'postTranscribeTitle' }));
+    makeSelect('postAsrModelSelect', modelOpts);
+    makeSelect('postLanguageSelect', langOpts);
+    makeSelect('postComputeDeviceSelect', devOpts);
+    makeSelect('postSpeakerCountSelect', spkOpts);
+    makeSelect('postDiarizationSensitivitySelect', sensOpts);
+    makeSelect('postAudioTracksSelect', trackOpts);
+    statusPanel.appendChild(new FakeElement('textarea', { id: 'postCustomPromptInput' }));
+    statusPanel.appendChild(new FakeElement('div', { id: 'postPromptPresets' }));
+    const postDenoiseToggle = statusPanel.appendChild(new FakeElement('input', { id: 'postDenoiseToggle' }));
+    const postLlmPolishToggle = statusPanel.appendChild(new FakeElement('input', { id: 'postLlmPolishToggle' }));
+    const postLlmConfigWrap = statusPanel.appendChild(new FakeElement('div', { id: 'postLlmConfigWrap', classes: ['hidden'] }));
+    const postLlmPresets = makeLlmPresets('postLlmPresets');
+    postLlmConfigWrap.appendChild(postLlmPresets.wrap);
+    const postLlmBaseUrlInput = postLlmConfigWrap.appendChild(new FakeElement('input', { id: 'postLlmBaseUrlInput' }));
+    const postLlmModelInput = postLlmConfigWrap.appendChild(new FakeElement('input', { id: 'postLlmModelInput' }));
+    const postLlmApiKeyInput = postLlmConfigWrap.appendChild(new FakeElement('input', { id: 'postLlmApiKeyInput' }));
+    const postLlmPrivacyHint = postLlmConfigWrap.appendChild(new FakeElement('p', { id: 'postLlmPrivacyHint' }));
+    statusPanel.appendChild(new FakeElement('p', { id: 'postAudioSourceHint' }));
+    const postTranscribeBtn = statusPanel.appendChild(new FakeElement('button', { id: 'postTranscribeBtn' }));
+    statusPanel.appendChild(new FakeElement('button', { id: 'resetBtn', classes: ['hidden'] }));
+
+    const docListeners = {};
+    const documentObj = {
+        documentElement: new FakeElement('html'),
+        get activeElement() { return activeElement; },
+        getElementById: (id) => byId.get(id) || null,
+        querySelector: (sel) => root.querySelector(sel),
+        querySelectorAll: (sel) => root.querySelectorAll(sel),
+        createElement: (tag) => new FakeElement(tag),
+        createElementNS: (_ns, tag) => new FakeElement(tag),
+        addEventListener: (t, fn) => { (docListeners[t] ||= []).push(fn); },
+        dispatchEvent: (evt) => { (docListeners[evt.type] || []).forEach((fn) => fn(evt)); },
+    };
+
+    class FakeFormData {
+        constructor() { this.entries = {}; }
+        append(k, v) { this.entries[k] = v; }
+    }
+
+    const uploadCalls = [];
+    const postCalls = [];
+    const fakeFetch = async (url, opts = {}) => {
+        if (url === '/api/config') {
+            return {
+                ok: true,
+                json: async () => ({
+                    version: '5.0.0',
+                    cpu_count: 8,
+                    default_workers: 4,
+                    max_workers: 7,
+                    transcription_default: true,
+                    default_asr_model: 'gigaam-v3',
+                    default_language: 'ru',
+                    asr_models: [
+                        { id: 'gigaam-v3', label: 'GigaAM v3 FP32', engine: 'onnx_asr', supports_cuda: true },
+                        { id: 'gigaam-v3-ctc', label: 'GigaAM v3 CTC FP32', engine: 'onnx_asr', supports_cuda: true },
+                        { id: 'breeze-asr-25', label: 'Breeze-ASR-25', engine: 'faster_whisper', supports_cuda: true },
+                        { id: 'canary-1b-v2', label: 'Canary 1B v2', engine: 'onnx_asr', supports_cuda: true },
+                        { id: 'canary-qwen-2.5b', label: 'Canary-Qwen 2.5B', engine: 'onnx_canary_qwen', supports_cuda: false, fixed_language: 'en' },
+                        { id: 'large-v3-ru', label: 'Whisper Large v3 RU', engine: 'faster_whisper', supports_cuda: true },
+                        { id: 'gigaam-v3-int8', label: 'GigaAM v3 INT8', engine: 'onnx_asr', supports_cuda: false },
+                    ],
+                    cuda_available: Boolean(ct2CudaAvailable || onnxCudaAvailable),
+                    ct2_cuda_available: ct2CudaAvailable,
+                    onnx_cuda_available: onnxCudaAvailable,
+                    default_compute_device: 'cpu',
+                    compute_devices: [{ id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU (CUDA)' }],
+                    denoise_default: false,
+                    llm_polish_default: false,
+                    llm_defaults: { base_url: 'http://localhost:11434/v1', model: 'qwen3:8b' },
+                    llm_presets: [
+                        { id: 'ollama_local', base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
+                        { id: 'lmstudio_local', base_url: 'http://localhost:1234/v1', model: 'qwen3-8b', is_cloud: false },
+                        { id: 'deepseek_cloud', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', is_cloud: true },
+                        { id: 'qwen_cloud', base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', is_cloud: true },
+                    ],
+                }),
+            };
+        }
+        if (url === '/api/recordings') return { ok: true, json: async () => ({ recordings: [] }) };
+        if (url === '/api/upload') {
+            uploadCalls.push({ ...opts.body.entries });
+            return { ok: true, json: async () => ({ task_id: 'v50-task', status: 'queued', worker_count: 4 }) };
+        }
+        if (url === '/api/status/v50-task') {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: 'completed',
+                    mode: 'anonymize',
+                    video_ready: true,
+                    transcript_ready: true,
+                    can_transcribe: true,
+                    has_original_audio: true,
+                    asr_model: uploadCalls[0].asr_model,
+                    compute_device: uploadCalls[0].compute_device,
+                    denoise: uploadCalls[0].denoise === 'true',
+                    llm_polish: uploadCalls[0].llm_polish === 'true',
+                    llm_base_url: uploadCalls[0].llm_base_url,
+                    llm_model: uploadCalls[0].llm_model,
+                    logs: ['Done!'],
+                }),
+            };
+        }
+        if (url === '/api/transcribe/v50-task') {
+            postCalls.push({ ...opts.body.entries });
+            return { ok: true, json: async () => ({ task_id: 'v50-task', status: 'queued' }) };
+        }
+        throw new Error('Unexpected URL: ' + url);
+    };
+
+    const ctx = vm.createContext({
+        document: documentObj,
+        window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+        localStorage,
+        sessionStorage,
+        Event: FakeEvent,
+        FormData: FakeFormData,
+        AbortController: class { constructor() { this.signal = {}; } abort() {} },
+        fetch: fakeFetch,
+        setInterval: () => 1,
+        clearInterval: () => {},
+        alert: (m) => { throw new Error('Unexpected alert: ' + m); },
+        console,
+        Number, String, Boolean, Array, Map, Set, Date,
+    });
+    vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
+    return {
+        ctx, storage, sessStorage, asrModelSelect, computeDeviceSelect, fileInput, transcribeHintText,
+        denoiseToggle, llmPolishToggle, llmConfigWrap, mainLlmPresets, llmBaseUrlInput, llmModelInput, llmApiKeyInput, llmPrivacyHint,
+        postDenoiseToggle, postLlmPolishToggle, postLlmConfigWrap, postLlmPresets, postLlmBaseUrlInput, postLlmModelInput, postLlmApiKeyInput, postLlmPrivacyHint,
+        postTranscribeBtn, uploadCalls, postCalls,
+    };
+}
+
+(async () => {
+    // Scenario A: Full GPU build (both ONNX CUDA + CTranslate2 CUDA available)
+    const a = createHarness({ onnxCudaAvailable: true, ct2CudaAvailable: true });
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Defaults OFF and privacy hint starts in local mode
+    assert.strictEqual(a.denoiseToggle.checked, false);
+    assert.strictEqual(a.llmPolishToggle.checked, false);
+    assert.strictEqual(a.llmConfigWrap.classList.contains('hidden'), true);
+    assert.strictEqual(a.llmPrivacyHint.classList.contains('is-cloud'), false);
+
+    // Switching to GPU (CUDA) keeps gigaam-v3 (FP32) AND canary-1b-v2 selected!
+    a.computeDeviceSelect.value = 'cuda';
+    a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.asrModelSelect.value, 'gigaam-v3');
+    assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
+
+    a.asrModelSelect.value = 'canary-1b-v2';
+    a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.asrModelSelect.value, 'canary-1b-v2');
+    assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
+
+    // Selecting CPU-only English-only canary-qwen-2.5b -> switches to CPU + warns when language is RU; GPU upgrades to canary-1b-v2
+    a.asrModelSelect.value = 'canary-qwen-2.5b';
+    a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.computeDeviceSelect.value, 'cpu');
+    assert.ok(a.transcribeHintText.textContent.includes('ТОЛЬКО на английском'));
+    a.computeDeviceSelect.value = 'cuda';
+    a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.asrModelSelect.value, 'canary-1b-v2');
+    assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
+
+    // Selecting CPU-only gigaam-v3-int8 -> switches to CPU; switching back to GPU upgrades to gigaam-v3!
+    a.asrModelSelect.value = 'gigaam-v3-int8';
+    a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.computeDeviceSelect.value, 'cpu');
+    a.computeDeviceSelect.value = 'cuda';
+    a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.asrModelSelect.value, 'gigaam-v3');
+    assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
+
+    // Enable GTCRN denoise + Cloud DeepSeek LLM polish via preset chip + API key
+    a.denoiseToggle.checked = true;
+    a.denoiseToggle.dispatchEvent(new a.ctx.Event('change'));
+    a.llmPolishToggle.checked = true;
+    a.llmPolishToggle.dispatchEvent(new a.ctx.Event('change'));
+    assert.strictEqual(a.llmConfigWrap.classList.contains('hidden'), false);
+    a.mainLlmPresets.btns.deepseek_cloud.click();
+    assert.strictEqual(a.llmBaseUrlInput.value, 'https://api.deepseek.com/v1');
+    assert.strictEqual(a.llmModelInput.value, 'deepseek-chat');
+    assert.strictEqual(a.llmPrivacyHint.classList.contains('is-cloud'), true);
+    assert.ok(a.llmPrivacyHint.textContent.includes('облачный API'));
+
+    a.llmApiKeyInput.value = 'sk-deepseek-ui-secret';
+    a.llmApiKeyInput.dispatchEvent(new a.ctx.Event('input'));
+    assert.strictEqual(a.sessStorage.get('selectedLlmApiKey'), 'sk-deepseek-ui-secret');
+    assert.strictEqual(a.storage.has('selectedLlmApiKey'), false, 'API key must NEVER be saved in localStorage');
+
+    a.fileInput.files = [{ name: 'interview.mp4' }];
+    a.fileInput.dispatchEvent(new a.ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 25));
+
+    assert.strictEqual(a.uploadCalls.length, 1);
+    assert.strictEqual(a.uploadCalls[0].asr_model, 'gigaam-v3');
+    assert.strictEqual(a.uploadCalls[0].compute_device, 'cuda');
+    assert.strictEqual(a.uploadCalls[0].denoise, 'true');
+    assert.strictEqual(a.uploadCalls[0].llm_polish, 'true');
+    assert.strictEqual(a.uploadCalls[0].llm_base_url, 'https://api.deepseek.com/v1');
+    assert.strictEqual(a.uploadCalls[0].llm_model, 'deepseek-chat');
+    assert.strictEqual(a.uploadCalls[0].llm_api_key, 'sk-deepseek-ui-secret');
+
+    // Post-transcribe form inherited controls + API key; switching to Qwen Cloud preset updates URL/model & submits
+    assert.strictEqual(a.postDenoiseToggle.checked, true);
+    assert.strictEqual(a.postLlmPolishToggle.checked, true);
+    assert.strictEqual(a.postLlmConfigWrap.classList.contains('hidden'), false);
+    assert.strictEqual(a.postLlmApiKeyInput.value, 'sk-deepseek-ui-secret');
+    assert.strictEqual(a.postLlmPrivacyHint.classList.contains('is-cloud'), true);
+    a.postLlmPresets.btns.qwen_cloud.click();
+    assert.strictEqual(a.postLlmBaseUrlInput.value, 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1');
+    assert.strictEqual(a.postLlmModelInput.value, 'qwen-plus');
+    assert.strictEqual(a.postLlmPrivacyHint.classList.contains('is-cloud'), true);
+    a.postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(a.postCalls.length, 1);
+    assert.strictEqual(a.postCalls[0].denoise, 'true');
+    assert.strictEqual(a.postCalls[0].llm_polish, 'true');
+    assert.strictEqual(a.postCalls[0].llm_base_url, 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1');
+    assert.strictEqual(a.postCalls[0].llm_model, 'qwen-plus');
+    assert.strictEqual(a.postCalls[0].llm_api_key, 'sk-deepseek-ui-secret');
+    assert.strictEqual(a.storage.has('selectedLlmApiKey'), false);
+
+    // Scenario B: CTranslate2 CUDA available, ONNX CUDA NOT available -> GPU switches gigaam-v3 -> breeze-asr-25
+    const b = createHarness({ onnxCudaAvailable: false, ct2CudaAvailable: true });
+    await new Promise((r) => setTimeout(r, 25));
+    b.computeDeviceSelect.value = 'cuda';
+    b.computeDeviceSelect.dispatchEvent(new b.ctx.Event('change'));
+    assert.strictEqual(b.asrModelSelect.value, 'breeze-asr-25');
+    assert.strictEqual(b.computeDeviceSelect.value, 'cuda');
+
+    console.log('FRONTEND_V50_GPU_GIGAAM_DENOISE_LLM_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node v5.0 UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_V50_GPU_GIGAAM_DENOISE_LLM_OK" in proc.stdout
+
+
+def test_video_processor_18_frame_adaptive_bisection_window_drag_and_dropout_bridging():
+    import numpy as np
+    from src.config import (
+        ADAPTIVE_MIN_DETECT_STEP,
+        DETECT_EVERY_N_FRAMES,
+        YUNET_MIN_CONFIDENCE,
+        YUNET_TARGET_HEIGHT,
+    )
+    from src.video_processor import VideoProcessor
+
+    # 1. Verify tightened config defaults for 100% face anonymity
+    assert DETECT_EVERY_N_FRAMES == 18
+    assert ADAPTIVE_MIN_DETECT_STEP == 2
+    assert YUNET_MIN_CONFIDENCE <= 0.25
+    assert YUNET_TARGET_HEIGHT >= 576
+
+    vp = VideoProcessor()
+    w, h = 1280, 720
+    vp._init_detector(w, h)
+    assert vp.ml_height == YUNET_TARGET_HEIGHT
+
+    # 2. Globally optimal matching tracks wide 30% screen browser drags without big/small cross-stealing
+    big_s = (100, 200, 140, 180)
+    small_s = (650, 120, 40, 52)
+    big_e = (460, 220, 142, 182)      # moved +360 px (~28% width)
+    small_e = (1010, 140, 41, 51)     # moved +360 px (~28% width)
+    matched, unm_s, unm_e = vp._match_faces_detailed([small_s, big_s], [big_e, small_e], w, h)
+    assert len(matched) == 2
+    assert not unm_s and not unm_e
+    assert (big_s, big_e) in matched
+    assert (small_s, small_e) in matched
+
+    # 3. Calm 18-frame interval must NOT trigger unnecessary bisection
+    frame_size = (w * h * 3) // 2
+    calm_frame = np.full(frame_size, 100, dtype=np.uint8)
+    calm_buf = [calm_frame.copy() for _ in range(DETECT_EVERY_N_FRAMES)]
+    calm_calls = []
+    vp._detect_faces = lambda fr: (calm_calls.append(1) or [(300, 200, 80, 100)])
+    prev_thumb = vp._extract_motion_thumb(calm_frame, w, h)
+    kp_calm, end_calm, _, sticky_calm = vp._resolve_batch_keypoints(
+        calm_buf, [(300, 200, 80, 100)], prev_thumb, w, h
+    )
+    assert sorted(kp_calm.keys()) == [0, DETECT_EVERY_N_FRAMES - 1]
+    assert len(calm_calls) == 1  # only last frame detected when continuing calm footage
+    assert end_calm == [(300, 200, 80, 100)]
+    assert sticky_calm == []
+
+    # 4. Fast browser-window drag triggers recursive bisection down to <= ADAPTIVE_MIN_DETECT_STEP
+    #    AND bridges isolated 1-keyframe YuNet drop-outs mid-drag
+    drag_buf = []
+    for idx in range(DETECT_EVERY_N_FRAMES):
+        fr = np.full(frame_size, 40, dtype=np.uint8)
+        y_plane = fr[: w * h].reshape((h, w))
+        # Moving bright browser window rectangle shifts horizontally across 400 px
+        wx = 60 + idx * 24
+        y_plane[80:560, wx : wx + 520] = 210
+        drag_buf.append(fr)
+
+    # Simulate YuNet detecting the face at moving x, EXCEPT dropping out on frame 8 (mid-drag flicker)
+    frame_id_map = {id(fr): idx for idx, fr in enumerate(drag_buf)}
+    def _mock_drag_detect(fr):
+        idx = frame_id_map[id(fr)]
+        if idx == 8:
+            return []  # momentary motion-blur drop-out
+        return [(200 + idx * 24, 180, 50, 64)]
+
+    vp._detect_faces = _mock_drag_detect
+    kp_drag, _, _, _ = vp._resolve_batch_keypoints(drag_buf, None, None, w, h)
+    keys = sorted(kp_drag.keys())
+    # Must subdivide aggressively across the 18-frame drag (max gap <= ADAPTIVE_MIN_DETECT_STEP)
+    assert len(keys) >= 7
+    assert max(b - a for a, b in zip(keys, keys[1:])) <= ADAPTIVE_MIN_DETECT_STEP
+    # Frame 8 drop-out must have been bridged from neighboring keyframes
+    assert 8 in kp_drag and len(kp_drag[8]) == 1
+    assert abs(kp_drag[8][0][0] - (200 + 8 * 24)) <= 10
+
+    # 5. Mid-batch Alt-Tab popup (faces absent at frame 0 & 17, visible only at frames 6..11) is caught
+    pop_buf = []
+    for idx in range(DETECT_EVERY_N_FRAMES):
+        fr = np.full(frame_size, 30, dtype=np.uint8)
+        if 6 <= idx <= 11:
+            y_plane = fr[: w * h].reshape((h, w))
+            y_plane[100:600, 150:900] = 220
+        pop_buf.append(fr)
+    pop_map = {id(fr): idx for idx, fr in enumerate(pop_buf)}
+    vp._detect_faces = lambda fr: [(400, 220, 60, 80)] if 6 <= pop_map[id(fr)] <= 11 else []
+    kp_pop, _, _, _ = vp._resolve_batch_keypoints(pop_buf, None, None, w, h)
+    assert any(kp_pop[k] for k in kp_pop if 6 <= k <= 11)
+
+    # 6. 1-cycle static-region anti-flicker persistence holds static face on momentary profile turn
+    vp._detect_faces = lambda _fr: []
+    _, _, _, sticky_static = vp._resolve_batch_keypoints(
+        calm_buf, [(300, 200, 80, 100)], prev_thumb, w, h
+    )
+    assert sticky_static == [(300, 200, 80, 100)]
+
+    # 7. _blur_and_write_buffer writes exact frame count without duplicates or drops
+    written_frames = []
+    class _DummyPipe:
+        class _Stdin:
+            def write(self, mv):
+                written_frames.append(len(mv))
+        stdin = _Stdin()
+
+    cancelled = vp._blur_and_write_buffer(drag_buf, kp_drag, [], w, h, _DummyPipe())
+    assert cancelled is False
+    assert len(written_frames) == DETECT_EVERY_N_FRAMES
+    assert all(nbytes == frame_size for nbytes in written_frames)
+
+
+
 
 
 

@@ -4,12 +4,16 @@ import os
 import subprocess
 from fractions import Fraction
 from src.config import (
+    ADAPTIVE_MIN_DETECT_STEP,
     DETECT_EVERY_N_FRAMES,
     FACE_PADDING_PERCENT_X,
     FACE_PADDING_PERCENT_Y,
+    MOTION_CHANGED_RATIO_TRIGGER,
+    MOTION_DIFF_PIXEL_THRESHOLD,
     OUTPUT_VIDEO_CRF,
     OUTPUT_VIDEO_PRESET,
     YUNET_MIN_CONFIDENCE,
+    YUNET_TARGET_HEIGHT,
 )
 
 
@@ -43,8 +47,10 @@ class VideoProcessor:
         self.frame_width = original_width
         self.frame_height = original_height
 
-        # Даунскейл до 480p ТОЛЬКО для нейросети (ускорение инференса в 5 раз!)
-        target_height = 480
+        # Даунскейл до YUNET_TARGET_HEIGHT (576p) ТОЛЬКО для нейросети:
+        # сохраняет достаточный размер мелких лиц в галерее видеозвонков (~16-24 px+)
+        # при высокой скорости инференса на CPU.
+        target_height = int(YUNET_TARGET_HEIGHT)
         if original_height > target_height:
             raw_scale = target_height / original_height
             self.ml_width = max(2, int(original_width * raw_scale))
@@ -74,7 +80,7 @@ class VideoProcessor:
             self.current_width = self.ml_width
             self.current_height = self.ml_height
 
-            # Preallocate 480p I420 + BGR buffers so _detect_faces does zero heap allocations
+            # Preallocate ML-resolution I420 + BGR buffers so _detect_faces does zero heap allocations
             ml_y_size = self.ml_width * self.ml_height
             ml_uv_size = (self.ml_width >> 1) * (self.ml_height >> 1)
             self._ml_yuv_1d = np.empty(ml_y_size + 2 * ml_uv_size, dtype=np.uint8)
@@ -93,7 +99,7 @@ class VideoProcessor:
     def _detect_faces(self, frame):
         """
         Detects faces using YuNet (OpenCV FaceDetectorYN).
-        Supports planar YUV420p (1-D uint8 buffer) with 480p-only color conversion,
+        Supports planar YUV420p (1-D uint8 buffer) with ML-resolution color conversion,
         as well as standard 3-D BGR frames.
         """
         if frame.ndim == 1:
@@ -151,52 +157,309 @@ class VideoProcessor:
 
         return detected_faces
 
+    @staticmethod
+    def _extract_motion_thumb(frame, width: int, height: int) -> np.ndarray:
+        """
+        Extracts a tiny (~64x36) uint8 luma thumbnail via zero-copy strided slicing
+        (plus a 2 KB copy so frame_pool reuse never mutates cached thumbnails).
+        """
+        if frame.ndim == 1:
+            y_plane = frame[: width * height].reshape((height, width))
+        else:
+            height, width = frame.shape[:2]
+            # Green channel is an ultra-fast proxy for luminance on BGR frames
+            y_plane = frame[:, :, 1]
+        sy = max(1, height // 36)
+        sx = max(1, width // 64)
+        return y_plane[::sy, ::sx].copy()
+
+    @staticmethod
+    def _thumb_changed_ratio(thumb_a: np.ndarray, thumb_b: np.ndarray) -> float:
+        if thumb_a is None or thumb_b is None or thumb_a.shape != thumb_b.shape or thumb_a.size == 0:
+            return 1.0
+        diff = np.abs(thumb_a.astype(np.int16) - thumb_b.astype(np.int16))
+        return float(np.mean(diff > MOTION_DIFF_PIXEL_THRESHOLD))
+
+    @staticmethod
+    def _local_region_changed_ratio(
+        thumb_a: np.ndarray,
+        thumb_b: np.ndarray,
+        face: tuple[int, int, int, int],
+        width: int,
+        height: int,
+    ) -> float:
+        if thumb_a is None or thumb_b is None or thumb_a.shape != thumb_b.shape or thumb_a.size == 0:
+            return 1.0
+        th, tw = thumb_a.shape[:2]
+        x, y, w, h = face
+        tx1 = max(0, min(tw - 1, int(x * tw / max(1, width))))
+        ty1 = max(0, min(th - 1, int(y * th / max(1, height))))
+        tx2 = max(tx1 + 1, min(tw, int((x + w) * tw / max(1, width)) + 1))
+        ty2 = max(ty1 + 1, min(th, int((y + h) * th / max(1, height)) + 1))
+        patch_a = thumb_a[ty1:ty2, tx1:tx2]
+        patch_b = thumb_b[ty1:ty2, tx1:tx2]
+        if patch_a.size == 0:
+            return 1.0
+        diff = np.abs(patch_a.astype(np.int16) - patch_b.astype(np.int16))
+        return float(np.mean(diff > MOTION_DIFF_PIXEL_THRESHOLD))
+
+    def _match_faces_detailed(self, faces_start, faces_end, width, height):
+        """
+        Globally-optimal (cost-sorted) 1-to-1 face matching between two keyframes.
+        Enforces size compatibility so large main speakers never steal small gallery tiles,
+        while allowing wide window-drag displacements (up to 35% of screen width).
+
+        Returns: (matched_pairs, unmatched_start, unmatched_end)
+        """
+        candidates = []
+        for i, sf in enumerate(faces_start):
+            cx1 = sf[0] + sf[2] * 0.5
+            cy1 = sf[1] + sf[3] * 0.5
+            sw = max(1.0, float(sf[2]))
+            sh = max(1.0, float(sf[3]))
+            for j, ef in enumerate(faces_end):
+                ew = max(1.0, float(ef[2]))
+                eh = max(1.0, float(ef[3]))
+                w_ratio = max(sw / ew, ew / sw)
+                h_ratio = max(sh / eh, eh / sh)
+                if w_ratio > 1.85 or h_ratio > 1.85:
+                    continue
+                cx2 = ef[0] + ef[2] * 0.5
+                cy2 = ef[1] + ef[3] * 0.5
+                dist = float(np.hypot(cx1 - cx2, cy1 - cy2))
+                max_dim = max(sw, sh, ew, eh)
+                max_allowed = max(max_dim * 4.5, float(width) * 0.35)
+                if dist <= max_allowed:
+                    size_pen = 0.5 * (abs(ew - sw) + abs(eh - sh))
+                    candidates.append((dist + size_pen, i, j))
+
+        candidates.sort(key=lambda item: item[0])
+        used_s = set()
+        used_e = set()
+        matched_pairs = []
+        for _cost, i, j in candidates:
+            if i in used_s or j in used_e:
+                continue
+            used_s.add(i)
+            used_e.add(j)
+            matched_pairs.append((faces_start[i], faces_end[j]))
+
+        unmatched_start = [sf for i, sf in enumerate(faces_start) if i not in used_s]
+        unmatched_end = [ef for j, ef in enumerate(faces_end) if j not in used_e]
+        return matched_pairs, unmatched_start, unmatched_end
+
     def _match_faces(self, faces_start, faces_end, width, height):
         """
-        Matches faces between two distant frames for interpolation.
-        Returns a list of tuples: (start_face, end_face).
-        Prevents matching to different faces by using a maximum distance threshold.
+        Matches faces between two keyframes for interpolation.
+        Returns a list of tuples: (start_face, end_face), keeping unmatched faces
+        covered at their detected coordinates.
         """
-        matched = []
-        unmatched_end = list(faces_end)
+        matched_pairs, unmatched_start, unmatched_end = self._match_faces_detailed(
+            faces_start, faces_end, width, height
+        )
+        out = list(matched_pairs)
+        for sf in unmatched_start:
+            out.append((sf, sf))
+        for ef in unmatched_end:
+            out.append((ef, ef))
+        return out
 
-        for sf in faces_start:
-            if not unmatched_end:
-                matched.append((sf, sf))
+    def _bridge_dropout_keypoints(self, keypoints: dict, width: int, height: int) -> None:
+        """
+        Reconstructs isolated 1-keyframe YuNet drop-outs (e.g. momentary motion blur
+        during a fast window drag or quick blink/tilt) when the same face is detected
+        at both neighboring keyframes k_{j-1} and k_{j+1}.
+        """
+        sorted_keys = sorted(keypoints.keys())
+        if len(sorted_keys) < 3:
+            return
+
+        for idx in range(1, len(sorted_keys) - 1):
+            k_prev = sorted_keys[idx - 1]
+            k_mid = sorted_keys[idx]
+            k_next = sorted_keys[idx + 1]
+            f_prev = keypoints[k_prev]
+            f_mid = keypoints[k_mid]
+            f_next = keypoints[k_next]
+            if not f_prev or not f_next:
                 continue
 
-            cx1 = sf[0] + sf[2] / 2
-            cy1 = sf[1] + sf[3] / 2
+            span = max(1, k_next - k_prev)
+            alpha = (k_mid - k_prev) / float(span)
+            bridged_pairs, _, _ = self._match_faces_detailed(f_prev, f_next, width, height)
+            for sf, ef in bridged_pairs:
+                mx = int(sf[0] * (1.0 - alpha) + ef[0] * alpha)
+                my = int(sf[1] * (1.0 - alpha) + ef[1] * alpha)
+                mw = int(sf[2] * (1.0 - alpha) + ef[2] * alpha)
+                mh = int(sf[3] * (1.0 - alpha) + ef[3] * alpha)
+                mcx = mx + mw * 0.5
+                mcy = my + mh * 0.5
+                # Only inject if no face already covers the expected midpoint
+                covered = False
+                for existing in f_mid:
+                    ecx = existing[0] + existing[2] * 0.5
+                    ecy = existing[1] + existing[3] * 0.5
+                    tol = max(20.0, 0.85 * max(mw, mh, existing[2], existing[3]))
+                    if np.hypot(mcx - ecx, mcy - ecy) <= tol:
+                        covered = True
+                        break
+                if not covered:
+                    f_mid.append((mx, my, mw, mh))
 
-            best_idx = -1
-            best_dist = float('inf')
-            for i, ef in enumerate(unmatched_end):
-                cx2 = ef[0] + ef[2] / 2
-                cy2 = ef[1] + ef[3] / 2
-                dist = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = i
+    def _resolve_batch_keypoints(
+        self,
+        buffer: list,
+        prev_faces,
+        prev_last_thumb,
+        width: int,
+        height: int,
+        cancel_event=None,
+    ):
+        """
+        Resolves face detections for a batch of frames (up to DETECT_EVERY_N_FRAMES=18).
+        On calm interview intervals, runs only 1 detection per 18 frames.
+        When window dragging, resizing, layout/tab switching, face appearance, or rapid
+        face motion occurs, recursively bisects the interval down to ADAPTIVE_MIN_DETECT_STEP
+        (2 frames) so faces never leak across motion gaps.
 
-            # Dynamic threshold based on face size and screen width.
-            max_allowed_dist = max((sf[2] * 3) ** 2, (width * 0.15) ** 2)
+        Returns: (keypoints_dict, end_faces_raw, last_thumb, sticky_overlays)
+        """
+        n = len(buffer)
+        if n == 0:
+            return {}, [], prev_last_thumb, []
 
-            if best_idx != -1 and best_dist < max_allowed_dist:
-                matched.append((sf, unmatched_end.pop(best_idx)))
+        thumbs: dict[int, np.ndarray] = {}
+
+        def get_thumb(idx: int) -> np.ndarray:
+            t = thumbs.get(idx)
+            if t is None:
+                t = self._extract_motion_thumb(buffer[idx], width, height)
+                thumbs[idx] = t
+            return t
+
+        keypoints: dict[int, list] = {}
+        zero_is_fresh = False
+        boundary_cut = False
+
+        if prev_faces is None or prev_last_thumb is None:
+            keypoints[0] = self._detect_faces(buffer[0])
+            zero_is_fresh = True
+        else:
+            boundary_diff = self._thumb_changed_ratio(prev_last_thumb, get_thumb(0))
+            if boundary_diff >= MOTION_CHANGED_RATIO_TRIGGER:
+                keypoints[0] = self._detect_faces(buffer[0])
+                zero_is_fresh = True
+                boundary_cut = True
             else:
-                # Match is too far away! Treat as disappeared.
-                matched.append((sf, sf))
+                keypoints[0] = list(prev_faces)
 
-        # For faces that just appeared
-        for ef in unmatched_end:
-            matched.append((ef, ef))
+        if n == 1:
+            end_raw = list(keypoints[0])
+            return keypoints, end_raw, get_thumb(0), []
 
-        return matched
+        last_idx = n - 1
+        keypoints[last_idx] = self._detect_faces(buffer[last_idx])
+        end_raw = list(keypoints[last_idx])
 
-    def _apply_blur(self, frame, x, y, w, h, frame_width: int = 0, frame_height: int = 0):
+        min_step = max(1, int(ADAPTIVE_MIN_DETECT_STEP))
+
+        def _needs_subdivision(lo: int, hi: int) -> bool:
+            if hi - lo <= min_step:
+                return False
+
+            f_lo = keypoints[lo]
+            f_hi = keypoints[hi]
+
+            # 1. Face count changed (someone appeared, left, or flickered)
+            if len(f_lo) != len(f_hi):
+                return True
+
+            # 2. Global screen/window motion (browser drag, resize, scroll, tab switch)
+            t_lo = get_thumb(lo)
+            t_hi = get_thumb(hi)
+            if self._thumb_changed_ratio(t_lo, t_hi) >= MOTION_CHANGED_RATIO_TRIGGER:
+                return True
+
+            # Also probe midpoint thumbnail on spans >= 6 to catch mid-interval window flashes
+            if hi - lo >= 6:
+                mid_probe = (lo + hi) // 2
+                t_mid = get_thumb(mid_probe)
+                if (
+                    self._thumb_changed_ratio(t_lo, t_mid) >= MOTION_CHANGED_RATIO_TRIGGER
+                    or self._thumb_changed_ratio(t_mid, t_hi) >= MOTION_CHANGED_RATIO_TRIGGER
+                ):
+                    return True
+
+            # 3. Face displacement or scale jump
+            if f_lo or f_hi:
+                matched_pairs, unm_s, unm_e = self._match_faces_detailed(f_lo, f_hi, width, height)
+                if unm_s or unm_e:
+                    return True
+                for sf, ef in matched_pairs:
+                    dx = abs((ef[0] + ef[2] * 0.5) - (sf[0] + sf[2] * 0.5))
+                    dy = abs((ef[1] + ef[3] * 0.5) - (sf[1] + sf[3] * 0.5))
+                    min_dim = max(16.0, float(min(sf[2], sf[3], ef[2], ef[3])))
+                    if max(dx, dy) > max(24.0, 0.35 * min_dim):
+                        return True
+                    w_ratio = max(sf[2] / max(1, ef[2]), ef[2] / max(1, sf[2]))
+                    h_ratio = max(sf[3] / max(1, ef[3]), ef[3] / max(1, sf[3]))
+                    if max(w_ratio, h_ratio) > 1.25:
+                        return True
+
+            return False
+
+        def _subdivide(lo: int, hi: int) -> None:
+            nonlocal zero_is_fresh
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if not _needs_subdivision(lo, hi):
+                return
+            if lo == 0 and not zero_is_fresh:
+                keypoints[0] = self._detect_faces(buffer[0])
+                zero_is_fresh = True
+            mid = (lo + hi) // 2
+            if mid not in keypoints:
+                keypoints[mid] = self._detect_faces(buffer[mid])
+            _subdivide(lo, mid)
+            _subdivide(mid, hi)
+
+        _subdivide(0, last_idx)
+
+        # Bridge isolated 1-keyframe drop-outs (e.g. motion blur during drag)
+        self._bridge_dropout_keypoints(keypoints, width, height)
+
+        # 1-cycle static-region anti-flicker persistence: if a previously detected face
+        # temporarily dropped (e.g. participant briefly turned into profile / hand over mouth)
+        # while the window itself stayed stationary, keep that static tile blurred for this cycle.
+        sticky_overlays = []
+        if prev_faces and not boundary_cut:
+            global_diff = self._thumb_changed_ratio(prev_last_thumb, get_thumb(last_idx))
+            if global_diff < MOTION_CHANGED_RATIO_TRIGGER:
+                _, dropped_prev, _ = self._match_faces_detailed(prev_faces, end_raw, width, height)
+                for df in dropped_prev:
+                    local_diff = self._local_region_changed_ratio(
+                        prev_last_thumb, get_thumb(last_idx), df, width, height
+                    )
+                    if local_diff < 0.30:
+                        sticky_overlays.append(df)
+
+        return keypoints, end_raw, get_thumb(last_idx), sticky_overlays
+
+    def _apply_blur(
+        self,
+        frame,
+        x,
+        y,
+        w,
+        h,
+        frame_width: int = 0,
+        frame_height: int = 0,
+        extra_pad_x: int = 0,
+        extra_pad_y: int = 0,
+    ):
         """Applies a strong pixelation (mosaic) effect in-place on planar YUV420p or BGR frames."""
-        pad_x = int(w * FACE_PADDING_PERCENT_X)
-        pad_y = int(h * FACE_PADDING_PERCENT_Y)
+        pad_x = int(w * FACE_PADDING_PERCENT_X) + max(0, int(extra_pad_x))
+        pad_y = int(h * FACE_PADDING_PERCENT_Y) + max(0, int(extra_pad_y))
 
         if frame.ndim == 1:
             width = frame_width or self.frame_width
@@ -255,6 +518,95 @@ class VideoProcessor:
         )
         if out_bgr is not roi:
             frame[y1:y2, x1:x2] = out_bgr
+
+    def _blur_and_write_buffer(
+        self,
+        buffer: list,
+        keypoints: dict,
+        sticky_overlays: list,
+        target_width: int,
+        target_height: int,
+        write_process,
+        cancel_event=None,
+    ) -> bool:
+        """
+        Interpolates faces piecewise across all adaptive keypoints in `buffer`,
+        applies motion-swept mosaic padding in-place, and writes every frame to FFmpeg.
+        Returns True if cancelled mid-buffer, False otherwise.
+        """
+        sorted_keys = sorted(keypoints.keys())
+        if not sorted_keys:
+            for b_frame in buffer:
+                if cancel_event is not None and cancel_event.is_set():
+                    return True
+                for ov in sticky_overlays:
+                    self._apply_blur(b_frame, ov[0], ov[1], ov[2], ov[3], target_width, target_height)
+                try:
+                    write_process.stdin.write(memoryview(b_frame))
+                except Exception:
+                    pass
+            return False
+
+        if len(sorted_keys) == 1:
+            faces_only = keypoints[sorted_keys[0]]
+            for b_frame in buffer:
+                if cancel_event is not None and cancel_event.is_set():
+                    return True
+                for f in faces_only:
+                    self._apply_blur(b_frame, f[0], f[1], f[2], f[3], target_width, target_height)
+                for ov in sticky_overlays:
+                    self._apply_blur(b_frame, ov[0], ov[1], ov[2], ov[3], target_width, target_height)
+                try:
+                    write_process.stdin.write(memoryview(b_frame))
+                except Exception:
+                    pass
+            return False
+
+        num_segs = len(sorted_keys) - 1
+        for seg_idx in range(num_segs):
+            k_a = sorted_keys[seg_idx]
+            k_b = sorted_keys[seg_idx + 1]
+            span = max(1, k_b - k_a)
+            matched_pairs = self._match_faces(keypoints[k_a], keypoints[k_b], target_width, target_height)
+
+            end_frame = k_b + 1 if seg_idx == num_segs - 1 else k_b
+            for i in range(k_a, end_frame):
+                if cancel_event is not None and cancel_event.is_set():
+                    return True
+                b_frame = buffer[i]
+                alpha = (i - k_a) / float(span)
+                mid_weight = 4.0 * alpha * (1.0 - alpha)
+
+                for sf, ef in matched_pairs:
+                    x = int(sf[0] * (1.0 - alpha) + ef[0] * alpha)
+                    y = int(sf[1] * (1.0 - alpha) + ef[1] * alpha)
+                    w = int(sf[2] * (1.0 - alpha) + ef[2] * alpha)
+                    h = int(sf[3] * (1.0 - alpha) + ef[3] * alpha)
+                    step_dx = abs((ef[0] + ef[2] * 0.5) - (sf[0] + sf[2] * 0.5))
+                    step_dy = abs((ef[1] + ef[3] * 0.5) - (sf[1] + sf[3] * 0.5))
+                    extra_px = int(min(w * 0.65, step_dx * 0.35 * mid_weight))
+                    extra_py = int(min(h * 0.65, step_dy * 0.35 * mid_weight))
+                    self._apply_blur(
+                        b_frame,
+                        x,
+                        y,
+                        w,
+                        h,
+                        target_width,
+                        target_height,
+                        extra_pad_x=extra_px,
+                        extra_pad_y=extra_py,
+                    )
+
+                for ov in sticky_overlays:
+                    self._apply_blur(b_frame, ov[0], ov[1], ov[2], ov[3], target_width, target_height)
+
+                try:
+                    write_process.stdin.write(memoryview(b_frame))
+                except Exception:
+                    pass
+
+        return False
 
     def process(
         self,
@@ -361,8 +713,8 @@ class VideoProcessor:
         pool_idx = 0
 
         buffer = []
-        faces_start = []
-        is_first_chunk = True
+        prev_faces = None
+        prev_last_thumb = None
         cancelled = False
 
         try:
@@ -389,28 +741,23 @@ class VideoProcessor:
 
                 if bytes_read != frame_size:
                     if buffer:
-                        last_frame = buffer[-1]
-                        faces_end = self._detect_faces(last_frame)
-                        if is_first_chunk:
-                            faces_start = self._detect_faces(buffer[0])
-
-                        matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
-
-                        for i, b_frame in enumerate(buffer):
-                            if cancel_event is not None and cancel_event.is_set():
-                                cancelled = True
-                                break
-                            alpha = i / max(1, len(buffer) - 1) if len(buffer) > 1 else 0
-                            for (sf, ef) in matched_pairs:
-                                x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
-                                y = int(sf[1] * (1 - alpha) + ef[1] * alpha)
-                                w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
-                                h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
-                                self._apply_blur(b_frame, x, y, w, h, target_width, target_height)
-                            try:
-                                write_process.stdin.write(memoryview(b_frame))
-                            except Exception:
-                                pass
+                        keypoints, _end_faces, _last_thumb, sticky = self._resolve_batch_keypoints(
+                            buffer,
+                            prev_faces,
+                            prev_last_thumb,
+                            target_width,
+                            target_height,
+                            cancel_event=cancel_event,
+                        )
+                        cancelled = self._blur_and_write_buffer(
+                            buffer,
+                            keypoints,
+                            sticky,
+                            target_width,
+                            target_height,
+                            write_process,
+                            cancel_event=cancel_event,
+                        )
                     break
 
                 frame = frame_array
@@ -418,41 +765,32 @@ class VideoProcessor:
                 pool_idx = (pool_idx + 1) % pool_size
 
                 if len(buffer) >= DETECT_EVERY_N_FRAMES:
-                    last_frame = buffer[-1]
-                    faces_end = self._detect_faces(last_frame)
+                    keypoints, end_faces, last_thumb, sticky = self._resolve_batch_keypoints(
+                        buffer,
+                        prev_faces,
+                        prev_last_thumb,
+                        target_width,
+                        target_height,
+                        cancel_event=cancel_event,
+                    )
+                    if cancel_event is not None and cancel_event.is_set():
+                        cancelled = True
+                        break
 
-                    if is_first_chunk:
-                        faces_start = self._detect_faces(buffer[0])
-                        is_first_chunk = False
-
-                    matched_pairs = self._match_faces(faces_start, faces_end, target_width, target_height)
-
-                    for i, b_frame in enumerate(buffer):
-                        if cancel_event is not None and cancel_event.is_set():
-                            cancelled = True
-                            break
-                        if is_first_chunk:
-                            alpha = i / max(1, len(buffer) - 1)
-                        else:
-                            alpha = (i + 1) / len(buffer)
-
-                        for (sf, ef) in matched_pairs:
-                            x = int(sf[0] * (1 - alpha) + ef[0] * alpha)
-                            y = int(sf[1] * (1 - alpha) + ef[1] * alpha)
-                            w = int(sf[2] * (1 - alpha) + ef[2] * alpha)
-                            h = int(sf[3] * (1 - alpha) + ef[3] * alpha)
-                            self._apply_blur(b_frame, x, y, w, h, target_width, target_height)
-                        try:
-                            write_process.stdin.write(memoryview(b_frame))
-                        except Exception:
-                            pass
-
+                    cancelled = self._blur_and_write_buffer(
+                        buffer,
+                        keypoints,
+                        sticky,
+                        target_width,
+                        target_height,
+                        write_process,
+                        cancel_event=cancel_event,
+                    )
                     if cancelled:
                         break
 
-                    is_first_chunk = False
-
-                    faces_start = faces_end
+                    prev_faces = end_faces
+                    prev_last_thumb = last_thumb
                     buffer = []
         finally:
             try:
@@ -476,4 +814,5 @@ class VideoProcessor:
         if cancelled:
             return False
         return write_process.returncode == 0
+
 

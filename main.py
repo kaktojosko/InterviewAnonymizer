@@ -13,7 +13,12 @@ from src.config import (
     DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_DIARIZATION_SENSITIVITY,
+    DEFAULT_LLM_API_KEY,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DENOISE_ENABLED_DEFAULT,
     DIARIZATION_SENSITIVITY_OPTIONS,
+    LLM_POLISH_ENABLED_DEFAULT,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     SPEAKER_COUNT_OPTIONS,
@@ -92,6 +97,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Compute device for transcription: cpu or cuda (default: {DEFAULT_COMPUTE_DEVICE})",
     )
     parser.add_argument(
+        "--denoise",
+        action="store_true",
+        default=DENOISE_ENABLED_DEFAULT,
+        help="Enable optional GTCRN ONNX neural speech denoising before ASR (default: off)",
+    )
+    parser.add_argument(
+        "--llm-polish",
+        action="store_true",
+        default=LLM_POLISH_ENABLED_DEFAULT,
+        help="Enable optional Stage 4 local LLM post-editing via Ollama / LM Studio (default: off)",
+    )
+    parser.add_argument(
+        "--llm-url",
+        default=DEFAULT_LLM_BASE_URL,
+        help=f"Local OpenAI-compatible LLM base URL for --llm-polish (default: {DEFAULT_LLM_BASE_URL})",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=DEFAULT_LLM_MODEL,
+        help=f"Local LLM model name for --llm-polish (default: {DEFAULT_LLM_MODEL})",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default=DEFAULT_LLM_API_KEY,
+        help="Optional Bearer API key for local OpenAI-compatible LLM server",
+    )
+    parser.add_argument(
         "-w",
         "--workers",
         type=int,
@@ -115,6 +147,11 @@ def process_video(
     custom_prompt: str = "",
     diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
     audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
+    denoise: bool = DENOISE_ENABLED_DEFAULT,
+    llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+    llm_base_url: str = DEFAULT_LLM_BASE_URL,
+    llm_model: str = DEFAULT_LLM_MODEL,
+    llm_api_key: str = DEFAULT_LLM_API_KEY,
 ) -> dict:
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
@@ -142,6 +179,11 @@ def process_video(
                 custom_prompt=custom_prompt,
                 diarization_sensitivity=diarization_sensitivity,
                 audio_tracks=audio_tracks,
+                denoise=denoise,
+                llm_polish=llm_polish,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_api_key=llm_api_key,
             )
         else:
             if not output_path:
@@ -160,6 +202,11 @@ def process_video(
                 custom_prompt=custom_prompt,
                 diarization_sensitivity=diarization_sensitivity,
                 audio_tracks=audio_tracks,
+                denoise=denoise,
+                llm_polish=llm_polish,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_api_key=llm_api_key,
             )
         if result.get("transcript_ready") and result.get("transcript_path"):
             print(f"Transcript saved to: {result['transcript_path']}")
@@ -200,6 +247,11 @@ def main():
         custom_prompt=args.prompt,
         diarization_sensitivity=args.sensitivity,
         audio_tracks=args.audio_tracks,
+        denoise=args.denoise,
+        llm_polish=args.llm_polish,
+        llm_base_url=args.llm_url,
+        llm_model=args.llm_model,
+        llm_api_key=args.llm_api_key,
     )
 
 

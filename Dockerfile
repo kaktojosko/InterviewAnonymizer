@@ -1,4 +1,4 @@
-FROM python:3.10-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 # Install system dependencies (ffmpeg and audio requirements)
 RUN apt-get update && apt-get install -y \
@@ -7,10 +7,18 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Optional GPU overlay (set ENABLE_GPU=1 via docker-compose.gpu.yml to enable
+# CUDA acceleration for both faster-whisper AND onnx-asr / GigaAM v3 FP32)
+ARG ENABLE_GPU=0
+
 # Install Python dependencies (includes lightweight cuBLAS runtime for optional NVIDIA GPU mode)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
-    python -c "import glob, site; paths = [p for sp in site.getsitepackages() for p in glob.glob(sp + '/nvidia/*/lib')]; open('/etc/ld.so.conf.d/nvidia-pip.conf', 'w').write('\n'.join(paths) + '\n') if paths else None" && \
+    if [ "$ENABLE_GPU" = "1" ]; then \
+        pip uninstall -y onnxruntime || true; \
+        pip install --no-cache-dir "onnxruntime-gpu[cuda,cudnn]<1.27"; \
+    fi && \
+    python -c "import glob, site; paths = sorted({p for sp in site.getsitepackages() for p in glob.glob(sp + '/nvidia/*/lib')}); open('/etc/ld.so.conf.d/nvidia-pip.conf', 'w').write('\n'.join(paths) + '\n') if paths else None" && \
     ldconfig
 
 # Copy only runtime files. Runtime data directories are bind-mounted by compose.

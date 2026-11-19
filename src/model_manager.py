@@ -2,13 +2,16 @@ import argparse
 import os
 import sys
 import threading
+import urllib.request
 from typing import Callable, Optional
 
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from src.config import (
+    APP_VERSION,
     ASR_MODEL_PROFILES,
     DEFAULT_ASR_MODEL,
+    DENOISER_MODEL,
     DIARIZATION_MODELS,
     MODELS_DIR,
     PRELOADED_MODELS_DIR,
@@ -131,6 +134,48 @@ class ModelManager:
             return seg_path, emb_path
 
     @classmethod
+    def ensure_denoiser_model(
+        cls, status_cb: Optional[Callable[[str], None]] = None
+    ) -> str:
+        """
+        Ensures the lightweight GTCRN ONNX speech enhancement model (~535 KB)
+        exists locally and passes size validation.
+        """
+        fname = DENOISER_MODEL["filename"]
+        min_bytes = int(DENOISER_MODEL.get("min_bytes", 400_000))
+        rel_path = os.path.join("denoiser", fname)
+
+        with _download_lock:
+            for root in cls._candidate_roots():
+                cand = os.path.join(root, rel_path)
+                if cls._is_valid_file(cand, min_bytes):
+                    return cand
+
+            target_dir = os.path.join(MODELS_DIR, "denoiser")
+            os.makedirs(target_dir, exist_ok=True)
+            dst_path = os.path.join(target_dir, fname)
+            part_path = f"{dst_path}.part"
+
+            if status_cb:
+                status_cb("Загрузка локальной модели шумоподавления речи GTCRN (~0.5 МБ, однократно)...")
+
+            req = urllib.request.Request(
+                DENOISER_MODEL["url"],
+                headers={"User-Agent": f"InterviewAnonymizer/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(req, timeout=60.0) as resp, open(part_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            os.replace(part_path, dst_path)
+
+            if not cls._is_valid_file(dst_path, min_bytes):
+                raise RuntimeError(f"Downloaded GTCRN denoiser model is invalid or truncated: {dst_path}")
+            return dst_path
+
+    @classmethod
     def ensure_asr_model(
         cls,
         profile_id: str = DEFAULT_ASR_MODEL,
@@ -176,13 +221,14 @@ class ModelManager:
 
 
 def _cli():
+    valid_profiles = ",".join(ASR_MODEL_PROFILES.keys())
     parser = argparse.ArgumentParser(
-        description="Preload local ASR and speaker diarization models into MODELS_DIR."
+        description="Preload local ASR, GTCRN denoiser, and speaker diarization models into MODELS_DIR."
     )
     parser.add_argument(
         "--preload",
         required=True,
-        help="Comma-separated ASR profile IDs (gigaam-v3,large-v3-ru,turbo,large-v3,parakeet,small), 'all', or 'diarization'.",
+        help=f"Comma-separated ASR profile IDs ({valid_profiles}), 'denoiser', 'all', or 'diarization'.",
     )
     args = parser.parse_args()
 
@@ -194,10 +240,14 @@ def _cli():
     print(f"[ModelManager] Target directory: {MODELS_DIR}")
     ModelManager.ensure_diarization_models(status_cb=print)
 
+    if "all" in raw_items or "denoiser" in raw_items:
+        dn_path = ModelManager.ensure_denoiser_model(status_cb=print)
+        print(f"[ModelManager] Ready: denoiser -> {dn_path}")
+
     if "all" in raw_items:
         profiles_to_load = list(ASR_MODEL_PROFILES.keys())
     else:
-        profiles_to_load = [p for p in raw_items if p != "diarization"]
+        profiles_to_load = [p for p in raw_items if p not in ("diarization", "denoiser")]
 
     for pid in profiles_to_load:
         if pid not in ASR_MODEL_PROFILES:

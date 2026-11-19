@@ -26,9 +26,15 @@ from src.config import (
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_JOB_MODE,
+    DEFAULT_LLM_API_KEY,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DENOISE_ENABLED_DEFAULT,
     DIARIZATION_SENSITIVITY_OPTIONS,
     DIARIZATION_SENSITIVITY_PROFILES,
     JOB_MODE_OPTIONS,
+    LLM_POLISH_ENABLED_DEFAULT,
+    LLM_PROVIDER_PRESETS,
     MAX_ALLOWED_WORKERS,
     MAX_CACHED_AUDIO_FILES,
     MAX_WORKERS,
@@ -39,7 +45,7 @@ from src.config import (
     TRANSCRIPTION_ENABLED_DEFAULT,
 )
 from src.cancellation import CancellationToken, TaskCancelledError
-from src.transcriber import probe_cuda_available
+from src.transcriber import probe_cuda_available, probe_onnx_cuda_available
 
 app = FastAPI(title="Interview Anonymizer", version=APP_VERSION)
 
@@ -149,7 +155,11 @@ def parse_worker_count(raw_workers: str | None) -> int:
     return workers
 
 
-def parse_bool_form(raw_val: str | bool | None, default: bool = TRANSCRIPTION_ENABLED_DEFAULT) -> bool:
+def parse_bool_form(
+    raw_val: str | bool | None,
+    default: bool = TRANSCRIPTION_ENABLED_DEFAULT,
+    field_name: str = "transcribe",
+) -> bool:
     if raw_val is None:
         return default
     if isinstance(raw_val, bool):
@@ -159,7 +169,7 @@ def parse_bool_form(raw_val: str | bool | None, default: bool = TRANSCRIPTION_EN
         return True
     if normalized in ("0", "false", "no", "off"):
         return False
-    raise HTTPException(status_code=400, detail="Invalid boolean value for transcribe.")
+    raise HTTPException(status_code=400, detail=f"Invalid boolean value for {field_name}.")
 
 
 def parse_asr_model(raw_model: str | None) -> str:
@@ -224,6 +234,29 @@ def parse_custom_prompt(raw_prompt: str | None) -> str:
     return " ".join(str(raw_prompt).split())[:600]
 
 
+def parse_llm_base_url(raw_url: str | None) -> str:
+    cleaned = (raw_url or "").strip()[:300]
+    if not cleaned:
+        return DEFAULT_LLM_BASE_URL
+    lower = cleaned.lower()
+    if not (lower.startswith("http://") or lower.startswith("https://")):
+        raise HTTPException(
+            status_code=400,
+            detail="llm_base_url must start with http:// or https://.",
+        )
+    return cleaned
+
+
+def parse_llm_model(raw_model: str | None) -> str:
+    cleaned = (raw_model or "").strip()[:120]
+    return cleaned or DEFAULT_LLM_MODEL
+
+
+def parse_llm_api_key(raw_key: str | None) -> str:
+    cleaned = (raw_key or "").strip()[:300]
+    return cleaned or DEFAULT_LLM_API_KEY
+
+
 def _safe_remove(path: str | None) -> None:
     if path and os.path.exists(path):
         try:
@@ -247,6 +280,11 @@ def background_process(
     custom_prompt: str = "",
     diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
     audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
+    denoise: bool = DENOISE_ENABLED_DEFAULT,
+    llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+    llm_base_url: str = DEFAULT_LLM_BASE_URL,
+    llm_model: str = DEFAULT_LLM_MODEL,
+    llm_api_key: str = "",
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -260,9 +298,15 @@ def background_process(
 
     init_logs = ["Initializing...", f"Worker count: {worker_count}"]
     if transcribe_enabled:
+        extras = []
+        if denoise:
+            extras.append("denoise=GTCRN")
+        if llm_polish:
+            extras.append(f"llm={llm_model}")
+        extra_str = f", {', '.join(extras)}" if extras else ""
         init_logs.append(
             f"Auto-transcription: ON (model={asr_model}, lang={language}, device={compute_device}, "
-            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks})"
+            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks}{extra_str})"
         )
     else:
         init_logs.append("Auto-transcription: OFF")
@@ -286,6 +330,10 @@ def background_process(
         "custom_prompt": custom_prompt,
         "diarization_sensitivity": diarization_sensitivity,
         "audio_tracks": audio_tracks,
+        "denoise": denoise,
+        "llm_polish": llm_polish,
+        "llm_base_url": llm_base_url,
+        "llm_model": llm_model,
         "original_filename": original_filename or tasks.get(task_id, {}).get("original_filename", ""),
     }
 
@@ -302,6 +350,7 @@ def background_process(
     job_dir = io_manager.create_job_dir()
     cached_audio_path = _audio_cache_path(task_id)
     cached_track2_path = _audio_cache_track2_path(task_id)
+    eff_api_key = (llm_api_key or "").strip() or DEFAULT_LLM_API_KEY
 
     try:
         result = Orchestrator.process_video_job(
@@ -322,6 +371,11 @@ def background_process(
             custom_prompt=custom_prompt,
             diarization_sensitivity=diarization_sensitivity,
             audio_tracks=audio_tracks,
+            denoise=denoise,
+            llm_polish=llm_polish,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=eff_api_key,
         )
         cancel_token.check()
         video_ready = bool(result.get("video_ready"))
@@ -391,6 +445,11 @@ def background_transcribe_only(
     diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
     audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
     input_track2_path: str | None = None,
+    denoise: bool = DENOISE_ENABLED_DEFAULT,
+    llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+    llm_base_url: str = DEFAULT_LLM_BASE_URL,
+    llm_model: str = DEFAULT_LLM_MODEL,
+    llm_api_key: str = "",
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -410,11 +469,17 @@ def background_transcribe_only(
         return
 
     mode_label = "Отдельная транскрибация записи" if is_post_transcribe else "Режим «Только транскрибация»"
+    extras = []
+    if denoise:
+        extras.append("denoise=GTCRN")
+    if llm_polish:
+        extras.append(f"llm={llm_model}")
+    extra_str = f", {', '.join(extras)}" if extras else ""
     init_logs = [
         f"{mode_label}...",
         (
             f"Параметры: model={asr_model}, lang={language}, device={compute_device}, "
-            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks}, threads={worker_count}"
+            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks}, threads={worker_count}{extra_str}"
         ),
     ]
 
@@ -437,6 +502,10 @@ def background_transcribe_only(
         "custom_prompt": custom_prompt,
         "diarization_sensitivity": diarization_sensitivity,
         "audio_tracks": audio_tracks,
+        "denoise": denoise,
+        "llm_polish": llm_polish,
+        "llm_base_url": llm_base_url,
+        "llm_model": llm_model,
         "original_filename": saved_filename,
     }
 
@@ -457,6 +526,7 @@ def background_transcribe_only(
     # re-transcribe with another model without re-uploading the media file.
     cache_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_audio_path
     cache_track2_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_track2_path
+    eff_api_key = (llm_api_key or "").strip() or DEFAULT_LLM_API_KEY
 
     try:
         result = Orchestrator.process_transcription_only_job(
@@ -478,6 +548,11 @@ def background_transcribe_only(
             custom_prompt=custom_prompt,
             diarization_sensitivity=diarization_sensitivity,
             audio_tracks=audio_tracks,
+            denoise=denoise,
+            llm_polish=llm_polish,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
+            llm_api_key=eff_api_key,
         )
         cancel_token.check()
         has_orig_audio = os.path.isfile(cached_audio_path)
@@ -541,6 +616,8 @@ async def root():
 
 @app.get("/api/config")
 async def get_config():
+    ct2_cuda_ok = probe_cuda_available()
+    onnx_cuda_ok = probe_onnx_cuda_available()
     return {
         "version": APP_VERSION,
         "cpu_count": CPU_COUNT,
@@ -560,6 +637,7 @@ async def get_config():
                 "id": p["id"],
                 "label": p["label"],
                 "short_name": p["short_name"],
+                "engine": p["engine"],
                 "supports_cuda": bool(p.get("supports_cuda", False)),
                 "fixed_language": p.get("fixed_language"),
             }
@@ -585,12 +663,21 @@ async def get_config():
             {"id": p["id"], "label": p["label"], "prompt": p["prompt"]}
             for p in ASR_PROMPT_PRESETS.values()
         ],
-        "cuda_available": probe_cuda_available(),
+        "cuda_available": bool(ct2_cuda_ok or onnx_cuda_ok),
+        "ct2_cuda_available": ct2_cuda_ok,
+        "onnx_cuda_available": onnx_cuda_ok,
         "default_compute_device": DEFAULT_COMPUTE_DEVICE,
         "compute_devices": [
             {"id": "cpu", "label": "CPU"},
             {"id": "cuda", "label": "GPU (CUDA)"},
         ],
+        "denoise_default": DENOISE_ENABLED_DEFAULT,
+        "llm_polish_default": LLM_POLISH_ENABLED_DEFAULT,
+        "llm_defaults": {
+            "base_url": DEFAULT_LLM_BASE_URL,
+            "model": DEFAULT_LLM_MODEL,
+        },
+        "llm_presets": [dict(p) for p in LLM_PROVIDER_PRESETS.values()],
     }
 
 
@@ -608,6 +695,11 @@ async def upload_video(
     custom_prompt: str = Form(""),
     diarization_sensitivity: str = Form(DEFAULT_DIARIZATION_SENSITIVITY),
     audio_tracks: str = Form(DEFAULT_AUDIO_TRACK_MODE),
+    denoise: str = Form("true" if DENOISE_ENABLED_DEFAULT else "false"),
+    llm_polish: str = Form("true" if LLM_POLISH_ENABLED_DEFAULT else "false"),
+    llm_base_url: str = Form(DEFAULT_LLM_BASE_URL),
+    llm_model: str = Form(DEFAULT_LLM_MODEL),
+    llm_api_key: str = Form(""),
 ):
     job_mode = parse_job_mode(mode)
     filename = file.filename or ""
@@ -626,7 +718,7 @@ async def upload_video(
 
     worker_count = parse_worker_count(workers)
     transcribe_enabled = True if job_mode == "transcribe_only" else parse_bool_form(
-        transcribe, default=TRANSCRIPTION_ENABLED_DEFAULT
+        transcribe, default=TRANSCRIPTION_ENABLED_DEFAULT, field_name="transcribe"
     )
     asr_model_id = parse_asr_model(asr_model)
     language_id = parse_language(language)
@@ -635,6 +727,13 @@ async def upload_video(
     prompt_clean = parse_custom_prompt(custom_prompt)
     sensitivity_mode = parse_diarization_sensitivity(diarization_sensitivity)
     track_mode = parse_audio_tracks(audio_tracks)
+    denoise_enabled = parse_bool_form(denoise, default=DENOISE_ENABLED_DEFAULT, field_name="denoise")
+    llm_polish_enabled = parse_bool_form(
+        llm_polish, default=LLM_POLISH_ENABLED_DEFAULT, field_name="llm_polish"
+    )
+    llm_url_clean = parse_llm_base_url(llm_base_url)
+    llm_model_clean = parse_llm_model(llm_model)
+    llm_key_clean = parse_llm_api_key(llm_api_key)
 
     task_id = str(uuid.uuid4())
     input_path = os.path.join("uploads", f"{task_id}{ext}")
@@ -674,6 +773,10 @@ async def upload_video(
         "custom_prompt": prompt_clean,
         "diarization_sensitivity": sensitivity_mode,
         "audio_tracks": track_mode,
+        "denoise": denoise_enabled,
+        "llm_polish": llm_polish_enabled,
+        "llm_base_url": llm_url_clean,
+        "llm_model": llm_model_clean,
         "original_filename": os.path.basename(filename),
     }
 
@@ -697,6 +800,11 @@ async def upload_video(
             sensitivity_mode,
             track_mode,
             None,
+            denoise_enabled,
+            llm_polish_enabled,
+            llm_url_clean,
+            llm_model_clean,
+            llm_key_clean,
         )
     else:
         background_tasks.add_task(
@@ -715,6 +823,11 @@ async def upload_video(
             prompt_clean,
             sensitivity_mode,
             track_mode,
+            denoise_enabled,
+            llm_polish_enabled,
+            llm_url_clean,
+            llm_model_clean,
+            llm_key_clean,
         )
 
     return {
@@ -731,6 +844,10 @@ async def upload_video(
         "custom_prompt": prompt_clean,
         "diarization_sensitivity": sensitivity_mode,
         "audio_tracks": track_mode,
+        "denoise": denoise_enabled,
+        "llm_polish": llm_polish_enabled,
+        "llm_base_url": llm_url_clean,
+        "llm_model": llm_model_clean,
     }
 
 
@@ -746,6 +863,11 @@ async def transcribe_existing_recording(
     custom_prompt: str = Form(""),
     diarization_sensitivity: str = Form(DEFAULT_DIARIZATION_SENSITIVITY),
     audio_tracks: str = Form(DEFAULT_AUDIO_TRACK_MODE),
+    denoise: str = Form("true" if DENOISE_ENABLED_DEFAULT else "false"),
+    llm_polish: str = Form("true" if LLM_POLISH_ENABLED_DEFAULT else "false"),
+    llm_base_url: str = Form(DEFAULT_LLM_BASE_URL),
+    llm_model: str = Form(DEFAULT_LLM_MODEL),
+    llm_api_key: str = Form(""),
 ):
     """
     Creates (or re-creates) a speaker-diarized .txt transcript separately for
@@ -767,6 +889,13 @@ async def transcribe_existing_recording(
     prompt_clean = parse_custom_prompt(custom_prompt)
     sensitivity_mode = parse_diarization_sensitivity(diarization_sensitivity)
     track_mode = parse_audio_tracks(audio_tracks)
+    denoise_enabled = parse_bool_form(denoise, default=DENOISE_ENABLED_DEFAULT, field_name="denoise")
+    llm_polish_enabled = parse_bool_form(
+        llm_polish, default=LLM_POLISH_ENABLED_DEFAULT, field_name="llm_polish"
+    )
+    llm_url_clean = parse_llm_base_url(llm_base_url)
+    llm_model_clean = parse_llm_model(llm_model)
+    llm_key_clean = parse_llm_api_key(llm_api_key)
 
     cached_wav = _audio_cache_path(task_id)
     cached_track2_wav = _audio_cache_track2_path(task_id)
@@ -819,6 +948,10 @@ async def transcribe_existing_recording(
         "custom_prompt": prompt_clean,
         "diarization_sensitivity": sensitivity_mode,
         "audio_tracks": track_mode,
+        "denoise": denoise_enabled,
+        "llm_polish": llm_polish_enabled,
+        "llm_base_url": llm_url_clean,
+        "llm_model": llm_model_clean,
         "original_filename": prev_filename,
     }
 
@@ -841,6 +974,11 @@ async def transcribe_existing_recording(
         sensitivity_mode,
         track_mode,
         source_track2_path,
+        denoise_enabled,
+        llm_polish_enabled,
+        llm_url_clean,
+        llm_model_clean,
+        llm_key_clean,
     )
 
     return {
@@ -856,6 +994,10 @@ async def transcribe_existing_recording(
         "custom_prompt": prompt_clean,
         "diarization_sensitivity": sensitivity_mode,
         "audio_tracks": track_mode,
+        "denoise": denoise_enabled,
+        "llm_polish": llm_polish_enabled,
+        "llm_base_url": llm_url_clean,
+        "llm_model": llm_model_clean,
         "using_original_audio": has_cached_wav,
     }
 

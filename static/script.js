@@ -67,6 +67,14 @@ const diarizationSensitivitySelect = document.getElementById('diarizationSensiti
 const audioTracksSelect = document.getElementById('audioTracksSelect');
 const customPromptInput = document.getElementById('customPromptInput');
 const promptPresetsEl = document.getElementById('promptPresets');
+const denoiseToggle = document.getElementById('denoiseToggle');
+const llmPolishToggle = document.getElementById('llmPolishToggle');
+const llmConfigWrap = document.getElementById('llmConfigWrap');
+const llmPresetsEl = document.getElementById('llmPresets');
+const llmBaseUrlInput = document.getElementById('llmBaseUrlInput');
+const llmModelInput = document.getElementById('llmModelInput');
+const llmApiKeyInput = document.getElementById('llmApiKeyInput');
+const llmPrivacyHint = document.getElementById('llmPrivacyHint');
 const transcribeHintText = document.getElementById('transcribeHintText');
 
 const recordingsSection = document.getElementById('recordingsSection');
@@ -85,6 +93,14 @@ const postDiarizationSensitivitySelect = document.getElementById('postDiarizatio
 const postAudioTracksSelect = document.getElementById('postAudioTracksSelect');
 const postCustomPromptInput = document.getElementById('postCustomPromptInput');
 const postPromptPresetsEl = document.getElementById('postPromptPresets');
+const postDenoiseToggle = document.getElementById('postDenoiseToggle');
+const postLlmPolishToggle = document.getElementById('postLlmPolishToggle');
+const postLlmConfigWrap = document.getElementById('postLlmConfigWrap');
+const postLlmPresetsEl = document.getElementById('postLlmPresets');
+const postLlmBaseUrlInput = document.getElementById('postLlmBaseUrlInput');
+const postLlmModelInput = document.getElementById('postLlmModelInput');
+const postLlmApiKeyInput = document.getElementById('postLlmApiKeyInput');
+const postLlmPrivacyHint = document.getElementById('postLlmPrivacyHint');
 const postAudioSourceHint = document.getElementById('postAudioSourceHint');
 const postTranscribeBtn = document.getElementById('postTranscribeBtn');
 
@@ -106,6 +122,8 @@ let customWorkers = localStorage.getItem('customWorkers') || '';
 let serverCpuCount = null;
 let serverMaxWorkers = null;
 let serverCudaAvailable = null;
+let serverCt2CudaAvailable = null;
+let serverOnnxCudaAvailable = null;
 let serverAsrModelsMeta = new Map();
 let promptPresetMap = {
     system_analyst:
@@ -115,6 +133,89 @@ let promptPresetMap = {
     frontend_qa:
         'Техническое собеседование: JavaScript, TypeScript, React, Vue, Next.js, REST, GraphQL, WebSocket, Playwright, Cypress, Selenium, Postman, Swagger, Allure, Jira, Git',
 };
+let llmPresetMap = {
+    ollama_local: { base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
+    lmstudio_local: { base_url: 'http://localhost:1234/v1', model: 'qwen3-8b', is_cloud: false },
+    deepseek_cloud: { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', is_cloud: true },
+    qwen_cloud: {
+        base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+        model: 'qwen-plus',
+        is_cloud: true,
+    },
+};
+
+function readSessionSecret(key) {
+    try {
+        if (typeof sessionStorage !== 'undefined' && sessionStorage && typeof sessionStorage.getItem === 'function') {
+            return sessionStorage.getItem(key) || '';
+        }
+    } catch (_err) {
+        // Ignore storage restrictions in private or mocked environments
+    }
+    return '';
+}
+
+function writeSessionSecret(key, value) {
+    try {
+        if (typeof sessionStorage !== 'undefined' && sessionStorage) {
+            if (value) {
+                sessionStorage.setItem(key, value);
+            } else if (typeof sessionStorage.removeItem === 'function') {
+                sessionStorage.removeItem(key);
+            }
+        }
+    } catch (_err) {
+        // Ignore storage restrictions in private or mocked environments
+    }
+}
+
+function isLocalLlmUrl(url) {
+    const trimmed = String(url || '').trim();
+    if (!trimmed) return true;
+    let host = '';
+    if (typeof URL === 'function') {
+        try {
+            host = (new URL(trimmed).hostname || '').toLowerCase();
+        } catch (_err) {
+            host = '';
+        }
+    }
+    if (!host) {
+        const match = trimmed.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/(\[[^\]]+\]|[^/:?#]+)/);
+        if (!match) return true;
+        host = match[1].toLowerCase();
+    }
+    host = host.replace(/^\[|\]$/g, '');
+    if (
+        host === 'localhost' ||
+        host === '127.0.0.1' ||
+        host === '0.0.0.0' ||
+        host === '::1' ||
+        host === 'host.docker.internal' ||
+        host === 'ollama' ||
+        host.endsWith('.local') ||
+        host.startsWith('10.') ||
+        host.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2\d|3[0-1])\./.test(host)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+function updateLlmPrivacyHint(hintEl, url) {
+    if (!hintEl) return;
+    const isCloud = !isLocalLlmUrl(url);
+    hintEl.classList.toggle('is-cloud', isCloud);
+    if (isCloud) {
+        hintEl.textContent =
+            'Режим: облачный API — текст реплик отправляется во внешний сервис (DeepSeek / Qwen). API-ключ не сохраняется на диск и не попадает в логи.';
+    } else {
+        hintEl.textContent =
+            'Режим: локальный сервер — 100% данных остаются на вашем компьютере.';
+    }
+}
+
 let transcribeOnlyExtensions = [
     '.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v',
     '.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac', '.aac', '.wma',
@@ -129,6 +230,11 @@ let selectedSpeakers = localStorage.getItem('selectedSpeakers') || 'auto';
 let selectedSensitivity = localStorage.getItem('selectedSensitivity') || 'normal';
 let selectedAudioTracks = localStorage.getItem('selectedAudioTracks') || 'auto';
 let selectedCustomPrompt = localStorage.getItem('selectedCustomPrompt') || '';
+let selectedDenoise = localStorage.getItem('selectedDenoise') === 'true';
+let selectedLlmPolish = localStorage.getItem('selectedLlmPolish') === 'true';
+let selectedLlmBaseUrl = localStorage.getItem('selectedLlmBaseUrl') || 'http://localhost:11434/v1';
+let selectedLlmModel = localStorage.getItem('selectedLlmModel') || 'qwen3:8b';
+let selectedLlmApiKey = readSessionSecret('selectedLlmApiKey');
 
 // Post-recording separate transcription form state (initialized from main settings)
 let postAsrModel = selectedAsrModel;
@@ -138,20 +244,43 @@ let postSpeakers = selectedSpeakers;
 let postSensitivity = selectedSensitivity;
 let postAudioTracks = selectedAudioTracks;
 let postCustomPrompt = selectedCustomPrompt;
+let postDenoise = selectedDenoise;
+let postLlmPolish = selectedLlmPolish;
+let postLlmBaseUrl = selectedLlmBaseUrl;
+let postLlmModel = selectedLlmModel;
+let postLlmApiKey = selectedLlmApiKey;
 
 function isCpuOnlyAsrModel(modelId) {
     if (serverAsrModelsMeta.has(modelId)) {
-        return !serverAsrModelsMeta.get(modelId).supports_cuda;
+        const meta = serverAsrModelsMeta.get(modelId);
+        if (!meta.supports_cuda) return true;
+        if (meta.engine === 'onnx_asr' && serverOnnxCudaAvailable === false) return true;
+        if (meta.engine === 'faster_whisper' && serverCt2CudaAvailable === false) return true;
+        return false;
     }
-    return modelId === 'gigaam-v3' || modelId === 'parakeet';
+    if (modelId === 'gigaam-v3-int8' || modelId === 'parakeet' || modelId === 'canary-qwen-2.5b') return true;
+    if (
+        (modelId === 'gigaam-v3' || modelId === 'gigaam-v3-ctc' || modelId === 'canary-1b-v2') &&
+        serverOnnxCudaAvailable === false
+    ) {
+        return true;
+    }
+    return false;
 }
 
 function getGpuFallbackModel(currentModelId, selectEl) {
     const hasOpt = (id) => Boolean(selectEl && Array.from(selectEl.options).some((opt) => opt.value === id));
-    if (currentModelId === 'gigaam-v3' && hasOpt('large-v3-ru')) {
-        return 'large-v3-ru';
+    if (String(currentModelId || '').startsWith('gigaam-v3')) {
+        if (serverOnnxCudaAvailable === true && hasOpt('gigaam-v3')) return 'gigaam-v3';
+        if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
+        if (hasOpt('large-v3-ru')) return 'large-v3-ru';
+    }
+    if (currentModelId === 'canary-qwen-2.5b') {
+        if (serverOnnxCudaAvailable === true && hasOpt('canary-1b-v2')) return 'canary-1b-v2';
+        if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
     }
     if (hasOpt('turbo')) return 'turbo';
+    if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
     if (hasOpt('large-v3-ru')) return 'large-v3-ru';
     return 'turbo';
 }
@@ -434,10 +563,17 @@ function applyComputeDeviceAvailabilityToPair(deviceSelectEl, modelId, currentDe
             opt.title = 'NVIDIA CUDA не обнаружена (для Docker запустите с docker-compose.gpu.yml)';
         } else if (cpuOnlySelected) {
             opt.dataset.limitHint = '';
-            opt.dataset.infoHint = nextModel === 'gigaam-v3' ? 'Whisper RU' : 'Whisper';
-            opt.title = nextModel === 'gigaam-v3'
-                ? 'При выборе GPU модель автоматически переключится на Whisper Large v3 RU'
-                : 'При выборе GPU модель автоматически переключится на Whisper Turbo';
+            const targetSelect = deviceSelectEl === postComputeDeviceSelect ? postAsrModelSelect : asrModelSelect;
+            const fallbackId = getGpuFallbackModel(nextModel, targetSelect);
+            opt.dataset.infoHint =
+                fallbackId === 'gigaam-v3'
+                    ? 'GigaAM FP32'
+                    : (fallbackId === 'canary-1b-v2'
+                        ? 'Canary 1B v2'
+                        : (fallbackId === 'breeze-asr-25'
+                            ? 'Breeze-ASR'
+                            : (fallbackId === 'large-v3-ru' ? 'Whisper RU' : 'Whisper')));
+            opt.title = `При выборе GPU модель автоматически переключится на ${opt.dataset.infoHint}`;
         } else {
             opt.dataset.limitHint = '';
             opt.dataset.infoHint = '';
@@ -470,16 +606,39 @@ function hasLatinTerms(text) {
 
 function updateTranscribeHint() {
     if (!transcribeHintText) return;
-    if (selectedAsrModel === 'gigaam-v3') {
+    if (selectedAsrModel === 'gigaam-v3' || selectedAsrModel === 'gigaam-v3-ctc' || selectedAsrModel === 'gigaam-v3-int8') {
         if (selectedLanguage === 'en') {
             transcribeHintText.textContent =
-                'GigaAM v3 специализирована на русском языке; для английской речи выберите Whisper.';
+                'GigaAM v3 специализирована на русском языке; для английской или смешанной RU+EN речи выберите Breeze-ASR-25, Canary 1B v2 или Whisper.';
         } else if (hasLatinTerms(selectedCustomPrompt)) {
             transcribeHintText.textContent =
-                'В словаре есть латинские термины — для нативного вывода латиницы выберите Whisper Large v3 RU или Turbo (для GigaAM v3 сработает автозамена по словарю).';
+                'В словаре есть латинские термины — для нативной латиницы подойдёт Breeze-ASR-25 или включение LLM-корректуры (локальной или облачной; для GigaAM v3 также сработает автозамена по словарю).';
+        } else if (selectedAsrModel === 'gigaam-v3-ctc') {
+            transcribeHintText.textContent =
+                'Sber GigaAM v3 CTC FP32: сверхбыстрая русская модель (до 240× на GPU CUDA), нарезка ≤20с с Silero VAD, пунктуация и регистр.';
+        } else if (selectedAsrModel === 'gigaam-v3-int8') {
+            transcribeHintText.textContent =
+                'Sber GigaAM v3 INT8 (232 МБ): облегчённая CPU-версия для машин без GPU или с малым объёмом RAM.';
+        } else if (selectedComputeDevice === 'cuda' && serverOnnxCudaAvailable === true) {
+            transcribeHintText.textContent =
+                'Sber GigaAM v3 FP32 (GPU CUDA): максимальная точность на русской речи (до ~60× ускорения на GPU), нарезка ≤20с с Silero VAD.';
         } else {
             transcribeHintText.textContent =
-                'Sber GigaAM v3: лучшая точность на русской речи (нарезка ≤20с с Silero VAD), пунктуация и регистр. Офлайн на CPU.';
+                'Sber GigaAM v3 FP32: лучшая точность на русской речи (нарезка ≤20с с Silero VAD), пунктуация и регистр. Поддерживает GPU (CUDA) и CPU.';
+        }
+    } else if (selectedAsrModel === 'breeze-asr-25') {
+        transcribeHintText.textContent =
+            'MediaTek Breeze-ASR-25: лучшая локальная модель для смешанной RU+EN речи и IT-терминов (gRPC, OAuth 2, Kubernetes), без галлюцинаций Whisper v3 (CPU/GPU).';
+    } else if (selectedAsrModel === 'canary-1b-v2') {
+        transcribeHintText.textContent =
+            'NVIDIA Canary 1B v2 (FP32): 25 европейских языков (RU/EN и др.), пунктуация и регистр, 1B параметров. Поддерживает GPU (CUDA) и CPU.';
+    } else if (selectedAsrModel === 'canary-qwen-2.5b') {
+        if (selectedLanguage === 'ru') {
+            transcribeHintText.textContent =
+                'Внимание: NVIDIA Canary-Qwen 2.5B обучена ТОЛЬКО на английском языке (EN, #1 Open ASR Leaderboard, 5.63% WER)! Для русской речи выберите GigaAM v3, Breeze-ASR-25 или Canary 1B v2.';
+        } else {
+            transcribeHintText.textContent =
+                'NVIDIA Canary-Qwen 2.5B (INT8 CPU, 2.9 ГБ): мировой #1 для английской речи (5.63% WER) с пунктуацией и регистром (FastConformer + Qwen3-1.7B, только English).';
         }
     } else if (selectedAsrModel === 'large-v3-ru') {
         transcribeHintText.textContent =
@@ -594,6 +753,26 @@ function renderTranscriptionControls() {
         customPromptInput.value = selectedCustomPrompt;
     }
 
+    if (denoiseToggle) {
+        denoiseToggle.checked = Boolean(selectedDenoise);
+    }
+    if (llmPolishToggle) {
+        llmPolishToggle.checked = Boolean(selectedLlmPolish);
+    }
+    if (llmConfigWrap) {
+        llmConfigWrap.classList.toggle('hidden', !selectedLlmPolish);
+    }
+    if (llmBaseUrlInput && llmBaseUrlInput.value !== selectedLlmBaseUrl) {
+        llmBaseUrlInput.value = selectedLlmBaseUrl;
+    }
+    if (llmModelInput && llmModelInput.value !== selectedLlmModel) {
+        llmModelInput.value = selectedLlmModel;
+    }
+    if (llmApiKeyInput && llmApiKeyInput.value !== selectedLlmApiKey) {
+        llmApiKeyInput.value = selectedLlmApiKey;
+    }
+    updateLlmPrivacyHint(llmPrivacyHint, selectedLlmBaseUrl);
+
     updateTranscribeHint();
 }
 
@@ -602,12 +781,21 @@ function updatePostAudioSourceHint() {
     const sourceText = postHasOriginalAudio
         ? 'Используется оригинальная аудиодорожка (без искажения голоса).'
         : 'Используется аудиодорожка из сохранённой записи.';
-    if (postAsrModel === 'gigaam-v3' && postLanguage === 'en') {
+    const isGiga = String(postAsrModel || '').startsWith('gigaam-v3');
+    if (isGiga && postLanguage === 'en') {
         postAudioSourceHint.textContent =
-            `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Whisper.`;
-    } else if (postAsrModel === 'gigaam-v3' && hasLatinTerms(postCustomPrompt)) {
+            `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Canary-Qwen 2.5B, Breeze-ASR-25 или Canary 1B v2.`;
+    } else if (isGiga && hasLatinTerms(postCustomPrompt)) {
         postAudioSourceHint.textContent =
-            `${sourceText} Для латинских IT-терминов из словаря лучше подходит Whisper Large v3 RU / Turbo (для GigaAM v3 сработает автозамена).`;
+            `${sourceText} Для латинских IT-терминов подойдёт Breeze-ASR-25 или LLM-корректура (локальная или облачная; для GigaAM v3 также сработает автозамена).`;
+    } else if (postAsrModel === 'canary-1b-v2') {
+        postAudioSourceHint.textContent =
+            `${sourceText} Canary 1B v2 поддерживает 25 языков, пунктуацию и ускорение на GPU (CUDA).`;
+    } else if (postAsrModel === 'canary-qwen-2.5b') {
+        postAudioSourceHint.textContent =
+            postLanguage === 'ru'
+                ? `${sourceText} Внимание: Canary-Qwen 2.5B обучена ТОЛЬКО на английском языке (EN)! Для русской речи выберите GigaAM v3 или Breeze-ASR-25.`
+                : `${sourceText} Canary-Qwen 2.5B (INT8 CPU): топ-1 для английской речи (EN ONLY) с пунктуацией и регистром.`;
     } else {
         postAudioSourceHint.textContent = sourceText;
     }
@@ -686,6 +874,26 @@ function renderPostTranscribeControls() {
     if (postCustomPromptInput && postCustomPromptInput.value !== postCustomPrompt) {
         postCustomPromptInput.value = postCustomPrompt;
     }
+
+    if (postDenoiseToggle) {
+        postDenoiseToggle.checked = Boolean(postDenoise);
+    }
+    if (postLlmPolishToggle) {
+        postLlmPolishToggle.checked = Boolean(postLlmPolish);
+    }
+    if (postLlmConfigWrap) {
+        postLlmConfigWrap.classList.toggle('hidden', !postLlmPolish);
+    }
+    if (postLlmBaseUrlInput && postLlmBaseUrlInput.value !== postLlmBaseUrl) {
+        postLlmBaseUrlInput.value = postLlmBaseUrl;
+    }
+    if (postLlmModelInput && postLlmModelInput.value !== postLlmModel) {
+        postLlmModelInput.value = postLlmModel;
+    }
+    if (postLlmApiKeyInput && postLlmApiKeyInput.value !== postLlmApiKey) {
+        postLlmApiKeyInput.value = postLlmApiKey;
+    }
+    updateLlmPrivacyHint(postLlmPrivacyHint, postLlmBaseUrl);
 
     updatePostAudioSourceHint();
 }
@@ -862,6 +1070,11 @@ function renderRecordingsList(recordings) {
                     sensitivity: selectedSensitivity,
                     audioTracks: selectedAudioTracks,
                     customPrompt: selectedCustomPrompt,
+                    denoise: selectedDenoise,
+                    llmPolish: selectedLlmPolish,
+                    llmBaseUrl: selectedLlmBaseUrl,
+                    llmModel: selectedLlmModel,
+                    llmApiKey: selectedLlmApiKey,
                 });
             });
             actions.appendChild(trBtn);
@@ -904,6 +1117,10 @@ function openRecordingPanel(rec) {
         diarization_sensitivity: selectedSensitivity,
         audio_tracks: selectedAudioTracks,
         custom_prompt: selectedCustomPrompt,
+        denoise: selectedDenoise,
+        llm_polish: selectedLlmPolish,
+        llm_base_url: selectedLlmBaseUrl,
+        llm_model: selectedLlmModel,
         original_filename: rec.original_filename || '',
     };
     lastTaskData = taskData;
@@ -949,6 +1166,16 @@ async function loadServerConfig() {
         if (typeof data.cuda_available === 'boolean') {
             serverCudaAvailable = data.cuda_available;
         }
+        if (typeof data.ct2_cuda_available === 'boolean') {
+            serverCt2CudaAvailable = data.ct2_cuda_available;
+        } else if (typeof data.cuda_available === 'boolean') {
+            serverCt2CudaAvailable = data.cuda_available;
+        }
+        if (typeof data.onnx_cuda_available === 'boolean') {
+            serverOnnxCudaAvailable = data.onnx_cuda_available;
+        } else if (typeof data.cuda_available === 'boolean') {
+            serverOnnxCudaAvailable = false;
+        }
         if (Array.isArray(data.transcribe_only_extensions) && data.transcribe_only_extensions.length > 0) {
             transcribeOnlyExtensions = data.transcribe_only_extensions;
         }
@@ -956,8 +1183,22 @@ async function loadServerConfig() {
         if (Array.isArray(data.asr_models) && data.asr_models.length > 0) {
             serverAsrModelsMeta = new Map();
             data.asr_models.forEach((m) => {
+                const fallbackEngine =
+                    m.id === 'canary-qwen-2.5b'
+                        ? 'onnx_canary_qwen'
+                        : (
+                            m.id === 'gigaam-v3' ||
+                            m.id === 'gigaam-v3-ctc' ||
+                            m.id === 'gigaam-v3-int8' ||
+                            m.id === 'canary-1b-v2'
+                        )
+                            ? 'onnx_asr'
+                            : (m.id === 'parakeet' ? 'sherpa_parakeet' : 'faster_whisper');
+                const fallbackSupportsCuda =
+                    m.id !== 'gigaam-v3-int8' && m.id !== 'parakeet' && m.id !== 'canary-qwen-2.5b';
                 serverAsrModelsMeta.set(m.id, {
-                    supports_cuda: m.supports_cuda !== undefined ? Boolean(m.supports_cuda) : (m.id !== 'gigaam-v3' && m.id !== 'parakeet'),
+                    engine: m.engine || fallbackEngine,
+                    supports_cuda: m.supports_cuda !== undefined ? Boolean(m.supports_cuda) : fallbackSupportsCuda,
                     fixed_language: m.fixed_language || null,
                 });
             });
@@ -1000,6 +1241,18 @@ async function loadServerConfig() {
             });
         }
 
+        if (Array.isArray(data.llm_presets) && data.llm_presets.length > 0) {
+            data.llm_presets.forEach((p) => {
+                if (p && p.id && typeof p.base_url === 'string') {
+                    llmPresetMap[p.id] = {
+                        base_url: p.base_url,
+                        model: typeof p.model === 'string' ? p.model : '',
+                        is_cloud: Boolean(p.is_cloud),
+                    };
+                }
+            });
+        }
+
         if (Array.isArray(data.compute_devices) && data.compute_devices.length > 0 && computeDeviceSelect) {
             syncSelectOptionsIfChanged(computeDeviceSelect, data.compute_devices);
             syncSelectOptionsIfChanged(postComputeDeviceSelect, data.compute_devices);
@@ -1011,6 +1264,20 @@ async function loadServerConfig() {
         if (savedTranscribe === null && localStorage.getItem('transcribeEnabled') === null && typeof data.transcription_default === 'boolean') {
             transcribeEnabled = data.transcription_default;
         }
+        if (localStorage.getItem('selectedDenoise') === null && typeof data.denoise_default === 'boolean') {
+            selectedDenoise = data.denoise_default;
+        }
+        if (localStorage.getItem('selectedLlmPolish') === null && typeof data.llm_polish_default === 'boolean') {
+            selectedLlmPolish = data.llm_polish_default;
+        }
+        if (data.llm_defaults) {
+            if (!localStorage.getItem('selectedLlmBaseUrl') && data.llm_defaults.base_url) {
+                selectedLlmBaseUrl = data.llm_defaults.base_url;
+            }
+            if (!localStorage.getItem('selectedLlmModel') && data.llm_defaults.model) {
+                selectedLlmModel = data.llm_defaults.model;
+            }
+        }
 
         postAsrModel = selectedAsrModel;
         postLanguage = selectedLanguage;
@@ -1019,6 +1286,11 @@ async function loadServerConfig() {
         postSensitivity = selectedSensitivity;
         postAudioTracks = selectedAudioTracks;
         postCustomPrompt = selectedCustomPrompt;
+        postDenoise = selectedDenoise;
+        postLlmPolish = selectedLlmPolish;
+        postLlmBaseUrl = selectedLlmBaseUrl;
+        postLlmModel = selectedLlmModel;
+        postLlmApiKey = selectedLlmApiKey;
 
         applyWorkerAvailability();
         renderModeControls();
@@ -1038,6 +1310,20 @@ function bindPromptPresetButtons(containerEl, onApply) {
                 onApply('');
             } else if (presetId && promptPresetMap[presetId]) {
                 onApply(promptPresetMap[presetId]);
+            }
+        });
+    });
+}
+
+function bindLlmPresetButtons(containerEl, onApply) {
+    if (!containerEl || !containerEl.querySelectorAll) return;
+    containerEl.querySelectorAll('[data-llm-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const presetId =
+                (btn.dataset && btn.dataset.llmPreset) ||
+                (btn.getAttribute && btn.getAttribute('data-llm-preset'));
+            if (presetId && llmPresetMap[presetId]) {
+                onApply(llmPresetMap[presetId]);
             }
         });
     });
@@ -1133,6 +1419,57 @@ bindPromptPresetButtons(promptPresetsEl, (val) => {
     updateTranscribeHint();
 });
 
+if (denoiseToggle) {
+    denoiseToggle.addEventListener('change', () => {
+        selectedDenoise = Boolean(denoiseToggle.checked);
+        localStorage.setItem('selectedDenoise', String(selectedDenoise));
+    });
+}
+
+if (llmPolishToggle) {
+    llmPolishToggle.addEventListener('change', () => {
+        selectedLlmPolish = Boolean(llmPolishToggle.checked);
+        localStorage.setItem('selectedLlmPolish', String(selectedLlmPolish));
+        if (llmConfigWrap) {
+            llmConfigWrap.classList.toggle('hidden', !selectedLlmPolish);
+        }
+        updateLlmPrivacyHint(llmPrivacyHint, selectedLlmBaseUrl);
+    });
+}
+
+bindLlmPresetButtons(llmPresetsEl, (preset) => {
+    if (!preset) return;
+    selectedLlmBaseUrl = preset.base_url || '';
+    selectedLlmModel = preset.model || '';
+    localStorage.setItem('selectedLlmBaseUrl', selectedLlmBaseUrl);
+    localStorage.setItem('selectedLlmModel', selectedLlmModel);
+    if (llmBaseUrlInput) llmBaseUrlInput.value = selectedLlmBaseUrl;
+    if (llmModelInput) llmModelInput.value = selectedLlmModel;
+    updateLlmPrivacyHint(llmPrivacyHint, selectedLlmBaseUrl);
+});
+
+if (llmBaseUrlInput) {
+    llmBaseUrlInput.addEventListener('input', () => {
+        selectedLlmBaseUrl = llmBaseUrlInput.value.trim();
+        localStorage.setItem('selectedLlmBaseUrl', selectedLlmBaseUrl);
+        updateLlmPrivacyHint(llmPrivacyHint, selectedLlmBaseUrl);
+    });
+}
+
+if (llmModelInput) {
+    llmModelInput.addEventListener('input', () => {
+        selectedLlmModel = llmModelInput.value.trim();
+        localStorage.setItem('selectedLlmModel', selectedLlmModel);
+    });
+}
+
+if (llmApiKeyInput) {
+    llmApiKeyInput.addEventListener('input', () => {
+        selectedLlmApiKey = llmApiKeyInput.value.trim();
+        writeSessionSecret('selectedLlmApiKey', selectedLlmApiKey);
+    });
+}
+
 // Post-recording separate transcription form events
 if (postAsrModelSelect) {
     postAsrModelSelect.addEventListener('change', () => {
@@ -1196,6 +1533,50 @@ bindPromptPresetButtons(postPromptPresetsEl, (val) => {
     updatePostAudioSourceHint();
 });
 
+if (postDenoiseToggle) {
+    postDenoiseToggle.addEventListener('change', () => {
+        postDenoise = Boolean(postDenoiseToggle.checked);
+    });
+}
+
+if (postLlmPolishToggle) {
+    postLlmPolishToggle.addEventListener('change', () => {
+        postLlmPolish = Boolean(postLlmPolishToggle.checked);
+        if (postLlmConfigWrap) {
+            postLlmConfigWrap.classList.toggle('hidden', !postLlmPolish);
+        }
+        updateLlmPrivacyHint(postLlmPrivacyHint, postLlmBaseUrl);
+    });
+}
+
+bindLlmPresetButtons(postLlmPresetsEl, (preset) => {
+    if (!preset) return;
+    postLlmBaseUrl = preset.base_url || '';
+    postLlmModel = preset.model || '';
+    if (postLlmBaseUrlInput) postLlmBaseUrlInput.value = postLlmBaseUrl;
+    if (postLlmModelInput) postLlmModelInput.value = postLlmModel;
+    updateLlmPrivacyHint(postLlmPrivacyHint, postLlmBaseUrl);
+});
+
+if (postLlmBaseUrlInput) {
+    postLlmBaseUrlInput.addEventListener('input', () => {
+        postLlmBaseUrl = postLlmBaseUrlInput.value.trim();
+        updateLlmPrivacyHint(postLlmPrivacyHint, postLlmBaseUrl);
+    });
+}
+
+if (postLlmModelInput) {
+    postLlmModelInput.addEventListener('input', () => {
+        postLlmModel = postLlmModelInput.value.trim();
+    });
+}
+
+if (postLlmApiKeyInput) {
+    postLlmApiKeyInput.addEventListener('input', () => {
+        postLlmApiKey = postLlmApiKeyInput.value.trim();
+    });
+}
+
 if (togglePostTranscribeBtn) {
     togglePostTranscribeBtn.addEventListener('click', () => {
         if (!postTranscribeForm) return;
@@ -1218,6 +1599,11 @@ if (postTranscribeBtn) {
             sensitivity: postSensitivity,
             audioTracks: postAudioTracks,
             customPrompt: postCustomPrompt,
+            denoise: postDenoise,
+            llmPolish: postLlmPolish,
+            llmBaseUrl: postLlmBaseUrl,
+            llmModel: postLlmModel,
+            llmApiKey: postLlmApiKey,
         });
     });
 }
@@ -1343,6 +1729,11 @@ async function uploadFile(file) {
     formData.append('diarization_sensitivity', selectedSensitivity);
     formData.append('audio_tracks', selectedAudioTracks);
     formData.append('custom_prompt', selectedCustomPrompt);
+    formData.append('denoise', String(Boolean(selectedDenoise)));
+    formData.append('llm_polish', String(Boolean(selectedLlmPolish)));
+    if (selectedLlmBaseUrl) formData.append('llm_base_url', selectedLlmBaseUrl);
+    if (selectedLlmModel) formData.append('llm_model', selectedLlmModel);
+    if (selectedLlmApiKey) formData.append('llm_api_key', selectedLlmApiKey);
 
     uploadAbortController = new AbortController();
 
@@ -1412,8 +1803,13 @@ async function startPostTranscription(taskId, opts = {}) {
     const chosenSens = opts.sensitivity || selectedSensitivity;
     const chosenTracks = opts.audioTracks || selectedAudioTracks;
     const chosenPrompt = opts.customPrompt !== undefined ? String(opts.customPrompt) : selectedCustomPrompt;
+    const chosenDenoise = opts.denoise !== undefined ? Boolean(opts.denoise) : Boolean(selectedDenoise);
+    const chosenLlmPolish = opts.llmPolish !== undefined ? Boolean(opts.llmPolish) : Boolean(selectedLlmPolish);
+    const chosenLlmUrl = opts.llmBaseUrl !== undefined ? String(opts.llmBaseUrl).trim() : selectedLlmBaseUrl;
+    const chosenLlmModel = opts.llmModel !== undefined ? String(opts.llmModel).trim() : selectedLlmModel;
+    const chosenLlmKey = opts.llmApiKey !== undefined ? String(opts.llmApiKey).trim() : selectedLlmApiKey;
 
-    // Remember user's latest transcription choices
+    // Remember user's latest transcription choices (API key stays in sessionStorage only, never localStorage)
     selectedAsrModel = chosenModel;
     selectedLanguage = chosenLang;
     selectedComputeDevice = chosenDev;
@@ -1421,6 +1817,12 @@ async function startPostTranscription(taskId, opts = {}) {
     selectedSensitivity = chosenSens;
     selectedAudioTracks = chosenTracks;
     selectedCustomPrompt = chosenPrompt;
+    selectedDenoise = chosenDenoise;
+    selectedLlmPolish = chosenLlmPolish;
+    if (chosenLlmUrl) selectedLlmBaseUrl = chosenLlmUrl;
+    if (chosenLlmModel) selectedLlmModel = chosenLlmModel;
+    selectedLlmApiKey = chosenLlmKey;
+    writeSessionSecret('selectedLlmApiKey', selectedLlmApiKey);
     postAsrModel = chosenModel;
     postLanguage = chosenLang;
     postComputeDevice = chosenDev;
@@ -1428,6 +1830,11 @@ async function startPostTranscription(taskId, opts = {}) {
     postSensitivity = chosenSens;
     postAudioTracks = chosenTracks;
     postCustomPrompt = chosenPrompt;
+    postDenoise = chosenDenoise;
+    postLlmPolish = chosenLlmPolish;
+    postLlmBaseUrl = selectedLlmBaseUrl;
+    postLlmModel = selectedLlmModel;
+    postLlmApiKey = selectedLlmApiKey;
     localStorage.setItem('selectedAsrModel', selectedAsrModel);
     localStorage.setItem('selectedLanguage', selectedLanguage);
     localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
@@ -1435,6 +1842,10 @@ async function startPostTranscription(taskId, opts = {}) {
     localStorage.setItem('selectedSensitivity', selectedSensitivity);
     localStorage.setItem('selectedAudioTracks', selectedAudioTracks);
     localStorage.setItem('selectedCustomPrompt', selectedCustomPrompt);
+    localStorage.setItem('selectedDenoise', String(selectedDenoise));
+    localStorage.setItem('selectedLlmPolish', String(selectedLlmPolish));
+    localStorage.setItem('selectedLlmBaseUrl', selectedLlmBaseUrl);
+    localStorage.setItem('selectedLlmModel', selectedLlmModel);
 
     prepareStatusPanelForRun('Транскрибация...', 'Запуск распознавания речи для готовой записи...');
 
@@ -1447,6 +1858,11 @@ async function startPostTranscription(taskId, opts = {}) {
     formData.append('diarization_sensitivity', chosenSens);
     formData.append('audio_tracks', chosenTracks);
     formData.append('custom_prompt', chosenPrompt);
+    formData.append('denoise', String(chosenDenoise));
+    formData.append('llm_polish', String(chosenLlmPolish));
+    if (selectedLlmBaseUrl) formData.append('llm_base_url', selectedLlmBaseUrl);
+    if (selectedLlmModel) formData.append('llm_model', selectedLlmModel);
+    if (chosenLlmKey) formData.append('llm_api_key', chosenLlmKey);
 
     try {
         const response = await fetch(`/api/transcribe/${taskId}`, {
@@ -1554,6 +1970,11 @@ function renderPostTranscribeSection(data = {}, opts = {}) {
     postSensitivity = data.diarization_sensitivity || selectedSensitivity;
     postAudioTracks = data.audio_tracks || selectedAudioTracks;
     postCustomPrompt = data.custom_prompt !== undefined ? String(data.custom_prompt) : selectedCustomPrompt;
+    postDenoise = data.denoise !== undefined ? Boolean(data.denoise) : Boolean(selectedDenoise);
+    postLlmPolish = data.llm_polish !== undefined ? Boolean(data.llm_polish) : Boolean(selectedLlmPolish);
+    postLlmBaseUrl = data.llm_base_url ? String(data.llm_base_url) : selectedLlmBaseUrl;
+    postLlmModel = data.llm_model ? String(data.llm_model) : selectedLlmModel;
+    postLlmApiKey = selectedLlmApiKey;
     renderPostTranscribeControls();
 
     postTranscribeSection.classList.remove('hidden');

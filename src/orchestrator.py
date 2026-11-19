@@ -25,6 +25,11 @@ from src.config import (
     DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
     DEFAULT_DIARIZATION_SENSITIVITY,
+    DEFAULT_LLM_API_KEY,
+    DEFAULT_LLM_BASE_URL,
+    DEFAULT_LLM_MODEL,
+    DENOISE_ENABLED_DEFAULT,
+    LLM_POLISH_ENABLED_DEFAULT,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     TRANSCRIPTION_ENABLED_DEFAULT,
@@ -141,6 +146,11 @@ class Orchestrator:
         custom_prompt: str = "",
         diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
         audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
+        denoise: bool = DENOISE_ENABLED_DEFAULT,
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         log_lock = threading.Lock()
 
@@ -195,13 +205,19 @@ class Orchestrator:
             and transcript_path
             and track_strategy != "dual"
             and requested_device == "cuda"
-            and profile_info.get("engine") == "faster_whisper"
+            and profile_info.get("supports_cuda")
         ):
-            from src.transcriber import probe_cuda_available
+            engine = profile_info.get("engine")
+            if engine == "faster_whisper":
+                from src.transcriber import probe_cuda_available
 
-            use_parallel_gpu = probe_cuda_available()
+                use_parallel_gpu = probe_cuda_available()
+            elif engine == "onnx_asr":
+                from src.transcriber import probe_onnx_cuda_available
 
-        # 2. Split Video & Parallel Audio / GPU Whisper ASR
+                use_parallel_gpu = probe_onnx_cuda_available()
+
+        # 2. Split Video & Parallel Audio / GPU ASR
         audio_future = None
         transcribe_extract_future = None
         parallel_gpu_future = None
@@ -267,6 +283,7 @@ class Orchestrator:
                                 cancel_token=cancel_token,
                                 language=language,
                                 custom_prompt=custom_prompt,
+                                denoise=denoise,
                             )
                             return True, asr_state
 
@@ -516,6 +533,10 @@ class Orchestrator:
                         cancel_token=cancel_token,
                         diarization_sensitivity=diarization_sensitivity,
                         custom_prompt=custom_prompt,
+                        llm_polish=llm_polish,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        llm_api_key=llm_api_key,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
                 elif track_strategy == "dual" and raw_track2_ready:
@@ -533,6 +554,11 @@ class Orchestrator:
                         language=language,
                         custom_prompt=custom_prompt,
                         diarization_sensitivity=diarization_sensitivity,
+                        denoise=denoise,
+                        llm_polish=llm_polish,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        llm_api_key=llm_api_key,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
                 else:
@@ -549,6 +575,11 @@ class Orchestrator:
                         language=language,
                         custom_prompt=custom_prompt,
                         diarization_sensitivity=diarization_sensitivity,
+                        denoise=denoise,
+                        llm_polish=llm_polish,
+                        llm_base_url=llm_base_url,
+                        llm_model=llm_model,
+                        llm_api_key=llm_api_key,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
             elif raw_wav_ready and cached_audio_path:
@@ -601,6 +632,11 @@ class Orchestrator:
         custom_prompt: str = "",
         diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
         audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
+        denoise: bool = DENOISE_ENABLED_DEFAULT,
+        llm_polish: bool = LLM_POLISH_ENABLED_DEFAULT,
+        llm_base_url: str = DEFAULT_LLM_BASE_URL,
+        llm_model: str = DEFAULT_LLM_MODEL,
+        llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         """
         Runs speaker-diarized transcription directly on a video/audio file (or
@@ -775,6 +811,11 @@ class Orchestrator:
                 language=language,
                 custom_prompt=custom_prompt,
                 diarization_sensitivity=diarization_sensitivity,
+                denoise=denoise,
+                llm_polish=llm_polish,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_api_key=llm_api_key,
             )
         else:
             update("Запуск локальной транскрибации по ролям...")
@@ -790,6 +831,11 @@ class Orchestrator:
                 language=language,
                 custom_prompt=custom_prompt,
                 diarization_sensitivity=diarization_sensitivity,
+                denoise=denoise,
+                llm_polish=llm_polish,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
+                llm_api_key=llm_api_key,
             )
 
         if cancel_token is not None:
@@ -798,6 +844,17 @@ class Orchestrator:
         shutil.copy2(staged_txt_path, f"{transcript_path}.part")
         os.replace(f"{transcript_path}.part", transcript_path)
         transcript_ready = os.path.isfile(transcript_path)
+
+        # Preserve optional raw pre-LLM backup next to the final transcript
+        staged_raw_path = os.path.splitext(staged_txt_path)[0] + "_raw.txt"
+        if os.path.isfile(staged_raw_path):
+            t_stem, t_ext = os.path.splitext(transcript_path)
+            raw_dest = f"{t_stem}_raw{t_ext or '.txt'}"
+            try:
+                shutil.copy2(staged_raw_path, f"{raw_dest}.part")
+                os.replace(f"{raw_dest}.part", raw_dest)
+            except OSError:
+                pass
 
         update(
             f"Success! Transcript saved to: {transcript_path}. "
