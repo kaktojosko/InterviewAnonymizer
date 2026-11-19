@@ -106,7 +106,7 @@ body {
 
 .container {
     width: 100%;
-    max-width: 580px;
+    max-width: 640px;
     padding: 1.75rem;
     z-index: 1;
 }
@@ -292,7 +292,7 @@ main {
     min-height: 46px;
     border: 1px solid transparent;
     border-radius: 14px;
-    padding: 0 2.65rem 0 1rem;
+    padding: 0.65rem 2.65rem 0.65rem 1rem;
     background: var(--sec-bg);
     color: var(--text-primary);
     font-family: inherit;
@@ -322,9 +322,9 @@ main {
 .clay-select-label {
     display: block;
     width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: break-word;
+    line-height: 1.32;
 }
 
 .clay-select-chevron {
@@ -352,7 +352,7 @@ main {
     border-radius: 16px;
     padding: 0.38rem;
     box-shadow: var(--dropdown-shadow);
-    max-height: 320px;
+    max-height: 360px;
     overflow-x: hidden;
     overflow-y: auto;
     scrollbar-width: thin;
@@ -414,9 +414,11 @@ main {
 }
 
 .clay-opt-text {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: break-word;
+    line-height: 1.32;
 }
 
 .clay-opt-meta {
