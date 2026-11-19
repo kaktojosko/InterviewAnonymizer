@@ -69,16 +69,30 @@ class FFmpegUtils:
             probe = ffmpeg.probe(input_path)
             
             if 'format' in probe and 'duration' in probe['format']:
-                duration = float(probe['format']['duration'])
+                try:
+                    duration = float(probe['format']['duration'])
+                except (TypeError, ValueError):
+                    duration = 0.0
                 
             for stream in probe.get('streams', []):
-                if stream['codec_type'] == 'video' and width is None:
-                    width = int(stream.get('width', 0))
-                    height = int(stream.get('height', 0))
+                if stream.get('codec_type') == 'video' and width is None:
+                    try:
+                        width = int(stream.get('width', 0))
+                        height = int(stream.get('height', 0))
+                    except (TypeError, ValueError):
+                        width, height = None, None
                     fps = FFmpegUtils._normalize_fps(stream)
-                elif stream['codec_type'] == 'audio' and not has_audio:
+                elif stream.get('codec_type') == 'audio' and not has_audio:
                     has_audio = True
-                    sample_rate = int(stream.get('sample_rate', 44100))
+                    try:
+                        sample_rate = int(stream.get('sample_rate', 44100))
+                    except (TypeError, ValueError):
+                        sample_rate = 44100
+                if duration <= 0.0 and 'duration' in stream:
+                    try:
+                        duration = float(stream['duration'])
+                    except (TypeError, ValueError):
+                        pass
                     
         except ffmpeg.Error:
             pass
@@ -203,6 +217,7 @@ class FFmpegUtils:
                     output_wav_path,
                     map='0:a:0',
                     vn=None,
+                    af='highpass=f=65',
                     ac=1,
                     ar=16000,
                     acodec='pcm_s16le',

@@ -258,7 +258,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.4.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.5.0)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -752,13 +752,17 @@ def test_decode_whisper_windows_cpu_optimizations_and_parallel_workers(monkeypat
     assert len(transcribe_calls) == 2
     for call_kw in transcribe_calls:
         assert call_kw["language"] == "ru"
-        assert call_kw["multilingual"] is True
+        assert call_kw["multilingual"] is False
         assert call_kw["word_timestamps"] is True
         assert call_kw["beam_size"] == 2
         assert call_kw["temperature"] == (0.0, 0.2, 0.4)
-        assert call_kw["compression_ratio_threshold"] == pytest.approx(2.65)
+        assert call_kw["compression_ratio_threshold"] == pytest.approx(2.4)
+        assert call_kw["log_prob_threshold"] == pytest.approx(-1.0)
+        assert call_kw["repetition_penalty"] == pytest.approx(1.08)
+        assert call_kw["hallucination_silence_threshold"] == pytest.approx(1.5)
         assert "-" not in call_kw["prepend_punctuations"]
-        assert "SQL" in call_kw["initial_prompt"]
+        # Hardcoded SQL/ClickHouse prompt must never be injected!
+        assert call_kw["initial_prompt"] is None
 
     # Chronological order preserved despite window 1 sleeping longer than window 2!
     assert [u.text.strip() for u in units] == ["Монолог первого спикера.", "Вопрос?", "Ответ!"]
@@ -1009,6 +1013,7 @@ def test_sequential_whisper_rolling_context_and_large_v3_single_worker(monkeypat
 
     init_kwargs = {}
     prompts_seen = []
+    calls_seen = []
 
     class _FakeLargeV3Model:
         def __init__(self, model_dir, **kwargs):
@@ -1019,11 +1024,12 @@ def test_sequential_whisper_rolling_context_and_large_v3_single_worker(monkeypat
 
         def transcribe(self, audio_slice, **kwargs):
             prompts_seen.append(kwargs.get("initial_prompt"))
+            calls_seen.append(dict(kwargs))
             idx = len(prompts_seen)
             txt = (
-                " Мы используем inner join и intersect."
+                " Мы обсуждали организацию проекта и сроки."
                 if idx == 1
-                else " А ещё у нас есть UNION в реляционной базе."
+                else " А ещё важно согласовать бюджет на квартал."
             )
             seg = SimpleNamespace(
                 start=0.1,
@@ -1041,10 +1047,10 @@ def test_sequential_whisper_rolling_context_and_large_v3_single_worker(monkeypat
 
     sr = 16000
     samples = np.ones(sr * 65, dtype=np.float32) * 0.04
-    # Two adjacent ~27s windows separated by <1s gap, followed by a window after a 6s silence
+    # Two adjacent ~26s windows separated by <1s gap, followed by a window after a 6s silence
     diar = [
-        DiarizationSegment(0.5, 27.5, speaker=0),
-        DiarizationSegment(28.0, 52.0, speaker=1),
+        DiarizationSegment(0.5, 26.5, speaker=0),
+        DiarizationSegment(27.0, 52.0, speaker=1),
         DiarizationSegment(59.0, 63.0, speaker=0),
     ]
 
@@ -1058,15 +1064,135 @@ def test_sequential_whisper_rolling_context_and_large_v3_single_worker(monkeypat
         diar_segments=diar,
         threads=12,
         status_cb=None,
+        language="ru",
     )
 
     # large-v3 caps num_workers=1 on CPU to preserve RAM bandwidth & enable rolling context
     assert init_kwargs["num_workers"] == 1
     assert init_kwargs["cpu_threads"] == 12
     assert len(prompts_seen) == 3
-    # Window 1 gets base style prompt only; Window 2 (<2.5s gap) gets base + Window 1 clean tail;
-    # Window 3 (>2.5s silence gap) resets to base style prompt only!
-    assert "inner join" not in prompts_seen[0]
-    assert "Мы используем inner join и intersect." in prompts_seen[1]
-    assert "UNION в реляционной базе" not in prompts_seen[2]
+    # Window 1 gets NO hardcoded SQL/IT prompt; Window 2 (<2.5s gap) gets Window 1 clean tail;
+    # Window 3 (>2.5s silence gap) resets to None!
+    assert prompts_seen[0] is None
+    assert "Мы обсуждали организацию проекта и сроки." in (prompts_seen[1] or "")
+    assert prompts_seen[2] is None
+    # Explicit Russian language locks multilingual=False and uses stronger CPU beam_size=3
+    assert all(c["language"] == "ru" and c["multilingual"] is False for c in calls_seen)
+    assert all(c["beam_size"] == 3 for c in calls_seen)
+
+
+def test_gigaam_v3_transducer_engine_feature_dim_64_and_bpe_tokens(monkeypatch):
+    from types import SimpleNamespace
+
+    from_transducer_kwargs = {}
+
+    class _FakeStream:
+        def __init__(self):
+            self.result = None
+
+        def accept_waveform(self, sr, wav):
+            self.sr = sr
+            self.wav = wav
+
+    class _FakeGigaAMRecognizer:
+        def create_stream(self):
+            return _FakeStream()
+
+        def decode_stream(self, stream):
+            # Mimics real GigaAM v3 e2e RNN-T BPE output with space-prefixed Cyrillic tokens + punctuation
+            stream.result = SimpleNamespace(
+                tokens=[" При", "вет", ",", " ", "как", " де", "ла", "?"],
+                timestamps=[0.10, 0.25, 0.40, 0.50, 0.60, 0.80, 0.95, 1.10],
+                text="Привет, как дела?",
+            )
+
+        def decode_streams(self, streams):
+            for s in streams:
+                self.decode_stream(s)
+
+    def _mock_from_transducer(**kwargs):
+        from_transducer_kwargs.update(kwargs)
+        return _FakeGigaAMRecognizer()
+
+    monkeypatch.setattr(tr_mod.sherpa_onnx.OfflineRecognizer, "from_transducer", staticmethod(_mock_from_transducer))
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    sr = 16000
+    samples = np.ones(sr * 5, dtype=np.float32) * 0.05
+    diar = [DiarizationSegment(0.2, 2.5, speaker=0)]
+
+    units = Transcriber._run_sherpa_transducer(
+        samples=samples,
+        sample_rate=sr,
+        model_dir="/tmp/fake_gigaam_v3",
+        diar_segments=diar,
+        profile_id="gigaam-v3",
+        threads=4,
+    )
+
+    assert from_transducer_kwargs["feature_dim"] == 64
+    assert from_transducer_kwargs["model_type"] == "nemo_transducer"
+    assert from_transducer_kwargs["encoder"].endswith("encoder.int8.onnx")
+    assert from_transducer_kwargs["decoder"].endswith("decoder.onnx")
+    assert from_transducer_kwargs["joiner"].endswith("joiner.onnx")
+    assert from_transducer_kwargs["tokens"].endswith("tokens.txt")
+
+    turns, spk_count = align_units_to_speakers(units, diar)
+    assert spk_count == 1
+    assert len(turns) == 1
+    assert turns[0].text == "Привет, как дела?"
+
+
+def test_whisper_language_resolution_and_russian_phantom_filter():
+    from src.transcriber import _resolve_whisper_language, is_whisper_phantom_hallucination
+
+    sr = 16000
+    samples = np.ones(sr * 30, dtype=np.float32) * 0.05
+    wins = [(0.0, 5.0, 0, 5 * sr), (6.0, 11.0, 6 * sr, 11 * sr), (12.0, 17.0, 12 * sr, 17 * sr)]
+
+    class _UnanimousRuModel:
+        def detect_language(self, audio=None):
+            return "ru", 0.94, [("ru", 0.94)]
+
+    class _MixedLangModel:
+        def __init__(self):
+            self.n = 0
+
+        def detect_language(self, audio=None):
+            self.n += 1
+            return ("ru", 0.90, []) if self.n % 2 == 1 else ("en", 0.88, [])
+
+    # 1. Explicit 'ru' always locks language='ru', multilingual=False
+    assert _resolve_whisper_language(_MixedLangModel(), wins, samples, "ru", "large-v3") == ("ru", False)
+    # 2. 'large-v3-ru' defaults to locked Russian even if 'auto' is passed
+    assert _resolve_whisper_language(_MixedLangModel(), wins, samples, "auto", "large-v3-ru") == ("ru", False)
+    # 3. 'auto' with unanimous high-confidence probes locks language to avoid per-window flips
+    assert _resolve_whisper_language(_UnanimousRuModel(), wins, samples, "auto", "large-v3") == ("ru", False)
+    # 4. 'auto' with genuinely mixed languages enables multilingual=True
+    assert _resolve_whisper_language(_MixedLangModel(), wins, samples, "auto", "large-v3") == ("ru", True)
+
+    # Phantom Russian subtitle hallucinations are dropped while normal speech stays intact
+    assert is_whisper_phantom_hallucination("Продолжение следует...", no_speech_prob=0.4, avg_logprob=-0.6) is True
+    assert is_whisper_phantom_hallucination("Редактор субтитров А.Семкин", no_speech_prob=0.05, avg_logprob=-0.2) is True
+    assert is_whisper_phantom_hallucination("Субтитры сделал DimaTorzok") is True
+    assert is_whisper_phantom_hallucination("Спасибо за просмотр!", no_speech_prob=0.35, avg_logprob=-0.5) is True
+    assert is_whisper_phantom_hallucination("Здравствуйте, расскажите о вашем проекте.", no_speech_prob=0.05, avg_logprob=-0.2) is False
+
+
+def test_load_wav_16k_mono_click_resistant_normalization(tmp_path):
+    wav_path = str(tmp_path / "quiet_with_click.wav")
+    sr = 16000
+    t = np.linspace(0, 1.0, sr, endpoint=False)
+    sig = (0.04 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16)
+    # Inject an isolated full-scale mic click that previously disabled peak normalization!
+    sig[100] = 32000
+    sig[101] = -32000
+    _write_pcm16_wav(wav_path, sig, sample_rate=sr, channels=1)
+
+    samples, _ = load_wav_16k_mono(wav_path, normalize_gain=True)
+    # Quiet speech body (excluding click) must still be boosted ~10x (0.04 -> ~0.40)
+    speech_p95 = float(np.percentile(np.abs(samples[500:]), 95))
+    assert speech_p95 >= 0.35
+
 

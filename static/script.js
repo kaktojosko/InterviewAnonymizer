@@ -1,5 +1,7 @@
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
+const dropZoneTitle = document.getElementById('dropZoneTitle');
+const dropZoneHint = document.getElementById('dropZoneHint');
 
 // Theme Toggle Logic
 const themeToggle = document.getElementById('themeToggle');
@@ -45,34 +47,92 @@ const downloadBtn = document.getElementById('downloadBtn');
 const downloadTranscriptBtn = document.getElementById('downloadTranscriptBtn');
 const resetBtn = document.getElementById('resetBtn');
 const debugLog = document.getElementById('debugLog');
+
+const modeAnonymizeBtn = document.getElementById('modeAnonymizeBtn');
+const modeTranscribeOnlyBtn = document.getElementById('modeTranscribeOnlyBtn');
 const workerValue = document.getElementById('workerValue');
 const workerSelect = document.getElementById('workerSelect');
 const customWorkerWrap = document.getElementById('customWorkerWrap');
 const customWorkerInput = document.getElementById('customWorkerInput');
 const workerLimitText = document.getElementById('workerLimitText');
 const transcribeToggle = document.getElementById('transcribeToggle');
+const transcribeSwitchWrap = document.getElementById('transcribeSwitchWrap');
 const transcribeStateBadge = document.getElementById('transcribeStateBadge');
 const transcribeOptionsWrap = document.getElementById('transcribeOptionsWrap');
 const asrModelSelect = document.getElementById('asrModelSelect');
+const languageSelect = document.getElementById('languageSelect');
 const computeDeviceSelect = document.getElementById('computeDeviceSelect');
 const speakerCountSelect = document.getElementById('speakerCountSelect');
+const transcribeHintText = document.getElementById('transcribeHintText');
+
+const recordingsSection = document.getElementById('recordingsSection');
+const recordingsCount = document.getElementById('recordingsCount');
+const recordingsList = document.getElementById('recordingsList');
+
+const postTranscribeSection = document.getElementById('postTranscribeSection');
+const togglePostTranscribeBtn = document.getElementById('togglePostTranscribeBtn');
+const postTranscribeForm = document.getElementById('postTranscribeForm');
+const postTranscribeTitle = document.getElementById('postTranscribeTitle');
+const postAsrModelSelect = document.getElementById('postAsrModelSelect');
+const postLanguageSelect = document.getElementById('postLanguageSelect');
+const postComputeDeviceSelect = document.getElementById('postComputeDeviceSelect');
+const postSpeakerCountSelect = document.getElementById('postSpeakerCountSelect');
+const postAudioSourceHint = document.getElementById('postAudioSourceHint');
+const postTranscribeBtn = document.getElementById('postTranscribeBtn');
 
 let currentTaskId = null;
 let pollInterval = null;
 let taskFinished = false;
 let uploadAbortController = null;
 let cancelRequested = false;
+let lastTaskData = null;
+let currentRunIsPostTranscribe = false;
+let postHasOriginalAudio = true;
+
+let selectedJobMode = localStorage.getItem('selectedJobMode') || 'anonymize';
+if (selectedJobMode !== 'anonymize' && selectedJobMode !== 'transcribe_only') {
+    selectedJobMode = 'anonymize';
+}
 let selectedWorkers = localStorage.getItem('selectedWorkers') || '4';
 let customWorkers = localStorage.getItem('customWorkers') || '';
 let serverCpuCount = null;
 let serverMaxWorkers = null;
 let serverCudaAvailable = null;
+let serverAsrModelsMeta = new Map();
+let transcribeOnlyExtensions = [
+    '.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v',
+    '.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac', '.aac', '.wma',
+];
 
 const savedTranscribe = localStorage.getItem('transcribeEnabled');
 let transcribeEnabled = savedTranscribe === null ? true : savedTranscribe !== 'false';
-let selectedAsrModel = localStorage.getItem('selectedAsrModel') || 'turbo';
+let selectedAsrModel = localStorage.getItem('selectedAsrModel') || 'gigaam-v3';
+let selectedLanguage = localStorage.getItem('selectedLanguage') || 'ru';
 let selectedComputeDevice = localStorage.getItem('selectedComputeDevice') || 'cpu';
 let selectedSpeakers = localStorage.getItem('selectedSpeakers') || 'auto';
+
+// Post-recording separate transcription form state (initialized from main settings)
+let postAsrModel = selectedAsrModel;
+let postLanguage = selectedLanguage;
+let postComputeDevice = selectedComputeDevice;
+let postSpeakers = selectedSpeakers;
+
+function isCpuOnlyAsrModel(modelId) {
+    if (serverAsrModelsMeta.has(modelId)) {
+        return !serverAsrModelsMeta.get(modelId).supports_cuda;
+    }
+    return modelId === 'gigaam-v3' || modelId === 'parakeet';
+}
+
+function getGpuFallbackModel(currentModelId, selectEl) {
+    const hasOpt = (id) => Boolean(selectEl && Array.from(selectEl.options).some((opt) => opt.value === id));
+    if (currentModelId === 'gigaam-v3' && hasOpt('large-v3-ru')) {
+        return 'large-v3-ru';
+    }
+    if (hasOpt('turbo')) return 'turbo';
+    if (hasOpt('large-v3-ru')) return 'large-v3-ru';
+    return 'turbo';
+}
 
 // --- Custom Claymorphism Select Enhancement ---
 const claySelectRegistry = new Map();
@@ -87,6 +147,7 @@ function closeAllClaySelects(exceptWrapper = null) {
 }
 
 function syncClaySelect(selectEl) {
+    if (!selectEl) return;
     const entry = claySelectRegistry.get(selectEl);
     if (!entry) return;
 
@@ -257,7 +318,17 @@ function enhanceSelect(selectEl) {
 
 document.addEventListener('click', () => closeAllClaySelects());
 
-[workerSelect, asrModelSelect, computeDeviceSelect, speakerCountSelect].forEach(enhanceSelect);
+[
+    workerSelect,
+    asrModelSelect,
+    languageSelect,
+    computeDeviceSelect,
+    speakerCountSelect,
+    postAsrModelSelect,
+    postLanguageSelect,
+    postComputeDeviceSelect,
+    postSpeakerCountSelect,
+].forEach(enhanceSelect);
 
 function stopPolling() {
     if (pollInterval) {
@@ -314,41 +385,113 @@ function renderWorkerControls() {
     validateWorkerSelection();
 }
 
-function applyComputeDeviceAvailability() {
-    if (!computeDeviceSelect) return;
+function applyComputeDeviceAvailabilityToPair(deviceSelectEl, modelId, currentDevice, onUpdate) {
+    if (!deviceSelectEl) return { device: currentDevice, model: modelId };
     const cudaMissingOnHost = serverCudaAvailable === false;
-    if (selectedComputeDevice === 'cuda' && cudaMissingOnHost) {
-        selectedComputeDevice = 'cpu';
-    } else if (selectedComputeDevice === 'cuda' && selectedAsrModel === 'parakeet') {
-        selectedAsrModel = 'turbo';
-        localStorage.setItem('selectedAsrModel', selectedAsrModel);
+    let nextDevice = currentDevice;
+    let nextModel = modelId;
+
+    if (nextDevice === 'cuda' && cudaMissingOnHost) {
+        nextDevice = 'cpu';
+    } else if (nextDevice === 'cuda' && isCpuOnlyAsrModel(nextModel)) {
+        const targetSelect = deviceSelectEl === postComputeDeviceSelect ? postAsrModelSelect : asrModelSelect;
+        nextModel = getGpuFallbackModel(nextModel, targetSelect);
     }
 
-    const parakeetSelected = selectedAsrModel === 'parakeet';
-    Array.from(computeDeviceSelect.options).forEach((opt) => {
+    const cpuOnlySelected = isCpuOnlyAsrModel(nextModel);
+    Array.from(deviceSelectEl.options).forEach((opt) => {
         if (opt.value !== 'cuda') return;
         opt.disabled = cudaMissingOnHost;
         if (cudaMissingOnHost) {
             opt.dataset.limitHint = 'нет GPU';
             opt.dataset.infoHint = '';
             opt.title = 'NVIDIA CUDA не обнаружена (для Docker запустите с docker-compose.gpu.yml)';
-        } else if (parakeetSelected) {
+        } else if (cpuOnlySelected) {
             opt.dataset.limitHint = '';
-            opt.dataset.infoHint = 'Whisper';
-            opt.title = 'При выборе GPU модель автоматически переключится на Whisper Turbo';
+            opt.dataset.infoHint = nextModel === 'gigaam-v3' ? 'Whisper RU' : 'Whisper';
+            opt.title = nextModel === 'gigaam-v3'
+                ? 'При выборе GPU модель автоматически переключится на Whisper Large v3 RU'
+                : 'При выборе GPU модель автоматически переключится на Whisper Turbo';
         } else {
             opt.dataset.limitHint = '';
             opt.dataset.infoHint = '';
             opt.title = '';
         }
     });
+
+    if (onUpdate) onUpdate(nextDevice, nextModel);
+    return { device: nextDevice, model: nextModel };
+}
+
+function applyComputeDeviceAvailability() {
+    applyComputeDeviceAvailabilityToPair(
+        computeDeviceSelect,
+        selectedAsrModel,
+        selectedComputeDevice,
+        (nextDev, nextMod) => {
+            selectedComputeDevice = nextDev;
+            if (nextMod !== selectedAsrModel) {
+                selectedAsrModel = nextMod;
+                localStorage.setItem('selectedAsrModel', selectedAsrModel);
+            }
+        }
+    );
+}
+
+function updateTranscribeHint() {
+    if (!transcribeHintText) return;
+    if (selectedAsrModel === 'gigaam-v3') {
+        transcribeHintText.textContent = selectedLanguage === 'en'
+            ? 'GigaAM v3 специализирована на русском языке; для английской речи выберите Whisper.'
+            : 'Sber GigaAM v3: лучшая точность на русской речи, встроенная пунктуация и регистр. Офлайн на CPU.';
+    } else if (selectedAsrModel === 'large-v3-ru') {
+        transcribeHintText.textContent = 'Русский файнтюн Whisper Large v3: высокая точность на русской речи и английских терминах (CPU/GPU).';
+    } else {
+        transcribeHintText.textContent = 'Отдельный .txt с таймкодами и ролями. Выбор «Русский (RU)» отключает случайное переключение языка.';
+    }
+}
+
+function renderModeControls() {
+    const isTranscribeOnly = selectedJobMode === 'transcribe_only';
+    if (modeAnonymizeBtn) {
+        modeAnonymizeBtn.classList.toggle('is-active', !isTranscribeOnly);
+        modeAnonymizeBtn.setAttribute('aria-selected', String(!isTranscribeOnly));
+    }
+    if (modeTranscribeOnlyBtn) {
+        modeTranscribeOnlyBtn.classList.toggle('is-active', isTranscribeOnly);
+        modeTranscribeOnlyBtn.setAttribute('aria-selected', String(isTranscribeOnly));
+    }
+    if (dropZoneTitle) {
+        dropZoneTitle.textContent = isTranscribeOnly
+            ? 'Перетащите видео или аудио сюда'
+            : 'Перетащите видео сюда';
+    }
+    if (dropZoneHint) {
+        dropZoneHint.textContent = isTranscribeOnly
+            ? 'или выберите файл (.mp4, .mp3, .wav, .m4a, .mkv, .ogg...)'
+            : 'или выберите файл (.mp4)';
+    }
+    if (fileInput) {
+        fileInput.accept = isTranscribeOnly ? transcribeOnlyExtensions.join(',') : '.mp4';
+    }
 }
 
 function renderTranscriptionControls() {
-    transcribeToggle.checked = transcribeEnabled;
-    transcribeOptionsWrap.classList.toggle('hidden', !transcribeEnabled);
-    transcribeStateBadge.textContent = transcribeEnabled ? 'Вкл' : 'Выкл';
-    transcribeStateBadge.classList.toggle('off', !transcribeEnabled);
+    const isTranscribeOnly = selectedJobMode === 'transcribe_only';
+    const effectiveTranscribe = isTranscribeOnly || transcribeEnabled;
+
+    transcribeToggle.checked = effectiveTranscribe;
+    if (transcribeSwitchWrap) {
+        transcribeSwitchWrap.classList.toggle('hidden', isTranscribeOnly);
+    }
+    transcribeOptionsWrap.classList.toggle('hidden', !effectiveTranscribe);
+    if (isTranscribeOnly) {
+        transcribeStateBadge.textContent = 'Режим транскрибации';
+        transcribeStateBadge.classList.remove('off');
+    } else {
+        transcribeStateBadge.textContent = transcribeEnabled ? 'Вкл' : 'Выкл';
+        transcribeStateBadge.classList.toggle('off', !transcribeEnabled);
+    }
 
     applyComputeDeviceAvailability();
 
@@ -359,6 +502,16 @@ function renderTranscriptionControls() {
         asrModelSelect.value = selectedAsrModel;
     }
     syncClaySelect(asrModelSelect);
+
+    if (languageSelect) {
+        if (Array.from(languageSelect.options).some((opt) => opt.value === selectedLanguage)) {
+            languageSelect.value = selectedLanguage;
+        } else if (languageSelect.options.length > 0) {
+            selectedLanguage = languageSelect.options[0].value;
+            languageSelect.value = selectedLanguage;
+        }
+        syncClaySelect(languageSelect);
+    }
 
     if (computeDeviceSelect) {
         if (Array.from(computeDeviceSelect.options).some((opt) => opt.value === selectedComputeDevice && !opt.disabled)) {
@@ -377,6 +530,79 @@ function renderTranscriptionControls() {
         speakerCountSelect.value = 'auto';
     }
     syncClaySelect(speakerCountSelect);
+    updateTranscribeHint();
+}
+
+function updatePostAudioSourceHint() {
+    if (!postAudioSourceHint) return;
+    const sourceText = postHasOriginalAudio
+        ? 'Используется оригинальная аудиодорожка (без искажения голоса).'
+        : 'Используется аудиодорожка из сохранённой записи.';
+    if (postAsrModel === 'gigaam-v3' && postLanguage === 'en') {
+        postAudioSourceHint.textContent =
+            `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Whisper.`;
+    } else {
+        postAudioSourceHint.textContent = sourceText;
+    }
+}
+
+function renderPostTranscribeControls() {
+    if (!postAsrModelSelect) return;
+    applyComputeDeviceAvailabilityToPair(
+        postComputeDeviceSelect,
+        postAsrModel,
+        postComputeDevice,
+        (nextDev, nextMod) => {
+            postComputeDevice = nextDev;
+            postAsrModel = nextMod;
+        }
+    );
+
+    if (Array.from(postAsrModelSelect.options).some((opt) => opt.value === postAsrModel)) {
+        postAsrModelSelect.value = postAsrModel;
+    } else if (postAsrModelSelect.options.length > 0) {
+        postAsrModel = postAsrModelSelect.options[0].value;
+        postAsrModelSelect.value = postAsrModel;
+    }
+    syncClaySelect(postAsrModelSelect);
+
+    if (postLanguageSelect) {
+        if (Array.from(postLanguageSelect.options).some((opt) => opt.value === postLanguage)) {
+            postLanguageSelect.value = postLanguage;
+        } else if (postLanguageSelect.options.length > 0) {
+            postLanguage = postLanguageSelect.options[0].value;
+            postLanguageSelect.value = postLanguage;
+        }
+        syncClaySelect(postLanguageSelect);
+    }
+
+    if (postComputeDeviceSelect) {
+        if (Array.from(postComputeDeviceSelect.options).some((opt) => opt.value === postComputeDevice && !opt.disabled)) {
+            postComputeDeviceSelect.value = postComputeDevice;
+        } else {
+            postComputeDevice = 'cpu';
+            postComputeDeviceSelect.value = 'cpu';
+        }
+        syncClaySelect(postComputeDeviceSelect);
+    }
+
+    if (postSpeakerCountSelect) {
+        if (Array.from(postSpeakerCountSelect.options).some((opt) => opt.value === postSpeakers)) {
+            postSpeakerCountSelect.value = postSpeakers;
+        } else {
+            postSpeakers = 'auto';
+            postSpeakerCountSelect.value = 'auto';
+        }
+        syncClaySelect(postSpeakerCountSelect);
+    }
+    updatePostAudioSourceHint();
+}
+
+function setJobMode(mode) {
+    selectedJobMode = mode === 'transcribe_only' ? 'transcribe_only' : 'anonymize';
+    localStorage.setItem('selectedJobMode', selectedJobMode);
+    renderModeControls();
+    renderTranscriptionControls();
 }
 
 function validateWorkerSelection() {
@@ -449,6 +675,172 @@ function syncSelectOptionsIfChanged(selectEl, items) {
     });
 }
 
+function formatFileSize(bytes) {
+    const n = Number(bytes) || 0;
+    if (n <= 0) return '';
+    if (n < 1024 * 1024) return `${Math.max(1, Math.round(n / 1024))} КБ`;
+    return `${(n / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function renderRecordingsList(recordings) {
+    if (!recordingsSection || !recordingsList) return;
+    if (!Array.isArray(recordings) || recordings.length === 0) {
+        recordingsSection.classList.add('hidden');
+        recordingsList.innerHTML = '';
+        if (recordingsCount) recordingsCount.textContent = '0';
+        return;
+    }
+
+    recordingsSection.classList.remove('hidden');
+    if (recordingsCount) recordingsCount.textContent = String(recordings.length);
+    recordingsList.innerHTML = '';
+
+    recordings.forEach((rec) => {
+        const item = document.createElement('div');
+        item.className = 'recording-item';
+
+        const top = document.createElement('div');
+        top.className = 'recording-top';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'recording-name';
+        nameEl.textContent = rec.original_filename || `Запись ${String(rec.task_id).slice(0, 8)}`;
+        top.appendChild(nameEl);
+
+        const badge = document.createElement('span');
+        badge.className = rec.transcript_ready ? 'recording-badge' : 'recording-badge muted';
+        badge.textContent = rec.transcript_ready ? 'Транскрипт готов' : 'Без транскрипта';
+        top.appendChild(badge);
+        item.appendChild(top);
+
+        const meta = document.createElement('div');
+        meta.className = 'recording-meta';
+        const metaParts = [];
+        if (rec.created_at) {
+            const dt = new Date(rec.created_at);
+            if (!Number.isNaN(dt.getTime())) {
+                metaParts.push(dt.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }));
+            }
+        }
+        if (rec.video_ready && rec.video_size_bytes) {
+            metaParts.push(`MP4 ${formatFileSize(rec.video_size_bytes)}`);
+        }
+        if (rec.has_original_audio) {
+            metaParts.push('ориг. голос в кэше');
+        }
+        meta.textContent = metaParts.join(' • ');
+        item.appendChild(meta);
+
+        const actions = document.createElement('div');
+        actions.className = 'recording-actions';
+
+        if (rec.video_ready) {
+            const dlVid = document.createElement('button');
+            dlVid.type = 'button';
+            dlVid.className = 'recording-chip';
+            dlVid.textContent = 'Скачать .mp4';
+            dlVid.addEventListener('click', () => {
+                window.location.href = `/api/download/${rec.task_id}`;
+            });
+            actions.appendChild(dlVid);
+        }
+
+        if (rec.transcript_ready) {
+            const dlTxt = document.createElement('button');
+            dlTxt.type = 'button';
+            dlTxt.className = 'recording-chip';
+            dlTxt.textContent = 'Скачать .txt';
+            dlTxt.addEventListener('click', () => {
+                window.location.href = `/api/download-transcript/${rec.task_id}`;
+            });
+            actions.appendChild(dlTxt);
+        }
+
+        if (rec.can_transcribe) {
+            const trBtn = document.createElement('button');
+            trBtn.type = 'button';
+            trBtn.className = rec.transcript_ready ? 'recording-chip' : 'recording-chip recording-chip-primary';
+            trBtn.textContent = rec.transcript_ready ? 'Пересоздать транскрипт' : 'Создать транскрипт';
+            trBtn.title = `Запустить сразу (модель: ${selectedAsrModel}, язык: ${selectedLanguage})`;
+            trBtn.addEventListener('click', () => {
+                startPostTranscription(rec.task_id, {
+                    asrModel: selectedAsrModel,
+                    language: selectedLanguage,
+                    computeDevice: selectedComputeDevice,
+                    speakers: selectedSpeakers,
+                });
+            });
+            actions.appendChild(trBtn);
+
+            const cfgBtn = document.createElement('button');
+            cfgBtn.type = 'button';
+            cfgBtn.className = 'recording-chip';
+            cfgBtn.textContent = 'Настроить';
+            cfgBtn.title = 'Выбрать модель, язык и число спикеров перед транскрибацией';
+            cfgBtn.addEventListener('click', () => openRecordingPanel(rec));
+            actions.appendChild(cfgBtn);
+        }
+
+        item.appendChild(actions);
+        recordingsList.appendChild(item);
+    });
+}
+
+function openRecordingPanel(rec) {
+    if (!rec || !rec.task_id) return;
+    stopPolling();
+    closeAllClaySelects();
+    currentTaskId = rec.task_id;
+    taskFinished = true;
+    cancelRequested = false;
+    currentRunIsPostTranscribe = false;
+
+    const taskData = {
+        task_id: rec.task_id,
+        status: 'completed',
+        mode: rec.video_ready ? 'anonymize' : 'transcribe_only',
+        video_ready: Boolean(rec.video_ready),
+        transcript_ready: Boolean(rec.transcript_ready),
+        has_original_audio: Boolean(rec.has_original_audio),
+        can_transcribe: Boolean(rec.can_transcribe),
+        asr_model: rec.asr_model || selectedAsrModel,
+        language: rec.language || selectedLanguage,
+        compute_device: selectedComputeDevice,
+        speakers: selectedSpeakers,
+        original_filename: rec.original_filename || '',
+    };
+    lastTaskData = taskData;
+
+    uploadPanel.classList.add('hidden');
+    statusPanel.classList.remove('hidden');
+    spinner.classList.add('hidden');
+    if (cancelIcon) cancelIcon.classList.add('hidden');
+    if (cancelBtn) cancelBtn.classList.add('hidden');
+    successIcon.classList.remove('hidden');
+    debugLog.classList.add('hidden');
+    debugLog.innerHTML = '';
+
+    statusText.textContent = rec.original_filename || `Запись ${String(rec.task_id).slice(0, 8)}`;
+    statusSubText.textContent = rec.transcript_ready
+        ? 'Выберите модель и параметры ниже, чтобы пересоздать транскрипт.'
+        : 'Выберите модель и параметры ниже, чтобы создать транскрипт.';
+
+    bindDownloadButtons(taskData);
+    renderPostTranscribeSection(taskData, { forceExpandForm: true });
+    resetBtn.classList.remove('hidden');
+}
+
+async function loadRecordings() {
+    if (!recordingsSection) return;
+    try {
+        const response = await fetch('/api/recordings');
+        if (!response || !response.ok) return;
+        const data = await response.json();
+        renderRecordingsList(data.recordings || []);
+    } catch (_err) {
+        // Ignore gracefully if endpoint unavailable in mocked tests
+    }
+}
+
 async function loadServerConfig() {
     try {
         const response = await fetch('/api/config');
@@ -459,16 +851,36 @@ async function loadServerConfig() {
         if (typeof data.cuda_available === 'boolean') {
             serverCudaAvailable = data.cuda_available;
         }
+        if (Array.isArray(data.transcribe_only_extensions) && data.transcribe_only_extensions.length > 0) {
+            transcribeOnlyExtensions = data.transcribe_only_extensions;
+        }
 
         if (Array.isArray(data.asr_models) && data.asr_models.length > 0) {
+            serverAsrModelsMeta = new Map();
+            data.asr_models.forEach((m) => {
+                serverAsrModelsMeta.set(m.id, {
+                    supports_cuda: m.supports_cuda !== undefined ? Boolean(m.supports_cuda) : (m.id !== 'gigaam-v3' && m.id !== 'parakeet'),
+                    fixed_language: m.fixed_language || null,
+                });
+            });
             syncSelectOptionsIfChanged(asrModelSelect, data.asr_models);
+            syncSelectOptionsIfChanged(postAsrModelSelect, data.asr_models);
             if (!localStorage.getItem('selectedAsrModel') && data.default_asr_model) {
                 selectedAsrModel = data.default_asr_model;
             }
         }
 
+        if (Array.isArray(data.languages) && data.languages.length > 0) {
+            syncSelectOptionsIfChanged(languageSelect, data.languages);
+            syncSelectOptionsIfChanged(postLanguageSelect, data.languages);
+            if (!localStorage.getItem('selectedLanguage') && data.default_language) {
+                selectedLanguage = data.default_language;
+            }
+        }
+
         if (Array.isArray(data.compute_devices) && data.compute_devices.length > 0 && computeDeviceSelect) {
             syncSelectOptionsIfChanged(computeDeviceSelect, data.compute_devices);
+            syncSelectOptionsIfChanged(postComputeDeviceSelect, data.compute_devices);
             if (!localStorage.getItem('selectedComputeDevice') && data.default_compute_device) {
                 selectedComputeDevice = data.default_compute_device;
             }
@@ -478,11 +890,25 @@ async function loadServerConfig() {
             transcribeEnabled = data.transcription_default;
         }
 
+        postAsrModel = selectedAsrModel;
+        postLanguage = selectedLanguage;
+        postComputeDevice = selectedComputeDevice;
+        postSpeakers = selectedSpeakers;
+
         applyWorkerAvailability();
+        renderModeControls();
         renderTranscriptionControls();
+        renderPostTranscribeControls();
     } catch (error) {
         console.warn('Could not load server config:', error);
     }
+}
+
+if (modeAnonymizeBtn) {
+    modeAnonymizeBtn.addEventListener('click', () => setJobMode('anonymize'));
+}
+if (modeTranscribeOnlyBtn) {
+    modeTranscribeOnlyBtn.addEventListener('click', () => setJobMode('transcribe_only'));
 }
 
 workerSelect.addEventListener('change', () => {
@@ -504,19 +930,27 @@ transcribeToggle.addEventListener('change', () => {
 asrModelSelect.addEventListener('change', () => {
     selectedAsrModel = asrModelSelect.value;
     localStorage.setItem('selectedAsrModel', selectedAsrModel);
-    if (selectedAsrModel === 'parakeet' && selectedComputeDevice === 'cuda') {
+    if (isCpuOnlyAsrModel(selectedAsrModel) && selectedComputeDevice === 'cuda') {
         selectedComputeDevice = 'cpu';
         localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
     }
     renderTranscriptionControls();
 });
 
+if (languageSelect) {
+    languageSelect.addEventListener('change', () => {
+        selectedLanguage = languageSelect.value;
+        localStorage.setItem('selectedLanguage', selectedLanguage);
+        renderTranscriptionControls();
+    });
+}
+
 if (computeDeviceSelect) {
     computeDeviceSelect.addEventListener('change', () => {
         selectedComputeDevice = computeDeviceSelect.value;
         localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
-        if (selectedComputeDevice === 'cuda' && selectedAsrModel === 'parakeet') {
-            selectedAsrModel = 'turbo';
+        if (selectedComputeDevice === 'cuda' && isCpuOnlyAsrModel(selectedAsrModel)) {
+            selectedAsrModel = getGpuFallbackModel(selectedAsrModel, asrModelSelect);
             localStorage.setItem('selectedAsrModel', selectedAsrModel);
         }
         renderTranscriptionControls();
@@ -529,9 +963,71 @@ speakerCountSelect.addEventListener('change', () => {
     syncClaySelect(speakerCountSelect);
 });
 
+// Post-recording separate transcription form events
+if (postAsrModelSelect) {
+    postAsrModelSelect.addEventListener('change', () => {
+        postAsrModel = postAsrModelSelect.value;
+        if (isCpuOnlyAsrModel(postAsrModel) && postComputeDevice === 'cuda') {
+            postComputeDevice = 'cpu';
+        }
+        renderPostTranscribeControls();
+    });
+}
+
+if (postLanguageSelect) {
+    postLanguageSelect.addEventListener('change', () => {
+        postLanguage = postLanguageSelect.value;
+        syncClaySelect(postLanguageSelect);
+        updatePostAudioSourceHint();
+    });
+}
+
+if (postComputeDeviceSelect) {
+    postComputeDeviceSelect.addEventListener('change', () => {
+        postComputeDevice = postComputeDeviceSelect.value;
+        if (postComputeDevice === 'cuda' && isCpuOnlyAsrModel(postAsrModel)) {
+            postAsrModel = getGpuFallbackModel(postAsrModel, postAsrModelSelect);
+        }
+        renderPostTranscribeControls();
+    });
+}
+
+if (postSpeakerCountSelect) {
+    postSpeakerCountSelect.addEventListener('change', () => {
+        postSpeakers = postSpeakerCountSelect.value;
+        syncClaySelect(postSpeakerCountSelect);
+    });
+}
+
+if (togglePostTranscribeBtn) {
+    togglePostTranscribeBtn.addEventListener('click', () => {
+        if (!postTranscribeForm) return;
+        const willShow = postTranscribeForm.classList.contains('hidden');
+        postTranscribeForm.classList.toggle('hidden', !willShow);
+        if (willShow) {
+            renderPostTranscribeControls();
+        }
+    });
+}
+
+if (postTranscribeBtn) {
+    postTranscribeBtn.addEventListener('click', () => {
+        if (!currentTaskId) return;
+        startPostTranscription(currentTaskId, {
+            asrModel: postAsrModel,
+            language: postLanguage,
+            computeDevice: postComputeDevice,
+            speakers: postSpeakers,
+        });
+    });
+}
+
 setSelectedWorkers(selectedWorkers);
+renderModeControls();
 renderTranscriptionControls();
+renderPostTranscribeControls();
 loadServerConfig();
+loadRecordings();
 
 // Drag and drop events
 ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -563,24 +1059,26 @@ function handleDrop(e) {
     handleFiles(files);
 }
 
+function isAllowedFile(filename) {
+    const lower = String(filename || '').toLowerCase();
+    if (selectedJobMode === 'transcribe_only') {
+        return transcribeOnlyExtensions.some((ext) => lower.endsWith(ext));
+    }
+    return lower.endsWith('.mp4');
+}
+
 function handleFiles(files) {
     const file = files[0];
-    if (file && file.name.toLowerCase().endsWith('.mp4')) {
+    if (file && isAllowedFile(file.name)) {
         uploadFile(file);
+    } else if (selectedJobMode === 'transcribe_only') {
+        alert('Пожалуйста, выберите видео или аудио файл (.mp4, .mp3, .wav, .m4a, .mkv, .ogg...)');
     } else {
         alert('Пожалуйста, выберите файл .mp4');
     }
 }
 
-async function uploadFile(file) {
-    stopPolling();
-    taskFinished = false;
-    cancelRequested = false;
-    currentTaskId = null;
-    closeAllClaySelects();
-    const workersForUpload = getWorkersForUpload();
-    if (!workersForUpload) return;
-
+function prepareStatusPanelForRun(titleText, subText) {
     uploadPanel.classList.add('hidden');
     statusPanel.classList.remove('hidden');
     spinner.classList.remove('hidden');
@@ -588,6 +1086,9 @@ async function uploadFile(file) {
     if (cancelIcon) cancelIcon.classList.add('hidden');
     downloadBtn.classList.add('hidden');
     downloadTranscriptBtn.classList.add('hidden');
+    if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
+    if (postTranscribeForm) postTranscribeForm.classList.add('hidden');
+    if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');
     resetBtn.classList.add('hidden');
     debugLog.classList.add('hidden');
     debugLog.innerHTML = '';
@@ -596,14 +1097,47 @@ async function uploadFile(file) {
         cancelBtn.textContent = 'Прервать';
         cancelBtn.classList.remove('hidden');
     }
-    statusText.textContent = 'Загрузка...';
-    statusSubText.textContent = 'Отправка видео на сервер...';
+    statusText.textContent = titleText;
+    statusSubText.textContent = subText;
+}
+
+async function extractErrorDetail(response) {
+    if (!response) return '';
+    try {
+        const body = await response.json();
+        if (body && typeof body.detail === 'string' && body.detail.trim()) {
+            return body.detail.trim();
+        }
+    } catch (_err) {
+        // Ignore non-JSON error bodies
+    }
+    return '';
+}
+
+async function uploadFile(file) {
+    stopPolling();
+    taskFinished = false;
+    cancelRequested = false;
+    currentRunIsPostTranscribe = false;
+    currentTaskId = null;
+    lastTaskData = null;
+    closeAllClaySelects();
+    const workersForUpload = getWorkersForUpload();
+    if (!workersForUpload) return;
+
+    const isTranscribeOnly = selectedJobMode === 'transcribe_only';
+    prepareStatusPanelForRun(
+        'Загрузка...',
+        isTranscribeOnly ? 'Отправка файла для транскрибации...' : 'Отправка видео на сервер...'
+    );
 
     const formData = new FormData();
     formData.append('file', file);
     formData.append('workers', workersForUpload);
-    formData.append('transcribe', String(transcribeEnabled));
+    formData.append('mode', selectedJobMode);
+    formData.append('transcribe', String(isTranscribeOnly ? true : transcribeEnabled));
     formData.append('asr_model', selectedAsrModel);
+    formData.append('language', selectedLanguage);
     formData.append('compute_device', selectedComputeDevice);
     formData.append('speakers', selectedSpeakers);
 
@@ -617,7 +1151,10 @@ async function uploadFile(file) {
         });
         uploadAbortController = null;
 
-        if (!response.ok) throw new Error('Upload failed');
+        if (!response.ok) {
+            const detail = await extractErrorDetail(response);
+            throw new Error(detail || 'Upload failed');
+        }
 
         const data = await response.json();
         currentTaskId = data.task_id;
@@ -630,11 +1167,14 @@ async function uploadFile(file) {
         }
 
         const time = new Date().toLocaleTimeString('ru-RU');
-        debugLog.innerHTML = `<p>[${time}] Видео загружено. Старт обработки...</p>`;
+        const startNote = isTranscribeOnly
+            ? 'Файл загружен. Старт транскрибации...'
+            : 'Видео загружено. Старт обработки...';
+        debugLog.innerHTML = `<p>[${time}] ${startNote}</p>`;
         debugLog.classList.remove('hidden');
         logCursor = 0;
 
-        statusText.textContent = 'Обработка...';
+        statusText.textContent = isTranscribeOnly ? 'Транскрибация...' : 'Обработка...';
         statusSubText.textContent = data.worker_count
             ? `Подготовка. Потоков: ${data.worker_count}.`
             : 'Подготовка к обработке.';
@@ -645,10 +1185,77 @@ async function uploadFile(file) {
         uploadAbortController = null;
         if (error && (error.name === 'AbortError' || cancelRequested)) {
             taskFinished = true;
-            showCancelled('Загрузка видео отменена.');
+            showCancelled('Загрузка файла отменена.');
             return;
         }
-        showError('Ошибка загрузки файла. Попробуйте снова.');
+        const detail = error && error.message && error.message !== 'Upload failed' ? ` (${error.message})` : '';
+        showError(`Ошибка загрузки файла. Попробуйте снова.${detail}`);
+    }
+}
+
+async function startPostTranscription(taskId, opts = {}) {
+    stopPolling();
+    taskFinished = false;
+    cancelRequested = false;
+    currentRunIsPostTranscribe = true;
+    currentTaskId = taskId;
+    closeAllClaySelects();
+    const workersForRun = getWorkersForUpload() || '4';
+
+    const chosenModel = opts.asrModel || selectedAsrModel;
+    const chosenLang = opts.language || selectedLanguage;
+    const chosenDev = opts.computeDevice || selectedComputeDevice;
+    const chosenSpk = opts.speakers || selectedSpeakers;
+
+    // Remember user's latest transcription choices
+    selectedAsrModel = chosenModel;
+    selectedLanguage = chosenLang;
+    selectedComputeDevice = chosenDev;
+    selectedSpeakers = chosenSpk;
+    postAsrModel = chosenModel;
+    postLanguage = chosenLang;
+    postComputeDevice = chosenDev;
+    postSpeakers = chosenSpk;
+    localStorage.setItem('selectedAsrModel', selectedAsrModel);
+    localStorage.setItem('selectedLanguage', selectedLanguage);
+    localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
+    localStorage.setItem('selectedSpeakers', selectedSpeakers);
+
+    prepareStatusPanelForRun('Транскрибация...', 'Запуск распознавания речи для готовой записи...');
+
+    const formData = new FormData();
+    formData.append('workers', workersForRun);
+    formData.append('asr_model', chosenModel);
+    formData.append('language', chosenLang);
+    formData.append('compute_device', chosenDev);
+    formData.append('speakers', chosenSpk);
+
+    try {
+        const response = await fetch(`/api/transcribe/${taskId}`, {
+            method: 'POST',
+            body: formData,
+        });
+        if (!response.ok) {
+            const detail = await extractErrorDetail(response);
+            throw new Error(detail || `HTTP ${response.status}`);
+        }
+        await response.json();
+
+        const time = new Date().toLocaleTimeString('ru-RU');
+        debugLog.innerHTML = `<p>[${time}] Старт отдельной транскрибации записи...</p>`;
+        debugLog.classList.remove('hidden');
+        logCursor = 0;
+
+        checkStatus();
+        stopPolling();
+        pollInterval = setInterval(checkStatus, 1000);
+    } catch (error) {
+        console.error('Post-transcription start failed:', error);
+        const detail = error && error.message ? ` (${error.message})` : '';
+        showError(
+            `Не удалось запустить транскрибацию для этой записи.${detail}`,
+            lastTaskData ? { ...lastTaskData, is_post_transcribe: true } : null
+        );
     }
 }
 
@@ -663,6 +1270,10 @@ async function checkStatus() {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         const data = await response.json();
+        lastTaskData = data;
+        if (typeof data.is_post_transcribe === 'boolean') {
+            currentRunIsPostTranscribe = data.is_post_transcribe;
+        }
 
         if (data.logs && data.logs.length > logCursor) {
             const time = new Date().toLocaleTimeString('ru-RU');
@@ -681,13 +1292,19 @@ async function checkStatus() {
         } else if (data.status === 'cancelled') {
             taskFinished = true;
             stopPolling();
-            showCancelled('Обработка остановлена, временные файлы очищены.');
+            const isPost = Boolean(data.is_post_transcribe || currentRunIsPostTranscribe);
+            const msg = isPost
+                ? 'Транскрибация остановлена. Готовая запись сохранена.'
+                : 'Обработка остановлена, временные файлы очищены.';
+            showCancelled(msg, isPost ? { ...data, is_post_transcribe: true } : data);
         } else if (data.status === 'error') {
             taskFinished = true;
             stopPolling();
-            showError('Ошибка при обработке видео.');
+            showError('Ошибка при обработке файла.', data);
         } else if (data.status === 'processing') {
-            statusText.textContent = 'Обработка...';
+            statusText.textContent = (data.mode === 'transcribe_only' || data.is_post_transcribe)
+                ? 'Транскрибация...'
+                : 'Обработка...';
             statusSubText.textContent = data.message || 'Пожалуйста, подождите...';
         } else if (data.status === 'queued') {
             statusText.textContent = 'В очереди...';
@@ -702,6 +1319,62 @@ async function checkStatus() {
     }
 }
 
+function renderPostTranscribeSection(data = {}, opts = {}) {
+    if (!postTranscribeSection) return;
+    const canTranscribe = Boolean(data.can_transcribe);
+    if (!canTranscribe || !currentTaskId) {
+        postTranscribeSection.classList.add('hidden');
+        return;
+    }
+
+    const hasTranscript = Boolean(data.transcript_ready);
+    postHasOriginalAudio = Boolean(data.has_original_audio);
+    postAsrModel = data.asr_model || selectedAsrModel;
+    postLanguage = data.language || selectedLanguage;
+    postComputeDevice = data.compute_device || selectedComputeDevice;
+    postSpeakers = data.speakers || selectedSpeakers;
+    renderPostTranscribeControls();
+
+    postTranscribeSection.classList.remove('hidden');
+
+    if (hasTranscript) {
+        if (togglePostTranscribeBtn) {
+            togglePostTranscribeBtn.textContent = 'Пересоздать транскрипт (другая модель)';
+            togglePostTranscribeBtn.classList.toggle('hidden', Boolean(opts.forceExpandForm));
+        }
+        if (postTranscribeTitle) postTranscribeTitle.textContent = 'Пересоздать транскрипт';
+        if (postTranscribeBtn) postTranscribeBtn.textContent = 'Пересоздать транскрипт';
+        if (postTranscribeForm) postTranscribeForm.classList.toggle('hidden', !opts.forceExpandForm);
+    } else {
+        if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');
+        if (postTranscribeTitle) postTranscribeTitle.textContent = 'Создать транскрипт отдельно';
+        if (postTranscribeBtn) postTranscribeBtn.textContent = 'Создать транскрипт';
+        if (postTranscribeForm) postTranscribeForm.classList.remove('hidden');
+    }
+}
+
+function bindDownloadButtons(data = {}) {
+    const hasVideo = data.video_ready !== undefined
+        ? Boolean(data.video_ready)
+        : data.mode !== 'transcribe_only';
+    const hasTranscript = Boolean(data.transcript_ready);
+
+    downloadBtn.classList.toggle('hidden', !hasVideo);
+    downloadTranscriptBtn.classList.toggle('hidden', !hasTranscript);
+
+    if (hasVideo) {
+        downloadBtn.onclick = () => {
+            window.location.href = `/api/download/${currentTaskId}`;
+        };
+    }
+    if (hasTranscript) {
+        downloadTranscriptBtn.onclick = () => {
+            window.location.href = `/api/download-transcript/${currentTaskId}`;
+        };
+    }
+    return { hasVideo, hasTranscript };
+}
+
 function showSuccess(data = {}) {
     spinner.classList.add('hidden');
     if (cancelIcon) cancelIcon.classList.add('hidden');
@@ -709,40 +1382,46 @@ function showSuccess(data = {}) {
     successIcon.classList.remove('hidden');
     statusText.textContent = 'Готово!';
 
-    const hasTranscript = Boolean(data.transcript_ready);
-    statusSubText.textContent = hasTranscript
-        ? 'Видео и транскрипт по ролям готовы.'
-        : 'Видео успешно анонимизировано.';
+    const { hasVideo, hasTranscript } = bindDownloadButtons(data);
+    if (hasVideo && hasTranscript) {
+        statusSubText.textContent = 'Видео и транскрипт по ролям готовы.';
+    } else if (hasVideo) {
+        statusSubText.textContent = 'Видео успешно анонимизировано. При необходимости создайте транскрипт ниже.';
+    } else {
+        statusSubText.textContent = 'Транскрипт по ролям готов.';
+    }
 
-    downloadBtn.classList.remove('hidden');
-    downloadTranscriptBtn.classList.toggle('hidden', !hasTranscript);
+    renderPostTranscribeSection(data);
     resetBtn.classList.remove('hidden');
 
     const time = new Date().toLocaleTimeString('ru-RU');
-    const readyNote = hasTranscript
-        ? 'Видео (.mp4) и транскрипт (.txt) готовы к скачиванию!'
-        : 'Видео готово к скачиванию!';
+    let readyNote = 'Готово к скачиванию!';
+    if (hasVideo && hasTranscript) {
+        readyNote = 'Видео (.mp4) и транскрипт (.txt) готовы к скачиванию!';
+    } else if (hasVideo) {
+        readyNote = 'Видео готово к скачиванию!';
+    } else if (hasTranscript) {
+        readyNote = 'Транскрипт (.txt) готов к скачиванию!';
+    }
     debugLog.innerHTML += `<p style="color: #4ade80;">[${time}] ${readyNote}</p>`;
     debugLog.scrollTop = debugLog.scrollHeight;
-
-    downloadBtn.onclick = () => {
-        window.location.href = `/api/download/${currentTaskId}`;
-    };
-
-    if (hasTranscript) {
-        downloadTranscriptBtn.onclick = () => {
-            window.location.href = `/api/download-transcript/${currentTaskId}`;
-        };
-    }
 }
 
-function showCancelled(msg) {
+function showCancelled(msg, data = null) {
     spinner.classList.add('hidden');
     successIcon.classList.add('hidden');
     if (cancelIcon) cancelIcon.classList.remove('hidden');
     if (cancelBtn) cancelBtn.classList.add('hidden');
-    downloadBtn.classList.add('hidden');
-    downloadTranscriptBtn.classList.add('hidden');
+
+    if (data && data.is_post_transcribe) {
+        bindDownloadButtons(data);
+        renderPostTranscribeSection(data);
+    } else {
+        downloadBtn.classList.add('hidden');
+        downloadTranscriptBtn.classList.add('hidden');
+        if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
+    }
+
     statusText.textContent = 'Прервано';
     statusSubText.textContent = msg;
     resetBtn.classList.remove('hidden');
@@ -754,10 +1433,14 @@ function showCancelled(msg) {
     }
 }
 
-function showError(msg) {
+function showError(msg, data = null) {
     spinner.classList.add('hidden');
     if (cancelIcon) cancelIcon.classList.add('hidden');
     if (cancelBtn) cancelBtn.classList.add('hidden');
+    if (data && data.is_post_transcribe) {
+        bindDownloadButtons(data);
+        renderPostTranscribeSection(data);
+    }
     statusText.textContent = 'Ошибка';
     statusSubText.textContent = msg;
     resetBtn.classList.remove('hidden');
@@ -777,15 +1460,34 @@ if (cancelBtn) {
 
         stopPolling();
         const taskIdToCancel = currentTaskId;
+        let cancelPayload = null;
         if (taskIdToCancel) {
             try {
-                await fetch(`/api/cancel/${taskIdToCancel}`, { method: 'POST' });
+                const resp = await fetch(`/api/cancel/${taskIdToCancel}`, { method: 'POST' });
+                if (resp && resp.ok) {
+                    cancelPayload = await resp.json();
+                }
             } catch (err) {
                 console.warn('Cancel request error:', err);
             }
         }
         taskFinished = true;
-        showCancelled('Обработка остановлена, временные файлы очищены.');
+        const mergedData = (lastTaskData || cancelPayload)
+            ? { ...(lastTaskData || {}), ...(cancelPayload || {}) }
+            : null;
+        const isPost = Boolean(
+            currentRunIsPostTranscribe || (mergedData && mergedData.is_post_transcribe)
+        );
+        if (isPost && mergedData) {
+            mergedData.is_post_transcribe = true;
+            lastTaskData = mergedData;
+        }
+        showCancelled(
+            isPost
+                ? 'Транскрибация остановлена. Готовая запись сохранена.'
+                : 'Обработка остановлена, временные файлы очищены.',
+            isPost ? mergedData : null
+        );
     };
 }
 
@@ -793,8 +1495,10 @@ resetBtn.onclick = () => {
     stopPolling();
     closeAllClaySelects();
     currentTaskId = null;
+    lastTaskData = null;
     taskFinished = false;
     cancelRequested = false;
+    currentRunIsPostTranscribe = false;
     uploadAbortController = null;
     statusPanel.classList.add('hidden');
     uploadPanel.classList.remove('hidden');
@@ -808,12 +1512,18 @@ resetBtn.onclick = () => {
     }
     downloadBtn.classList.add('hidden');
     downloadTranscriptBtn.classList.add('hidden');
+    if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
+    if (postTranscribeForm) postTranscribeForm.classList.add('hidden');
+    if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');
     resetBtn.classList.add('hidden');
     debugLog.classList.add('hidden');
     fileInput.value = '';
     renderWorkerControls();
+    renderModeControls();
     renderTranscriptionControls();
+    loadRecordings();
     if (serverCudaAvailable === null) {
         loadServerConfig();
     }
 };
+

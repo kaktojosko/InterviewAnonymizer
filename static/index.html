@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=17">
+    <link rel="stylesheet" href="/static/style.css?v=18">
 </head>
 <body>
     <div class="container">
@@ -25,14 +25,23 @@
 
         <main>
             <div class="clay-panel" id="uploadPanel">
+                <div class="mode-switcher" id="modeSwitcher" role="tablist" aria-label="Режим обработки">
+                    <button type="button" class="mode-tab is-active" id="modeAnonymizeBtn" data-mode="anonymize" role="tab" aria-selected="true">
+                        Анонимизация
+                    </button>
+                    <button type="button" class="mode-tab" id="modeTranscribeOnlyBtn" data-mode="transcribe_only" role="tab" aria-selected="false">
+                        Только транскрибация
+                    </button>
+                </div>
+
                 <div class="upload-zone" id="dropZone">
                     <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
                         <polyline points="17 8 12 3 7 8"></polyline>
                         <line x1="12" y1="3" x2="12" y2="15"></line>
                     </svg>
-                    <h2>Перетащите видео сюда</h2>
-                    <p>или выберите файл (.mp4)</p>
+                    <h2 id="dropZoneTitle">Перетащите видео сюда</h2>
+                    <p id="dropZoneHint">или выберите файл (.mp4)</p>
                     <input type="file" id="fileInput" accept=".mp4" hidden>
                 </div>
 
@@ -63,7 +72,7 @@
                             <label class="worker-settings-title" for="transcribeToggle">Транскрибация по ролям</label>
                             <span class="transcribe-badge" id="transcribeStateBadge">Вкл</span>
                         </div>
-                        <label class="clay-switch" for="transcribeToggle">
+                        <label class="clay-switch" id="transcribeSwitchWrap" for="transcribeToggle">
                             <input type="checkbox" id="transcribeToggle" checked>
                             <span class="clay-slider"></span>
                         </label>
@@ -73,13 +82,23 @@
                         <div class="transcribe-field">
                             <label class="custom-worker-label" for="asrModelSelect">Модель распознавания</label>
                             <select id="asrModelSelect" class="worker-select">
-                                <option value="turbo" selected>Whisper Turbo — точная (99 яз., 810 МБ)</option>
-                                <option value="large-v3">Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)</option>
+                                <option value="gigaam-v3" selected>GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)</option>
+                                <option value="large-v3-ru">Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)</option>
+                                <option value="turbo">Whisper Turbo — универсальная (99 яз., 810 МБ)</option>
+                                <option value="large-v3">Whisper Large v3 — мультиязычная (99 яз., 3.1 ГБ)</option>
                                 <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
                                 <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
                             </select>
                         </div>
                         <div class="transcribe-grid-2">
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="languageSelect">Язык речи</label>
+                                <select id="languageSelect" class="worker-select">
+                                    <option value="ru" selected>Русский (RU)</option>
+                                    <option value="auto">Авто (мультиязычный)</option>
+                                    <option value="en">English (EN)</option>
+                                </select>
+                            </div>
                             <div class="transcribe-field">
                                 <label class="custom-worker-label" for="computeDeviceSelect">Ускорение</label>
                                 <select id="computeDeviceSelect" class="worker-select">
@@ -87,18 +106,26 @@
                                     <option value="cuda">GPU (CUDA)</option>
                                 </select>
                             </div>
-                            <div class="transcribe-field">
-                                <label class="custom-worker-label" for="speakerCountSelect">Число спикеров</label>
-                                <select id="speakerCountSelect" class="worker-select">
-                                    <option value="auto" selected>Авто</option>
-                                    <option value="2">2 спикера</option>
-                                    <option value="3">3 спикера</option>
-                                    <option value="4+">4+ спикеров</option>
-                                </select>
-                            </div>
                         </div>
-                        <p class="worker-settings-hint" id="transcribeHintText">Отдельный .txt с таймкодами и ролями. Мультиязычно (RU/EN и др.), офлайн.</p>
+                        <div class="transcribe-field">
+                            <label class="custom-worker-label" for="speakerCountSelect">Число спикеров</label>
+                            <select id="speakerCountSelect" class="worker-select">
+                                <option value="auto" selected>Авто</option>
+                                <option value="2">2 спикера</option>
+                                <option value="3">3 спикера</option>
+                                <option value="4+">4+ спикеров</option>
+                            </select>
+                        </div>
+                        <p class="worker-settings-hint" id="transcribeHintText">Sber GigaAM v3: лучшая точность на русской речи, пунктуация и регистр. Офлайн на CPU.</p>
                     </div>
+                </div>
+
+                <div class="recordings-section hidden" id="recordingsSection" aria-label="Созданные записи">
+                    <div class="recordings-header">
+                        <span class="worker-settings-title">Созданные записи</span>
+                        <span class="recordings-count" id="recordingsCount">0</span>
+                    </div>
+                    <div class="recordings-list" id="recordingsList"></div>
                 </div>
             </div>
 
@@ -118,19 +145,69 @@
                     <div id="debugLog" class="debug-log hidden"></div>
                     <div class="download-actions">
                         <button id="cancelBtn" class="clay-btn clay-btn-danger hidden" type="button">Прервать</button>
-                        <button id="downloadBtn" class="clay-btn hidden">Скачать видео (.mp4)</button>
-                        <button id="downloadTranscriptBtn" class="clay-btn clay-btn-transcript hidden">Скачать транскрипт (.txt)</button>
-                        <button id="resetBtn" class="clay-btn clay-btn-secondary hidden">Загрузить ещё</button>
+                        <button id="downloadBtn" class="clay-btn hidden" type="button">Скачать видео (.mp4)</button>
+                        <button id="downloadTranscriptBtn" class="clay-btn clay-btn-transcript hidden" type="button">Скачать транскрипт (.txt)</button>
+
+                        <div id="postTranscribeSection" class="post-transcribe-section hidden">
+                            <button id="togglePostTranscribeBtn" class="clay-btn clay-btn-secondary hidden" type="button">Пересоздать транскрипт (другая модель)</button>
+                            <div id="postTranscribeForm" class="post-transcribe-form hidden">
+                                <div class="post-transcribe-header">
+                                    <span class="worker-settings-title" id="postTranscribeTitle">Создать транскрипт отдельно</span>
+                                </div>
+                                <div class="transcribe-field">
+                                    <label class="custom-worker-label" for="postAsrModelSelect">Модель распознавания</label>
+                                    <select id="postAsrModelSelect" class="worker-select">
+                                        <option value="gigaam-v3" selected>GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)</option>
+                                        <option value="large-v3-ru">Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)</option>
+                                        <option value="turbo">Whisper Turbo — универсальная (99 яз., 810 МБ)</option>
+                                        <option value="large-v3">Whisper Large v3 — мультиязычная (99 яз., 3.1 ГБ)</option>
+                                        <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
+                                        <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
+                                    </select>
+                                </div>
+                                <div class="transcribe-grid-2">
+                                    <div class="transcribe-field">
+                                        <label class="custom-worker-label" for="postLanguageSelect">Язык речи</label>
+                                        <select id="postLanguageSelect" class="worker-select">
+                                            <option value="ru" selected>Русский (RU)</option>
+                                            <option value="auto">Авто (мультиязычный)</option>
+                                            <option value="en">English (EN)</option>
+                                        </select>
+                                    </div>
+                                    <div class="transcribe-field">
+                                        <label class="custom-worker-label" for="postComputeDeviceSelect">Ускорение</label>
+                                        <select id="postComputeDeviceSelect" class="worker-select">
+                                            <option value="cpu" selected>CPU</option>
+                                            <option value="cuda">GPU (CUDA)</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="transcribe-field">
+                                    <label class="custom-worker-label" for="postSpeakerCountSelect">Число спикеров</label>
+                                    <select id="postSpeakerCountSelect" class="worker-select">
+                                        <option value="auto" selected>Авто</option>
+                                        <option value="2">2 спикера</option>
+                                        <option value="3">3 спикера</option>
+                                        <option value="4+">4+ спикеров</option>
+                                    </select>
+                                </div>
+                                <p class="worker-settings-hint" id="postAudioSourceHint">Используется оригинальная аудиодорожка (без искажения голоса).</p>
+                                <button id="postTranscribeBtn" class="clay-btn clay-btn-transcript" type="button">Создать транскрипт</button>
+                            </div>
+                        </div>
+
+                        <button id="resetBtn" class="clay-btn clay-btn-secondary hidden" type="button">Загрузить ещё</button>
                     </div>
                 </div>
             </div>
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v4.4.0 (Stable Edition)
+            v4.5.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=17"></script>
+    <script src="/static/script.js?v=19"></script>
 </body>
 </html>
+
 

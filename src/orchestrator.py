@@ -1,8 +1,10 @@
 import os
+import shutil
 import time
 import glob
 import multiprocessing as mp
 import threading
+import wave
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -18,6 +20,7 @@ from src.config import (
     ASR_MODEL_PROFILES,
     CHUNK_DURATION_SECONDS,
     CPU_COUNT,
+    DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
     MAX_ALLOWED_WORKERS,
@@ -72,6 +75,32 @@ def process_chunk(
 
 class Orchestrator:
     @staticmethod
+    def _save_cached_audio(src_wav_path: str, dst_cache_path: str | None) -> bool:
+        if not dst_cache_path or not os.path.isfile(src_wav_path):
+            return False
+        if os.path.abspath(src_wav_path) == os.path.abspath(dst_cache_path):
+            return True
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(dst_cache_path)), exist_ok=True)
+            tmp_dst = f"{dst_cache_path}.part"
+            shutil.copy2(src_wav_path, tmp_dst)
+            os.replace(tmp_dst, dst_cache_path)
+            return os.path.isfile(dst_cache_path)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _resolve_post_video_threads(workers: int) -> int:
+        # Once video blurring is complete (or in transcription-only mode), all CPU
+        # cores are free: respect explicit low-CPU caps (1..3), otherwise use
+        # available cores up to MAX_ALLOWED_WORKERS.
+        return (
+            workers
+            if workers < 4
+            else max(workers, min(MAX_ALLOWED_WORKERS, max(4, CPU_COUNT - 2)))
+        )
+
+    @staticmethod
     def process_video_job(
         input_path: str,
         output_path: str,
@@ -84,6 +113,8 @@ class Orchestrator:
         speaker_count: str = "auto",
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         cancel_token: CancellationToken | None = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
+        cached_audio_path: str | None = None,
     ) -> dict:
         log_lock = threading.Lock()
 
@@ -137,6 +168,7 @@ class Orchestrator:
         audio_future = None
         transcribe_extract_future = None
         parallel_gpu_future = None
+        need_raw_wav = bool(has_audio and ((transcribe and transcript_path) or cached_audio_path))
         audio_executor = ThreadPoolExecutor(max_workers=2)
         try:
             # Split video first so 3 concurrent FFmpeg readers don't thrash the disk
@@ -165,7 +197,7 @@ class Orchestrator:
                 audio_future = audio_executor.submit(
                     AudioProcessor.process, input_path, audio_pitched_path, sample_rate, cancel_token
                 )
-                if transcribe and transcript_path:
+                if need_raw_wav:
                     if use_parallel_gpu:
                         def _extract_and_run_gpu_asr() -> tuple[bool, dict | None]:
                             raw_ok = FFmpegUtils.extract_transcription_audio(
@@ -185,6 +217,7 @@ class Orchestrator:
                                 threads=1,
                                 status_cb=update,
                                 cancel_token=cancel_token,
+                                language=language,
                             )
                             return True, asr_state
 
@@ -367,26 +400,22 @@ class Orchestrator:
 
             # 6. Local Auto-Transcription with Speaker Diarization (if enabled)
             transcript_ready = False
+            audio_cached = False
             if transcribe and transcript_path:
                 if cancel_token is not None:
                     cancel_token.check()
                 from src.transcriber import Transcriber, format_transcript_txt
 
-                # Once video blurring is complete, all CPU cores are free: if the user left
-                # workers at the default >=4 (kept moderate to cap video-worker RAM), allow
-                # post-mux CPU ASR & diarization to utilize available cores while still
-                # respecting explicit low-CPU caps (1..3).
-                post_video_threads = (
-                    workers
-                    if workers < 4
-                    else max(workers, min(MAX_ALLOWED_WORKERS, max(4, CPU_COUNT - 2)))
-                )
+                post_video_threads = Orchestrator._resolve_post_video_threads(workers)
 
                 gpu_asr_state = None
                 if parallel_gpu_future is not None:
                     if not parallel_gpu_future.done():
                         update("Ожидание завершения распознавания речи на GPU...")
                     raw_wav_ready, gpu_asr_state = parallel_gpu_future.result()
+
+                if raw_wav_ready and cached_audio_path:
+                    audio_cached = Orchestrator._save_cached_audio(audio_16k_path, cached_audio_path)
 
                 if not has_audio or not raw_wav_ready:
                     update("Аудиодорожка отсутствует — формирование пустого файла транскрибации...")
@@ -423,8 +452,11 @@ class Orchestrator:
                         compute_device=requested_device,
                         status_cb=update,
                         cancel_token=cancel_token,
+                        language=language,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
+            elif raw_wav_ready and cached_audio_path:
+                audio_cached = Orchestrator._save_cached_audio(audio_16k_path, cached_audio_path)
 
         finally:
             if cancel_token is not None and cancel_token.is_cancelled():
@@ -447,4 +479,152 @@ class Orchestrator:
             "video_ready": os.path.isfile(output_path),
             "transcript_ready": transcript_ready,
             "transcript_path": transcript_path if transcript_ready else None,
+            "audio_cached": audio_cached,
         }
+
+    @staticmethod
+    def process_transcription_only_job(
+        input_path: str,
+        transcript_path: str,
+        job_dir: str,
+        status_cb=None,
+        worker_count: int | None = None,
+        asr_model: str = DEFAULT_ASR_MODEL,
+        language: str = DEFAULT_ASR_LANGUAGE,
+        speaker_count: str = "auto",
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
+        cancel_token: CancellationToken | None = None,
+        cached_audio_path: str | None = None,
+        input_is_wav_16k: bool = False,
+        source_note: str | None = None,
+    ) -> dict:
+        """
+        Runs speaker-diarized transcription directly on a video/audio file (or
+        cached 16 kHz mono WAV) without splitting, face blurring, pitch-shifting,
+        or video re-encoding. Used by 'Только транскрибация' mode and post-recording
+        separate transcript generation.
+        """
+        log_lock = threading.Lock()
+
+        def update(msg):
+            if cancel_token is not None and cancel_token.is_cancelled():
+                return
+            with log_lock:
+                print(msg)
+                if status_cb:
+                    status_cb(msg)
+
+        if cancel_token is not None:
+            cancel_token.check()
+
+        total_start_time = time.time()
+        workers = max(1, worker_count or MAX_WORKERS)
+        requested_device = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
+        profile_info = ASR_MODEL_PROFILES.get(asr_model, ASR_MODEL_PROFILES[DEFAULT_ASR_MODEL])
+        asr_threads = Orchestrator._resolve_post_video_threads(workers)
+
+        if source_note:
+            update(source_note)
+
+        from src.transcriber import Transcriber, format_transcript_txt
+
+        duration = 0.0
+        has_audio = False
+        wav_path: str | None = None
+        audio_cached = False
+
+        if input_is_wav_16k and os.path.isfile(input_path):
+            update("Использование сохранённой оригинальной аудиодорожки (без искажения голоса)...")
+            wav_path = input_path
+            has_audio = True
+            try:
+                with wave.open(input_path, "rb") as wf:
+                    fr = wf.getframerate() or 16000
+                    duration = wf.getnframes() / float(fr)
+            except Exception:
+                duration = 0.0
+            if cached_audio_path:
+                audio_cached = Orchestrator._save_cached_audio(wav_path, cached_audio_path)
+        else:
+            update("Анализ медиафайла...")
+            t0 = time.time()
+            _, _, _, duration, has_audio, _ = FFmpegUtils.get_video_metadata(input_path)
+            if cancel_token is not None:
+                cancel_token.check()
+            update(f"[Profile] Probe finished in {time.time() - t0:.2f}s (Длительность: {duration:.1f}с)")
+
+            if has_audio:
+                update("Извлечение аудиодорожки (16 кГц моно)...")
+                t0 = time.time()
+                extracted_wav = os.path.join(job_dir, "audio_16k.wav")
+                raw_ok = FFmpegUtils.extract_transcription_audio(
+                    input_path, extracted_wav, cancel_token=cancel_token
+                )
+                if cancel_token is not None:
+                    cancel_token.check()
+                update(f"[Profile] Audio extract finished in {time.time() - t0:.2f}s")
+                if raw_ok:
+                    wav_path = extracted_wav
+                    if duration <= 0.0:
+                        try:
+                            with wave.open(extracted_wav, "rb") as wf:
+                                fr = wf.getframerate() or 16000
+                                duration = wf.getnframes() / float(fr)
+                        except Exception:
+                            pass
+                    if cached_audio_path:
+                        audio_cached = Orchestrator._save_cached_audio(extracted_wav, cached_audio_path)
+                else:
+                    has_audio = False
+
+        if cancel_token is not None:
+            cancel_token.check()
+
+        os.makedirs(os.path.dirname(os.path.abspath(transcript_path)), exist_ok=True)
+        # Write to a staging file inside job_dir first so cancelling a re-transcription
+        # never corrupts or wipes an existing transcript file.
+        staged_txt_path = os.path.join(job_dir, "transcript_staged.txt")
+
+        if not has_audio or not wav_path:
+            update("Аудиодорожка отсутствует — формирование пустого файла транскрибации...")
+            empty_txt = format_transcript_txt(
+                turns=[],
+                duration_sec=duration,
+                model_name=profile_info["short_name"],
+                num_speakers=0,
+                note="[Аудиодорожка в исходном файле отсутствует]",
+            )
+            with open(staged_txt_path, "w", encoding="utf-8") as f:
+                f.write(empty_txt)
+        else:
+            update("Запуск локальной транскрибации по ролям...")
+            Transcriber.transcribe_audio_file(
+                wav_path=wav_path,
+                output_txt_path=staged_txt_path,
+                asr_model=asr_model,
+                speaker_count=speaker_count,
+                threads=asr_threads,
+                compute_device=requested_device,
+                status_cb=update,
+                cancel_token=cancel_token,
+                language=language,
+            )
+
+        if cancel_token is not None:
+            cancel_token.check()
+
+        shutil.copy2(staged_txt_path, f"{transcript_path}.part")
+        os.replace(f"{transcript_path}.part", transcript_path)
+        transcript_ready = os.path.isfile(transcript_path)
+
+        update(
+            f"Success! Transcript saved to: {transcript_path}. "
+            f"Total time: {time.time() - total_start_time:.2f}s"
+        )
+        return {
+            "video_ready": False,
+            "transcript_ready": transcript_ready,
+            "transcript_path": transcript_path if transcript_ready else None,
+            "audio_cached": audio_cached,
+        }
+

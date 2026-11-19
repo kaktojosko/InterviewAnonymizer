@@ -75,7 +75,9 @@ def test_cli_arg_parser():
     parser = build_arg_parser()
     args_default = parser.parse_args(["-i", "in.mp4", "-o", "out.mp4"])
     assert args_default.no_transcribe is False
-    assert args_default.asr_model == "turbo"
+    assert args_default.transcribe_only is False
+    assert args_default.asr_model == "gigaam-v3"
+    assert args_default.language == "ru"
     assert args_default.speakers == "auto"
     assert args_default.device == "cpu"
     assert args_default.transcript_output is None
@@ -90,7 +92,9 @@ def test_cli_arg_parser():
             "dialog.txt",
             "--no-transcribe",
             "--asr-model",
-            "parakeet",
+            "large-v3-ru",
+            "--language",
+            "auto",
             "--speakers",
             "2",
             "--device",
@@ -100,35 +104,50 @@ def test_cli_arg_parser():
         ]
     )
     assert args_custom.no_transcribe is True
-    assert args_custom.asr_model == "parakeet"
+    assert args_custom.asr_model == "large-v3-ru"
+    assert args_custom.language == "auto"
     assert args_custom.speakers == "2"
     assert args_custom.device == "cuda"
     assert args_custom.transcript_output == "dialog.txt"
     assert args_custom.workers == 1
+
+    args_tr_only = parser.parse_args(["-i", "interview.mp3", "--transcribe-only", "-t", "out.txt"])
+    assert args_tr_only.transcribe_only is True
+    assert args_tr_only.output is None
+    assert args_tr_only.transcript_output == "out.txt"
 
 
 def test_api_root_and_config():
     client = TestClient(app)
     root_resp = client.get("/")
     assert root_resp.status_code == 200
+    assert "modeSwitcher" in root_resp.text
+    assert "Только транскрибация" in root_resp.text
     assert "transcribeToggle" in root_resp.text
+    assert "languageSelect" in root_resp.text
     assert "computeDeviceSelect" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
+    assert "postTranscribeBtn" in root_resp.text
+    assert "recordingsSection" in root_resp.text
     assert "cancelBtn" in root_resp.text
     assert "Прервать" in root_resp.text
 
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.4.0"
+    assert data["version"] == "4.5.0"
 
+    assert data["default_job_mode"] == "anonymize"
+    assert [m["id"] for m in data["job_modes"]] == ["anonymize", "transcribe_only"]
     assert data["transcription_default"] is True
-    assert data["default_asr_model"] == "turbo"
+    assert data["default_asr_model"] == "gigaam-v3"
+    assert data["default_language"] == "ru"
+    assert [l["id"] for l in data["languages"]] == ["ru", "auto", "en"]
     assert data["default_compute_device"] == "cpu"
     assert isinstance(data["cuda_available"], bool)
     assert [d["id"] for d in data["compute_devices"]] == ["cpu", "cuda"]
     model_ids = [m["id"] for m in data["asr_models"]]
-    assert model_ids == ["turbo", "large-v3", "parakeet", "small"]
+    assert model_ids == ["gigaam-v3", "large-v3-ru", "turbo", "large-v3", "parakeet", "small"]
     assert data["speaker_options"] == ["auto", "2", "3", "4+"]
 
 
@@ -141,12 +160,33 @@ def test_api_upload_validation_errors():
     )
     assert r_ext.status_code == 400
 
+    r_bad_mode = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"mode": "invalid_mode"},
+    )
+    assert r_bad_mode.status_code == 400
+
+    r_tr_ext = client.post(
+        "/api/upload",
+        files={"file": ("notes.pdf", b"dummy", "application/pdf")},
+        data={"mode": "transcribe_only"},
+    )
+    assert r_tr_ext.status_code == 400
+
     r_model = client.post(
         "/api/upload",
         files={"file": ("clip.mp4", b"dummy", "video/mp4")},
         data={"asr_model": "nonexistent"},
     )
     assert r_model.status_code == 400
+
+    r_lang = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"language": "klingon"},
+    )
+    assert r_lang.status_code == 400
 
     r_spk = client.post(
         "/api/upload",
@@ -272,6 +312,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         threads: int = 1,
         status_cb=None,
         cancel_token=None,
+        language: str = "ru",
     ):
         events.append(("gpu_asr", compute_device, threads))
         if status_cb:
@@ -471,11 +512,13 @@ def test_api_cancel_running_job_stops_and_cleans_up(tmp_path, monkeypatch):
         t0 = time.time()
         cancel_resp = client.post(f"/api/cancel/{task_id}")
         assert cancel_resp.status_code == 200
-        assert cancel_resp.json() == {
-            "task_id": task_id,
-            "status": "cancelled",
-            "cancelled": True,
-        }
+        cancel_payload = cancel_resp.json()
+        assert cancel_payload["task_id"] == task_id
+        assert cancel_payload["status"] == "cancelled"
+        assert cancel_payload["cancelled"] is True
+        assert cancel_payload["is_post_transcribe"] is False
+        assert cancel_payload["video_ready"] is False
+        assert cancel_payload["transcript_ready"] is False
 
         worker_thread.join(timeout=3.0)
         assert not worker_thread.is_alive()
@@ -520,6 +563,7 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         compute_device: str = "cpu",
         status_cb=None,
         cancel_token=None,
+        language: str = "ru",
     ):
         assert os.path.isfile(wav_path)
         turns = [
@@ -591,6 +635,7 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         assert st2["status"] == "completed"
         assert st2["transcribe_enabled"] is False
         assert st2["transcript_ready"] is False
+        assert st2["can_transcribe"] is True
 
         dl_vid2 = client.get(f"/api/download/{tid2}")
         assert dl_vid2.status_code == 200
@@ -598,12 +643,17 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         dl_txt2 = client.get(f"/api/download-transcript/{tid2}")
         assert dl_txt2.status_code == 404
     finally:
+        from app import _audio_cache_path
+
         for tid in created_task_ids:
             tasks.pop(tid, None)
             for suffix in ("_anonymized.mp4", "_transcript.txt"):
                 out_file = os.path.join("output", f"{tid}{suffix}")
                 if os.path.exists(out_file):
                     os.remove(out_file)
+            cached = _audio_cache_path(tid)
+            if os.path.exists(cached):
+                os.remove(cached)
 
 
 def test_planar_yuv420p_video_processor_and_single_pass_concat_mux(tmp_path):
@@ -1153,4 +1203,843 @@ function runScenario({ cudaAvailable }) {
     )
     assert proc.returncode == 0, f"Node UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "FRONTEND_GPU_RESET_TEST_OK" in proc.stdout
+
+
+def test_post_recording_separate_transcription_cache_fallback_and_recordings_api(tmp_path, monkeypatch):
+    from app import _audio_cache_path
+
+    mp4_path = str(tmp_path / "post_tr_clip.mp4")
+    _generate_test_mp4(mp4_path, duration_sec=1.5, with_audio=True)
+
+    calls = []
+
+    def _mock_transcribe(
+        cls,
+        wav_path: str,
+        output_txt_path: str,
+        asr_model: str = "gigaam-v3",
+        speaker_count: str = "auto",
+        threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
+        status_cb=None,
+        cancel_token=None,
+        language: str = "ru",
+    ):
+        calls.append({"wav_path": wav_path, "asr_model": asr_model, "language": language, "speakers": speaker_count})
+        turns = [SpeakerTurn(0.1, 1.2, "Спикер 1", f"Модель {asr_model} ({language})")]
+        txt = format_transcript_txt(turns, duration_sec=1.5, model_name=asr_model, num_speakers=1)
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01}
+
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_transcribe))
+
+    client = TestClient(app)
+    tid = None
+    try:
+        # 1. Anonymize video WITHOUT transcription first
+        with open(mp4_path, "rb") as f:
+            up = client.post(
+                "/api/upload",
+                files={"file": ("demo.mp4", f, "video/mp4")},
+                data={"workers": "1", "transcribe": "false"},
+            )
+        assert up.status_code == 200
+        tid = up.json()["task_id"]
+
+        st = client.get(f"/api/status/{tid}").json()
+        assert st["status"] == "completed"
+        assert st["video_ready"] is True
+        assert st["transcript_ready"] is False
+        assert st["has_original_audio"] is True
+        assert st["can_transcribe"] is True
+        assert os.path.isfile(_audio_cache_path(tid))
+
+        # Verify GET /api/recordings lists the recording before transcription
+        recs = client.get("/api/recordings").json()["recordings"]
+        rec_item = next((r for r in recs if r["task_id"] == tid), None)
+        assert rec_item is not None
+        assert rec_item["video_ready"] is True
+        assert rec_item["transcript_ready"] is False
+        assert rec_item["has_original_audio"] is True
+        assert rec_item["can_transcribe"] is True
+
+        # 2. Generate transcript separately -> must use cached original un-pitched WAV!
+        tr1 = client.post(
+            f"/api/transcribe/{tid}",
+            data={
+                "workers": "1",
+                "asr_model": "gigaam-v3",
+                "language": "ru",
+                "speakers": "2",
+                "compute_device": "cpu",
+            },
+        )
+        assert tr1.status_code == 200
+        assert tr1.json()["using_original_audio"] is True
+
+        st_after1 = client.get(f"/api/status/{tid}").json()
+        assert st_after1["status"] == "completed"
+        assert st_after1["video_ready"] is True
+        assert st_after1["transcript_ready"] is True
+        assert len(calls) == 1
+        assert os.path.abspath(calls[0]["wav_path"]) == os.path.abspath(_audio_cache_path(tid))
+        assert calls[0]["asr_model"] == "gigaam-v3"
+        assert calls[0]["language"] == "ru"
+
+        dl_txt1 = client.get(f"/api/download-transcript/{tid}")
+        assert dl_txt1.status_code == 200
+        assert "Модель gigaam-v3 (ru)" in dl_txt1.text
+        assert client.get(f"/api/download/{tid}").status_code == 200
+
+        # 3. Remove cached original audio (simulating container restart) -> falls back to anonymized MP4!
+        os.remove(_audio_cache_path(tid))
+        tr2 = client.post(
+            f"/api/transcribe/{tid}",
+            data={
+                "workers": "1",
+                "asr_model": "large-v3-ru",
+                "language": "ru",
+                "speakers": "auto",
+                "compute_device": "cpu",
+            },
+        )
+        assert tr2.status_code == 200
+        assert tr2.json()["using_original_audio"] is False
+
+        st_after2 = client.get(f"/api/status/{tid}").json()
+        assert st_after2["status"] == "completed"
+        assert st_after2["video_ready"] is True
+        assert st_after2["transcript_ready"] is True
+        assert len(calls) == 2
+        assert calls[1]["asr_model"] == "large-v3-ru"
+
+        dl_txt2 = client.get(f"/api/download-transcript/{tid}")
+        assert dl_txt2.status_code == 200
+        assert "Модель large-v3-ru (ru)" in dl_txt2.text
+    finally:
+        if tid:
+            tasks.pop(tid, None)
+            for p in (
+                os.path.join("output", f"{tid}_anonymized.mp4"),
+                os.path.join("output", f"{tid}_transcript.txt"),
+                _audio_cache_path(tid),
+            ):
+                if os.path.exists(p):
+                    os.remove(p)
+
+
+def test_cancel_post_recording_transcription_preserves_video_and_existing_transcript(tmp_path, monkeypatch):
+    import threading
+    import time
+    from app import _audio_cache_path, background_transcribe_only, cancel_tokens
+    from src.cancellation import CancellationToken
+
+    client = TestClient(app)
+    task_id = "test-cancel-post-transcribe"
+    out_mp4 = os.path.join("output", f"{task_id}_anonymized.mp4")
+    out_txt = os.path.join("output", f"{task_id}_transcript.txt")
+    _generate_test_mp4(out_mp4, duration_sec=1.2, with_audio=True)
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write("PREVIOUS_TRANSCRIPT_INTACT\n")
+
+    entered = threading.Event()
+
+    def _slow_retranscribe(cls, wav_path, output_txt_path, cancel_token=None, **kwargs):
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write("PARTIAL_NEW_TRANSCRIPT\n")
+        entered.set()
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            if cancel_token is not None:
+                cancel_token.check()
+            time.sleep(0.02)
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 10.0}
+
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_slow_retranscribe))
+
+    cancel_tokens[task_id] = CancellationToken()
+    tasks[task_id] = {
+        "status": "queued",
+        "mode": "anonymize",
+        "message": "Queued",
+        "logs": [],
+        "worker_count": 1,
+        "transcribe_enabled": True,
+        "video_ready": True,
+        "transcript_ready": True,
+        "has_original_audio": False,
+        "can_transcribe": True,
+        "is_post_transcribe": True,
+        "asr_model": "gigaam-v3",
+        "language": "ru",
+        "speakers": "auto",
+        "compute_device": "cpu",
+    }
+
+    worker = threading.Thread(
+        target=background_transcribe_only,
+        args=(task_id, out_mp4, out_txt, 1, "gigaam-v3", "ru", "auto", "cpu", True, False, False),
+        daemon=True,
+    )
+    try:
+        worker.start()
+        assert entered.wait(timeout=10.0)
+
+        cancel_resp = client.post(f"/api/cancel/{task_id}")
+        assert cancel_resp.status_code == 200
+        cancel_json = cancel_resp.json()
+        assert cancel_json["cancelled"] is True
+        assert cancel_json["is_post_transcribe"] is True
+        assert cancel_json["video_ready"] is True
+        assert cancel_json["transcript_ready"] is True
+        assert cancel_json["can_transcribe"] is True
+
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+
+        # Both the original anonymized video AND the previous transcript MUST remain intact & downloadable!
+        assert os.path.isfile(out_mp4)
+        assert os.path.isfile(out_txt)
+        assert open(out_txt, encoding="utf-8").read() == "PREVIOUS_TRANSCRIPT_INTACT\n"
+
+        st = client.get(f"/api/status/{task_id}").json()
+        assert st["status"] == "cancelled"
+        assert st["video_ready"] is True
+        assert st["transcript_ready"] is True
+        assert client.get(f"/api/download/{task_id}").status_code == 200
+        assert client.get(f"/api/download-transcript/{task_id}").status_code == 200
+    finally:
+        tasks.pop(task_id, None)
+        cancel_tokens.pop(task_id, None)
+        for p in (out_mp4, out_txt, _audio_cache_path(task_id)):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, monkeypatch):
+    from app import _audio_cache_path
+    from main import process_video
+    from src.video_processor import VideoProcessor
+
+    mp4_path = str(tmp_path / "only_tr.mp4")
+    wav_path = str(tmp_path / "only_tr.wav")
+    _generate_test_mp4(mp4_path, duration_sec=1.2, with_audio=True)
+    FFmpegUtils.extract_transcription_audio(mp4_path, wav_path)
+
+    def _forbid_video_process(*args, **kwargs):
+        raise AssertionError("VideoProcessor.process MUST NOT be called in transcribe_only mode")
+
+    def _forbid_split(*args, **kwargs):
+        raise AssertionError("FFmpegUtils.split_video MUST NOT be called in transcribe_only mode")
+
+    monkeypatch.setattr(VideoProcessor, "process", _forbid_video_process)
+    monkeypatch.setattr(FFmpegUtils, "split_video", staticmethod(_forbid_split))
+
+    seen_models = []
+
+    def _mock_transcribe(
+        cls,
+        wav_path: str,
+        output_txt_path: str,
+        asr_model: str = "gigaam-v3",
+        speaker_count: str = "auto",
+        threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
+        status_cb=None,
+        cancel_token=None,
+        language: str = "ru",
+    ):
+        seen_models.append((asr_model, language))
+        turns = [SpeakerTurn(0.0, 1.0, "Спикер 1", "Тест только транскрибации.")]
+        txt = format_transcript_txt(turns, duration_sec=1.2, model_name=asr_model, num_speakers=1)
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01}
+
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_transcribe))
+
+    client = TestClient(app)
+    created_ids = []
+    try:
+        # 1. API transcribe_only with MP4
+        with open(mp4_path, "rb") as f:
+            r1 = client.post(
+                "/api/upload",
+                files={"file": ("meeting.mp4", f, "video/mp4")},
+                data={"mode": "transcribe_only", "asr_model": "gigaam-v3", "language": "ru", "workers": "1"},
+            )
+        assert r1.status_code == 200
+        assert r1.json()["mode"] == "transcribe_only"
+        tid1 = r1.json()["task_id"]
+        created_ids.append(tid1)
+
+        st1 = client.get(f"/api/status/{tid1}").json()
+        assert st1["status"] == "completed"
+        assert st1["mode"] == "transcribe_only"
+        assert st1["video_ready"] is False
+        assert st1["transcript_ready"] is True
+        assert st1["can_transcribe"] is True
+        assert client.get(f"/api/download/{tid1}").status_code == 404
+        dl1 = client.get(f"/api/download-transcript/{tid1}")
+        assert dl1.status_code == 200
+        assert "Тест только транскрибации." in dl1.text
+
+        # 2. API transcribe_only with audio-only .wav file
+        with open(wav_path, "rb") as f:
+            r2 = client.post(
+                "/api/upload",
+                files={"file": ("voice_note.wav", f, "audio/wav")},
+                data={"mode": "transcribe_only", "asr_model": "large-v3-ru", "language": "ru", "workers": "1"},
+            )
+        assert r2.status_code == 200
+        tid2 = r2.json()["task_id"]
+        created_ids.append(tid2)
+
+        st2 = client.get(f"/api/status/{tid2}").json()
+        assert st2["status"] == "completed"
+        assert st2["transcript_ready"] is True
+        assert client.get(f"/api/download-transcript/{tid2}").status_code == 200
+
+        # 3. CLI process_video(transcribe_only=True) without output_path
+        cli_txt = str(tmp_path / "cli_only.txt")
+        cli_res = process_video(
+            input_path=wav_path,
+            output_path=None,
+            transcript_path=cli_txt,
+            asr_model="gigaam-v3",
+            language="ru",
+            workers=1,
+            transcribe_only=True,
+        )
+        assert cli_res["video_ready"] is False
+        assert cli_res["transcript_ready"] is True
+        assert os.path.isfile(cli_txt)
+        assert seen_models == [("gigaam-v3", "ru"), ("large-v3-ru", "ru"), ("gigaam-v3", "ru")]
+    finally:
+        for tid in created_ids:
+            tasks.pop(tid, None)
+            for p in (
+                os.path.join("output", f"{tid}_anonymized.mp4"),
+                os.path.join("output", f"{tid}_transcript.txt"),
+                _audio_cache_path(tid),
+            ):
+                if os.path.exists(p):
+                    os.remove(p)
+
+
+def test_frontend_v45_modes_russian_models_and_post_transcribe():
+    """
+    Executes static/script.js in Node.js to verify v4.5.0 frontend flows:
+      1. Default model is GigaAM v3; switching GPU (CUDA) auto-switches GigaAM v3 -> Whisper Large v3 RU.
+      2. Switching to 'Только транскрибация' updates dropzone, accepts .wav/.mp3, sends mode='transcribe_only',
+         hides video download button, and shows transcript download button.
+      3. Anonymization with transcribe=false displays the 'Создать транскрипт отдельно' panel on completion
+         and clicking #postTranscribeBtn calls POST /api/transcribe/{task_id}.
+      4. GET /api/recordings populates #recordingsList with 'Создать транскрипт' actions.
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const storage = new Map();
+const localStorage = {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+};
+
+class ClassList {
+    constructor(el, initial = []) { this.el = el; this.set = new Set(initial.filter(Boolean)); }
+    add(...cls) { cls.forEach((c) => this.set.add(c)); }
+    remove(...cls) { cls.forEach((c) => this.set.delete(c)); }
+    contains(c) { return this.set.has(c); }
+    toggle(c, force) {
+        const next = force !== undefined ? Boolean(force) : !this.set.has(c);
+        if (next) this.set.add(c); else this.set.delete(c);
+        return next;
+    }
+}
+
+class FakeEvent {
+    constructor(type, opts = {}) {
+        this.type = type;
+        this.bubbles = Boolean(opts.bubbles);
+        this.defaultPrevented = false;
+        this.propagationStopped = false;
+    }
+    preventDefault() { this.defaultPrevented = true; }
+    stopPropagation() { this.propagationStopped = true; }
+}
+
+const byId = new Map();
+let activeElement = null;
+
+class FakeElement {
+    constructor(tagName, { id = '', classes = [], attrs = {}, text = '' } = {}) {
+        this.tagName = tagName.toUpperCase();
+        this.id = id;
+        if (id) byId.set(id, this);
+        this.classList = new ClassList(this, classes);
+        this.attrs = { ...attrs };
+        this.dataset = {};
+        this.children = [];
+        this.parentNode = null;
+        this.listeners = {};
+        this._textContent = text;
+        this._innerHTML = '';
+        this.disabled = false;
+        this.checked = Boolean(attrs.checked);
+        this.title = '';
+        this.accept = attrs.accept || '';
+        this.tabIndex = 0;
+        this.scrollTop = 0;
+        this.scrollHeight = 100;
+        this.files = [];
+        this._value = attrs.value !== undefined ? String(attrs.value) : '';
+        this.selected = Boolean(attrs.selected);
+        this.onclick = null;
+    }
+    get className() { return Array.from(this.classList.set).join(' '); }
+    set className(v) { this.classList = new ClassList(this, String(v).split(/\s+/)); }
+    get textContent() {
+        if (this.children.length === 0) return this._textContent;
+        return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    set textContent(v) { this._textContent = String(v); this.children = []; }
+    get innerHTML() { return this._innerHTML; }
+    set innerHTML(v) {
+        this._innerHTML = String(v);
+        if (v === '') {
+            this.children.forEach((c) => { c.parentNode = null; });
+            this.children = [];
+        }
+    }
+    get options() { return this.children.filter((c) => c.tagName === 'OPTION'); }
+    get selectedIndex() {
+        const opts = this.options;
+        const idx = opts.findIndex((o) => o.value === this.value);
+        return idx >= 0 ? idx : 0;
+    }
+    get value() {
+        if (this.tagName === 'SELECT') {
+            const opts = this.options;
+            if (this._value && opts.some((o) => o.value === this._value)) return this._value;
+            const sel = opts.find((o) => o.selected) || opts[0];
+            return sel ? sel.value : '';
+        }
+        return this._value;
+    }
+    set value(v) { this._value = String(v); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return this.attrs[k] ?? null; }
+    appendChild(child) {
+        if (child.parentNode) {
+            const idx = child.parentNode.children.indexOf(child);
+            if (idx >= 0) child.parentNode.children.splice(idx, 1);
+        }
+        child.parentNode = this;
+        this.children.push(child);
+        return child;
+    }
+    insertBefore(newNode, refNode) {
+        if (newNode.parentNode) {
+            const oldIdx = newNode.parentNode.children.indexOf(newNode);
+            if (oldIdx >= 0) newNode.parentNode.children.splice(oldIdx, 1);
+        }
+        newNode.parentNode = this;
+        const idx = this.children.indexOf(refNode);
+        if (idx >= 0) this.children.splice(idx, 0, newNode);
+        else this.children.push(newNode);
+        return newNode;
+    }
+    addEventListener(type, fn) {
+        if (!this.listeners[type]) this.listeners[type] = [];
+        this.listeners[type].push(fn);
+    }
+    dispatchEvent(evt) {
+        (this.listeners[evt.type] || []).forEach((fn) => fn.call(this, evt));
+        if (evt.type === 'click' && typeof this.onclick === 'function') this.onclick.call(this, evt);
+        if (evt.bubbles && !evt.propagationStopped) {
+            if (this.parentNode) this.parentNode.dispatchEvent(evt);
+            else documentObj.dispatchEvent(evt);
+        }
+        return !evt.defaultPrevented;
+    }
+    click() { this.dispatchEvent(new FakeEvent('click', { bubbles: true })); }
+    focus() { activeElement = this; }
+    matchesSelector(sel) {
+        if (sel === '.sun-icon') return this.classList.contains('sun-icon');
+        if (sel === '.moon-icon') return this.classList.contains('moon-icon');
+        const lm = sel.match(/^label\[for="(.+)"\]$/);
+        if (lm) return this.tagName === 'LABEL' && this.attrs.for === lm[1];
+        if (sel === '.clay-select-option:not(:disabled)') return this.classList.contains('clay-select-option') && !this.disabled;
+        if (sel === '.clay-select-option.is-selected:not(:disabled)') {
+            return this.classList.contains('clay-select-option') && this.classList.contains('is-selected') && !this.disabled;
+        }
+        return false;
+    }
+    querySelectorAll(sel) {
+        const out = [];
+        const walk = (n) => { n.children.forEach((ch) => { if (ch.matchesSelector(sel)) out.push(ch); walk(ch); }); };
+        walk(this);
+        return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+}
+
+const root = new FakeElement('div', { id: 'root' });
+const makeSelect = (id, opts) => {
+    const container = new FakeElement('div');
+    const sel = new FakeElement('select', { id, classes: ['worker-select'] });
+    opts.forEach(([val, text, selected]) => sel.appendChild(new FakeElement('option', { attrs: { value: val, selected }, text })));
+    container.appendChild(sel);
+    root.appendChild(container);
+    return sel;
+};
+
+const themeBtn = root.appendChild(new FakeElement('button', { id: 'themeToggle' }));
+themeBtn.appendChild(new FakeElement('svg', { classes: ['sun-icon', 'hidden'] }));
+themeBtn.appendChild(new FakeElement('svg', { classes: ['moon-icon', 'hidden'] }));
+
+const uploadPanel = root.appendChild(new FakeElement('div', { id: 'uploadPanel' }));
+const modeAnonymizeBtn = uploadPanel.appendChild(new FakeElement('button', { id: 'modeAnonymizeBtn', classes: ['mode-tab', 'is-active'] }));
+const modeTranscribeOnlyBtn = uploadPanel.appendChild(new FakeElement('button', { id: 'modeTranscribeOnlyBtn', classes: ['mode-tab'] }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'dropZone' }));
+const dropZoneTitle = uploadPanel.appendChild(new FakeElement('h2', { id: 'dropZoneTitle' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'dropZoneHint' }));
+const fileInput = uploadPanel.appendChild(new FakeElement('input', { id: 'fileInput', attrs: { accept: '.mp4' } }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'workerValue', text: '4' }));
+makeSelect('workerSelect', [['1', '1'], ['4', '4', true], ['custom', 'Другое']]);
+uploadPanel.appendChild(new FakeElement('div', { id: 'customWorkerWrap', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'customWorkerInput' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'workerLimitText' }));
+const transcribeToggle = uploadPanel.appendChild(new FakeElement('input', { id: 'transcribeToggle', attrs: { checked: true } }));
+const transcribeSwitchWrap = uploadPanel.appendChild(new FakeElement('label', { id: 'transcribeSwitchWrap' }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'transcribeStateBadge', text: 'Вкл' }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'transcribeHintText' }));
+
+const modelOpts = [
+    ['gigaam-v3', 'GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)', true],
+    ['large-v3-ru', 'Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)'],
+    ['turbo', 'Whisper Turbo — универсальная (99 яз., 810 МБ)'],
+    ['parakeet', 'Parakeet v3 — быстрая (25 яз., 600 МБ)'],
+];
+const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто (мультиязычный)'], ['en', 'English (EN)']];
+const devOpts = [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']];
+const spkOpts = [['auto', 'Авто', true], ['2', '2 спикера']];
+
+const asrModelSelect = makeSelect('asrModelSelect', modelOpts);
+const languageSelect = makeSelect('languageSelect', langOpts);
+const computeDeviceSelect = makeSelect('computeDeviceSelect', devOpts);
+makeSelect('speakerCountSelect', spkOpts);
+
+const recordingsSection = uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsSection', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'recordingsCount' }));
+const recordingsList = uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsList' }));
+
+const statusPanel = root.appendChild(new FakeElement('div', { id: 'statusPanel', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('div', { id: 'spinner' }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'successIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'cancelIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('h2', { id: 'statusText' }));
+statusPanel.appendChild(new FakeElement('p', { id: 'statusSubText' }));
+statusPanel.appendChild(new FakeElement('div', { id: 'debugLog', classes: ['hidden'] }));
+const cancelBtn = statusPanel.appendChild(new FakeElement('button', { id: 'cancelBtn', classes: ['hidden'] }));
+const downloadBtn = statusPanel.appendChild(new FakeElement('button', { id: 'downloadBtn', classes: ['hidden'] }));
+const downloadTranscriptBtn = statusPanel.appendChild(new FakeElement('button', { id: 'downloadTranscriptBtn', classes: ['hidden'] }));
+const postTranscribeSection = statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeSection', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'togglePostTranscribeBtn', classes: ['hidden'] }));
+const postTranscribeForm = statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeForm', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('span', { id: 'postTranscribeTitle' }));
+makeSelect('postAsrModelSelect', modelOpts);
+makeSelect('postLanguageSelect', langOpts);
+makeSelect('postComputeDeviceSelect', devOpts);
+makeSelect('postSpeakerCountSelect', spkOpts);
+statusPanel.appendChild(new FakeElement('p', { id: 'postAudioSourceHint' }));
+const postTranscribeBtn = statusPanel.appendChild(new FakeElement('button', { id: 'postTranscribeBtn' }));
+const resetBtn = statusPanel.appendChild(new FakeElement('button', { id: 'resetBtn', classes: ['hidden'] }));
+
+const docListeners = {};
+const documentObj = {
+    documentElement: new FakeElement('html'),
+    get activeElement() { return activeElement; },
+    getElementById: (id) => byId.get(id) || null,
+    querySelector: (sel) => root.querySelector(sel),
+    querySelectorAll: (sel) => root.querySelectorAll(sel),
+    createElement: (tag) => new FakeElement(tag),
+    createElementNS: (_ns, tag) => new FakeElement(tag),
+    addEventListener: (t, fn) => { (docListeners[t] ||= []).push(fn); },
+    dispatchEvent: (evt) => { (docListeners[evt.type] || []).forEach((fn) => fn(evt)); },
+};
+
+class FakeFormData {
+    constructor() { this.entries = {}; }
+    append(k, v) { this.entries[k] = v; }
+}
+
+const uploadCalls = [];
+const postTranscribeCalls = [];
+let statusResponses = {};
+
+const fakeFetch = async (url, opts = {}) => {
+    if (url === '/api/config') {
+        return {
+            ok: true,
+            json: async () => ({
+                version: '4.5.0',
+                cpu_count: 8,
+                default_workers: 4,
+                max_workers: 7,
+                transcription_default: true,
+                default_asr_model: 'gigaam-v3',
+                default_language: 'ru',
+                asr_models: [
+                    { id: 'gigaam-v3', label: 'GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)', supports_cuda: false },
+                    { id: 'large-v3-ru', label: 'Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)', supports_cuda: true },
+                    { id: 'turbo', label: 'Whisper Turbo — универсальная (99 яз., 810 МБ)', supports_cuda: true },
+                    { id: 'parakeet', label: 'Parakeet v3 — быстрая (25 яз., 600 МБ)', supports_cuda: false },
+                ],
+                languages: [
+                    { id: 'ru', label: 'Русский (RU)' },
+                    { id: 'auto', label: 'Авто (мультиязычный)' },
+                    { id: 'en', label: 'English (EN)' },
+                ],
+                cuda_available: true,
+                default_compute_device: 'cpu',
+                compute_devices: [{ id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU (CUDA)' }],
+            }),
+        };
+    }
+    if (url === '/api/recordings') {
+        return {
+            ok: true,
+            json: async () => ({
+                recordings: [
+                    {
+                        task_id: 'old-rec-1',
+                        original_filename: 'saved_interview.mp4',
+                        video_ready: true,
+                        video_size_bytes: 5 * 1024 * 1024,
+                        transcript_ready: false,
+                        has_original_audio: false,
+                        can_transcribe: true,
+                    },
+                ],
+            }),
+        };
+    }
+    if (url === '/api/upload') {
+        const payload = { ...opts.body.entries };
+        uploadCalls.push(payload);
+        const tid = `t-${uploadCalls.length}`;
+        if (payload.mode === 'transcribe_only') {
+            statusResponses[tid] = {
+                status: 'completed',
+                mode: 'transcribe_only',
+                video_ready: false,
+                transcript_ready: true,
+                can_transcribe: true,
+                has_original_audio: true,
+                logs: ['Done!'],
+            };
+        } else {
+            statusResponses[tid] = {
+                status: 'completed',
+                mode: 'anonymize',
+                video_ready: true,
+                transcript_ready: payload.transcribe === 'true',
+                can_transcribe: true,
+                has_original_audio: true,
+                logs: ['Done!'],
+            };
+        }
+        return { ok: true, json: async () => ({ task_id: tid, status: 'queued', worker_count: 4 }) };
+    }
+    if (url.startsWith('/api/transcribe/')) {
+        const tid = url.split('/').pop();
+        postTranscribeCalls.push({ tid, payload: { ...opts.body.entries } });
+        if (tid === 'old-rec-1') {
+            statusResponses[tid] = {
+                status: 'processing',
+                mode: 'anonymize',
+                video_ready: true,
+                transcript_ready: false,
+                can_transcribe: true,
+                has_original_audio: true,
+                is_post_transcribe: true,
+                logs: ['Working...'],
+            };
+        } else {
+            statusResponses[tid] = {
+                status: 'completed',
+                mode: 'anonymize',
+                video_ready: true,
+                transcript_ready: true,
+                can_transcribe: true,
+                has_original_audio: true,
+                is_post_transcribe: true,
+                logs: ['Done!'],
+            };
+        }
+        return { ok: true, json: async () => ({ task_id: tid, status: 'queued' }) };
+    }
+    if (url.startsWith('/api/cancel/')) {
+        const tid = url.split('/').pop();
+        return {
+            ok: true,
+            json: async () => ({
+                task_id: tid,
+                status: 'cancelled',
+                cancelled: true,
+                mode: 'anonymize',
+                is_post_transcribe: true,
+                video_ready: true,
+                transcript_ready: false,
+                has_original_audio: true,
+                can_transcribe: true,
+            }),
+        };
+    }
+    if (url.startsWith('/api/status/')) {
+        const tid = url.split('/').pop();
+        return { ok: true, json: async () => statusResponses[tid] };
+    }
+    throw new Error('Unexpected URL: ' + url);
+};
+
+const ctx = vm.createContext({
+    document: documentObj,
+    window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+    localStorage,
+    Event: FakeEvent,
+    FormData: FakeFormData,
+    AbortController: class { constructor() { this.signal = {}; } abort() {} },
+    fetch: fakeFetch,
+    setInterval: () => 1,
+    clearInterval: () => {},
+    alert: (m) => { throw new Error('Unexpected alert: ' + m); },
+    console,
+    Number, String, Boolean, Array, Map, Set, Date,
+});
+vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
+
+(async () => {
+    await new Promise((r) => setTimeout(r, 25));
+
+    // 1. Default model is gigaam-v3 + ru, and recordings list rendered from /api/recordings
+    assert.strictEqual(asrModelSelect.value, 'gigaam-v3');
+    assert.strictEqual(languageSelect.value, 'ru');
+    assert.strictEqual(recordingsSection.classList.contains('hidden'), false);
+    assert.strictEqual(recordingsList.children.length, 1);
+
+    // 2. Selecting GPU (CUDA) while gigaam-v3 is active auto-switches to large-v3-ru!
+    const devMenuBtns = computeDeviceSelect.parentNode.children.find((c) => c.classList.contains('clay-select-menu')).children;
+    assert.strictEqual(devMenuBtns[1].disabled, false);
+    devMenuBtns[1].click();
+    assert.strictEqual(computeDeviceSelect.value, 'cuda');
+    assert.strictEqual(asrModelSelect.value, 'large-v3-ru');
+
+    // 3. Switch to 'Только транскрибация' mode -> accepts .wav, hides video download button!
+    modeTranscribeOnlyBtn.click();
+    assert.ok(dropZoneTitle.textContent.includes('аудио'));
+    assert.ok(fileInput.accept.includes('.wav'));
+    assert.strictEqual(transcribeSwitchWrap.classList.contains('hidden'), true);
+
+    fileInput.files = [{ name: 'voice_memo.wav' }];
+    fileInput.dispatchEvent(new ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 25));
+
+    assert.strictEqual(uploadCalls.length, 1);
+    assert.strictEqual(uploadCalls[0].mode, 'transcribe_only');
+    assert.strictEqual(uploadCalls[0].language, 'ru');
+    assert.strictEqual(uploadCalls[0].asr_model, 'large-v3-ru');
+    assert.strictEqual(downloadBtn.classList.contains('hidden'), true, 'Video download must stay hidden in transcribe_only');
+    assert.strictEqual(downloadTranscriptBtn.classList.contains('hidden'), false);
+
+    // 4. Return, switch to 'Анонимизация' with transcribe=false -> post-transcribe form opens immediately!
+    resetBtn.click();
+    modeAnonymizeBtn.click();
+    transcribeToggle.checked = false;
+    transcribeToggle.dispatchEvent(new ctx.Event('change'));
+
+    fileInput.files = [{ name: 'interview.mp4' }];
+    fileInput.dispatchEvent(new ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 25));
+
+    assert.strictEqual(uploadCalls.length, 2);
+    assert.strictEqual(uploadCalls[1].mode, 'anonymize');
+    assert.strictEqual(uploadCalls[1].transcribe, 'false');
+    assert.strictEqual(downloadBtn.classList.contains('hidden'), false);
+    assert.strictEqual(downloadTranscriptBtn.classList.contains('hidden'), true);
+    assert.strictEqual(postTranscribeSection.classList.contains('hidden'), false);
+    assert.strictEqual(postTranscribeForm.classList.contains('hidden'), false);
+
+    // 5. Click 'Создать транскрипт' -> calls POST /api/transcribe/t-2 and unlocks transcript download!
+    postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+
+    assert.strictEqual(postTranscribeCalls.length, 1);
+    assert.strictEqual(postTranscribeCalls[0].tid, 't-2');
+    assert.strictEqual(downloadBtn.classList.contains('hidden'), false);
+    assert.strictEqual(downloadTranscriptBtn.classList.contains('hidden'), false);
+
+    // 6. Return to home, click 'Настроить' on saved recording, start post-transcribe and cancel immediately
+    resetBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    const recCard = recordingsList.children[0];
+    const actionsRow = recCard.children[2];
+    const cfgChip = actionsRow.children.find((b) => b.textContent === 'Настроить');
+    assert.ok(cfgChip, 'Expected Настроить button on recording card');
+    cfgChip.click();
+    assert.strictEqual(statusPanel.classList.contains('hidden'), false);
+    assert.strictEqual(postTranscribeForm.classList.contains('hidden'), false);
+    assert.strictEqual(downloadBtn.classList.contains('hidden'), false);
+
+    postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    await cancelBtn.onclick();
+    assert.strictEqual(downloadBtn.classList.contains('hidden'), false, 'Video download must stay visible after cancelling post-transcribe');
+    assert.strictEqual(postTranscribeSection.classList.contains('hidden'), false, 'Post-transcribe section must stay visible after cancel');
+
+    console.log('FRONTEND_V45_ALL_FEATURES_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node v4.5 UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_V45_ALL_FEATURES_OK" in proc.stdout
+
+
+def test_ffmpeg_metadata_handles_na_duration_and_invalid_sample_rate(monkeypatch):
+    import ffmpeg as ffmpeg_pkg
+
+    def _fake_probe(_path):
+        return {
+            "format": {"duration": "N/A"},
+            "streams": [
+                {"codec_type": "audio", "sample_rate": "N/A", "duration": "12.5"},
+            ],
+        }
+
+    monkeypatch.setattr(ffmpeg_pkg, "probe", _fake_probe)
+    width, height, fps, duration, has_audio, sample_rate = FFmpegUtils.get_video_metadata("stream.webm")
+    assert width is None
+    assert height is None
+    assert has_audio is True
+    assert abs(duration - 12.5) < 1e-6
+    assert sample_rate == 44100
+
+
 

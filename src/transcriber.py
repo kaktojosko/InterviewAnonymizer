@@ -22,8 +22,11 @@ from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 from src.cancellation import CancellationToken
 from src.config import (
+    APP_VERSION,
+    ASR_LANGUAGE_OPTIONS,
     ASR_MODEL_PROFILES,
     COMPUTE_DEVICE_OPTIONS,
+    DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
     DIARIZATION_CENTROID_SIM_THRESHOLD,
@@ -69,8 +72,9 @@ def format_timestamp(seconds: float) -> str:
 def load_wav_16k_mono(wav_path: str, normalize_gain: bool = True) -> tuple[np.ndarray, int]:
     """
     Loads a 16 kHz PCM s16le WAV file into a 1-D float32 numpy array in [-1, 1].
-    Applies zero-phase peak gain normalization on quiet recordings to avoid
-    timestamp drift while improving VAD, diarization, and ASR sensitivity.
+    Applies DC removal and zero-phase 99.5th-percentile gain normalization on quiet
+    recordings so isolated clicks/pops never defeat normalization while preserving
+    exact timestamps and boosting VAD, diarization, and ASR sensitivity.
     """
     if not os.path.isfile(wav_path):
         raise FileNotFoundError(f"Audio file not found: {wav_path}")
@@ -93,9 +97,13 @@ def load_wav_16k_mono(wav_path: str, normalize_gain: bool = True) -> tuple[np.nd
         pcm = pcm.reshape(-1, channels).mean(axis=1)
 
     if normalize_gain and pcm.size > 0:
-        peak = float(np.max(np.abs(pcm)))
-        if 0.005 < peak < 0.5:
-            gain = min(10.0, 0.9 / peak)
+        dc = float(np.mean(pcm))
+        if abs(dc) > 1e-4:
+            pcm = pcm - dc
+        abs_pcm = np.abs(pcm)
+        ref_level = float(np.percentile(abs_pcm, 99.5)) if pcm.size >= 160 else float(np.max(abs_pcm))
+        if 0.005 < ref_level < 0.5:
+            gain = min(10.0, 0.9 / ref_level)
             pcm = np.clip(pcm * gain, -1.0, 1.0)
 
     return np.ascontiguousarray(pcm, dtype=np.float32), sample_rate
@@ -853,26 +861,42 @@ def group_bpe_tokens_to_units(
     """
     units: list[TimedUnit] = []
     cur_text = ""
-    cur_start = None
-    cur_last_t = None
+    cur_start: Optional[float] = None
+    cur_last_t: Optional[float] = None
+    pending_space = False
 
     for tok, rel_t in zip(tokens, timestamps):
         if not tok:
             continue
         abs_t = offset_sec + max(0.0, float(rel_t))
-        starts_new_word = tok.startswith(" ") or tok.startswith("▁")
         clean_piece = tok.replace("▁", " ")
 
-        if starts_new_word and cur_text.strip():
+        # Standalone word-boundary marker (e.g. '▁' or ' ' in GigaAM v3 BPE vocab)
+        if not clean_piece.strip():
+            if cur_text.strip() and cur_start is not None:
+                word_end = min(chunk_end_sec, max(cur_start + 0.08, abs_t))
+                units.append(TimedUnit(start=cur_start, end=word_end, text=cur_text))
+                cur_text = ""
+                cur_start = None
+                cur_last_t = None
+            pending_space = True
+            continue
+
+        starts_new_word = pending_space or tok.startswith(" ") or tok.startswith("▁")
+        pending_space = False
+
+        if starts_new_word and cur_text.strip() and cur_start is not None:
             word_end = min(chunk_end_sec, max(cur_start + 0.08, abs_t))
             units.append(TimedUnit(start=cur_start, end=word_end, text=cur_text))
-            cur_text = clean_piece
+            cur_text = clean_piece if clean_piece.startswith(" ") else f" {clean_piece}"
             cur_start = abs_t
             cur_last_t = abs_t
         else:
             if cur_start is None:
                 cur_start = abs_t
-            cur_text += clean_piece
+                cur_text = clean_piece if (not units or clean_piece.startswith(" ")) else f" {clean_piece}"
+            else:
+                cur_text += clean_piece
             cur_last_t = abs_t
 
     if cur_text.strip() and cur_start is not None:
@@ -1495,7 +1519,7 @@ def format_transcript_txt(
     note: Optional[str] = None,
 ) -> str:
     header_lines = [
-        "# Транскрибация интервью (Interview Anonymizer v4.4.0)",
+        f"# Транскрибация интервью (Interview Anonymizer v{APP_VERSION})",
         f"# Длительность: {format_timestamp(duration_sec)} | Модель: {model_name} | Обнаружено спикеров: {num_speakers}",
         "# " + ("=" * 72),
         "",
@@ -1669,33 +1693,58 @@ def resolve_compute_device(
     return "cpu", "int8"
 
 
-_WHISPER_STYLE_PROMPTS: dict[str, str] = {
-    "ru": (
-        "Здравствуйте! Расскажите, пожалуйста, про ваш опыт: AI, SQL, JOIN, UNION, "
-        "подзапросы, реляционные базы данных, ClickHouse, API, Python, Git, Docker. "
-        "Ну да, по-моему, что-то такое мы использовали в продакшене."
-    ),
-    "en": (
-        "Hello! Could you tell me about your engineering experience with AI, SQL, APIs, "
-        "relational databases, Python, Git, and Docker? Sure, we used them in production."
-    ),
-    "uk": (
-        "Вітаю! Розкажіть, будь ласка, про ваш досвід роботи з AI, SQL, JOIN, API, "
-        "реляційними базами даних, Python та Docker."
-    ),
-}
-
 _CONSECUTIVE_REPEAT_RE = re.compile(r"\b(\w+)(?:\s+\1){2,}\b", re.IGNORECASE)
 
+# Known Whisper phantom subtitle hallucinations generated on Russian silence/noise
+_WHISPER_PHANTOM_RE = re.compile(
+    r"^(?:"
+    r"продолжение\s+следует|"
+    r"редактор\s+субтитров\b.*|"
+    r"корректор\b.*|"
+    r"субтитры\s+(?:сделал|создавал|подготовил|подогнал|добавил)\b.*|"
+    r"спасибо\s+за\s+просмотр\b.*|"
+    r"подписывайтесь\s+на\s+(?:наш\s+)?канал\b.*|"
+    r"ставьте\s+лайк(?:и)?\b.*|"
+    r"dimatorzok\b.*|"
+    r"amara\.org\b.*"
+    r")[\s.!?,:;…\-—]*$",
+    re.IGNORECASE,
+)
 
-def _extract_clean_context_tail(text: str, max_chars: int = 140) -> str:
+
+def is_whisper_phantom_hallucination(
+    text: str,
+    no_speech_prob: float = 0.0,
+    avg_logprob: float = 0.0,
+) -> bool:
+    """
+    Detects well-known Whisper training-data subtitle artifacts (e.g.
+    'Продолжение следует...', 'Редактор субтитров ...', 'Субтитры сделал ...')
+    that Whisper Large v3 / Turbo emit on silence or low-energy noise.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return True
+    if not _WHISPER_PHANTOM_RE.match(cleaned):
+        return False
+    # Always drop unambiguous subtitle credit lines; drop generic sign-offs when confidence is weak
+    lowered = cleaned.lower()
+    if any(k in lowered for k in ("субтитр", "корректор", "dimatorzok", "amara.org")):
+        return True
+    return no_speech_prob >= 0.25 or avg_logprob <= -0.45 or len(cleaned) <= 32
+
+
+def _extract_clean_context_tail(text: str, max_chars: int = 120) -> str:
     """
     Extracts a verified, non-repetitive trailing snippet from the previous ASR
-    window to preserve punctuation and technical-term continuity across adjacent
-    windows without enabling Whisper's drift-prone condition_on_previous_text.
+    window to preserve punctuation and term continuity across adjacent windows
+    without injecting unrelated hardcoded domain prompts or enabling Whisper's
+    drift-prone condition_on_previous_text.
     """
     cleaned = clean_hallucinated_text(text or "")
-    if len(cleaned) < 12 or _CONSECUTIVE_REPEAT_RE.search(cleaned):
+    if len(cleaned) < 16 or _CONSECUTIVE_REPEAT_RE.search(cleaned):
+        return ""
+    if is_whisper_phantom_hallucination(cleaned):
         return ""
     if len(cleaned) <= max_chars:
         return cleaned
@@ -1704,6 +1753,69 @@ def _extract_clean_context_tail(text: str, max_chars: int = 140) -> str:
     if 0 <= space_pos < len(tail) - 8:
         tail = tail[space_pos + 1 :]
     return tail.strip()
+
+
+def _resolve_whisper_language(
+    model,
+    valid_windows: list[tuple[float, float, int, int]],
+    samples: np.ndarray,
+    requested_language: str = DEFAULT_ASR_LANGUAGE,
+    profile_id: str = DEFAULT_ASR_MODEL,
+) -> tuple[str, bool]:
+    """
+    Determines (language_code, use_multilingual) for Whisper decoding.
+    Explicit language (e.g. 'ru') disables per-window multilingual re-detection
+    so Whisper Large v3 never randomly flips Russian chunks into Ukrainian,
+    Polish, Korean, or broken Latin. In 'auto' mode, probes up to 3 evenly
+    spaced substantive windows and locks the language when they agree.
+    """
+    lang = (requested_language or DEFAULT_ASR_LANGUAGE).strip().lower()
+    profile = ASR_MODEL_PROFILES.get(profile_id, {})
+
+    if lang != "auto":
+        return lang, False
+
+    fixed_or_default = profile.get("fixed_language") or profile.get("default_language")
+    if fixed_or_default:
+        return str(fixed_or_default), False
+
+    if not hasattr(model, "detect_language") or not valid_windows:
+        return "ru", True
+
+    substantive = [w for w in valid_windows if (w[1] - w[0]) >= 2.0] or list(valid_windows)
+    if len(substantive) <= 3:
+        probe_list = substantive
+    else:
+        probe_list = [
+            substantive[0],
+            substantive[len(substantive) // 2],
+            substantive[-1],
+        ]
+
+    votes: list[tuple[str, float]] = []
+    for _, _, s_idx, e_idx in probe_list:
+        try:
+            det_lang, det_prob, _ = model.detect_language(audio=samples[s_idx:e_idx])
+            if det_lang and float(det_prob) >= 0.45:
+                votes.append((str(det_lang), float(det_prob)))
+        except Exception:
+            continue
+
+    if not votes:
+        return "ru", True
+
+    # Aggregate confidence per detected language
+    score_by_lang: dict[str, float] = {}
+    for code, prob in votes:
+        score_by_lang[code] = score_by_lang.get(code, 0.0) + prob
+    dominant_lang = max(score_by_lang.items(), key=lambda kv: kv[1])[0]
+    distinct_langs = {code for code, _ in votes}
+    avg_dominant_prob = score_by_lang[dominant_lang] / len(votes)
+
+    # Lock language when all probed windows unanimously and confidently agree
+    if len(distinct_langs) == 1 and avg_dominant_prob >= 0.80:
+        return dominant_lang, False
+    return dominant_lang, True
 
 
 class Transcriber:
@@ -1984,13 +2096,14 @@ class Transcriber:
         threads: int,
         status_cb: Optional[Callable[[str], None]],
         cancel_token: Optional[CancellationToken] = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
     ) -> list[TimedUnit]:
         if cancel_token:
             cancel_token.check()
 
         if device == "cpu":
             total_threads = max(1, int(threads))
-            if profile_id == "large-v3":
+            if profile_id in ("large-v3", "large-v3-ru"):
                 max_workers_cap = 1
             elif profile_id == "turbo":
                 max_workers_cap = 2
@@ -2043,8 +2156,8 @@ class Transcriber:
             windows = build_speaker_asr_windows(
                 ordered_diar,
                 total_dur,
-                max_same_speaker_sec=28.0 if device == "cpu" else 26.5,
-                merge_gap_sec=3.0 if device == "cpu" else 1.6,
+                max_same_speaker_sec=26.5,
+                merge_gap_sec=2.0 if device == "cpu" else 1.6,
                 split_speaker_turns=(device != "cpu"),
             )
             if windows:
@@ -2072,27 +2185,25 @@ class Transcriber:
         if not valid_windows:
             return []
 
-        # Detect interview primary language once on the first substantive window to
-        # supply a language-matched punctuation & technical code-switching style prompt
-        primary_lang = "ru"
-        if hasattr(model, "detect_language"):
-            probe_win = next(
-                (w for w in valid_windows if (w[1] - w[0]) >= 1.5),
-                valid_windows[0],
-            )
-            try:
-                det_lang, det_prob, _ = model.detect_language(
-                    audio=samples[probe_win[2] : probe_win[3]]
-                )
-                if det_lang and float(det_prob) >= 0.55:
-                    primary_lang = str(det_lang)
-            except Exception:
-                primary_lang = "ru"
+        resolved_lang, use_multilingual = _resolve_whisper_language(
+            model=model,
+            valid_windows=valid_windows,
+            samples=samples,
+            requested_language=language,
+            profile_id=profile_id,
+        )
+        if status_cb:
+            mode_desc = "мультиязычный авто" if use_multilingual else f"фиксированный ({resolved_lang})"
+            status_cb(f"Язык распознавания Whisper: {mode_desc}")
 
-        base_prompt = _WHISPER_STYLE_PROMPTS.get(primary_lang)
-        beam_size = 5 if device == "cuda" else 2
+        if device == "cuda":
+            beam_size = 5
+        elif profile_id in ("large-v3", "large-v3-ru"):
+            beam_size = 3
+        else:
+            beam_size = 2
         temperatures = (0.0, 0.2, 0.4)
-        comp_ratio_thr = 2.65
+        comp_ratio_thr = 2.4
         dev_tag = "GPU CUDA" if device == "cuda" else "CPU"
 
         last_pct = 0
@@ -2128,23 +2239,14 @@ class Transcriber:
 
             win_dur = w_end - w_start
             use_vad = win_dur > 30.0
-            if base_prompt and rolling_tail:
-                win_prompt: Optional[str] = f"{base_prompt} {rolling_tail}"
-            elif base_prompt:
-                win_prompt = base_prompt
-            elif rolling_tail:
-                win_prompt = rolling_tail
-            else:
-                win_prompt = None
+            # Never inject hardcoded domain jargon prompts (which trigger Whisper
+            # hallucinations on unrelated topics); pass only verified rolling context.
+            win_prompt: Optional[str] = rolling_tail if rolling_tail else None
 
             transcribe_kwargs = dict(
-                # Non-None default language + multilingual=True skips faster-whisper's
-                # discarded pre-encode detect_language() pass (saving a full 30s Encoder
-                # pass per window!) while generate_segments still runs model.detect_language()
-                # on encoder_output for every window across all 99 languages.
-                language=primary_lang,
+                language=resolved_lang,
                 task="transcribe",
-                multilingual=True,
+                multilingual=use_multilingual,
                 word_timestamps=True,
                 prepend_punctuations="\"'“¿([{",
                 vad_filter=use_vad,
@@ -2152,7 +2254,9 @@ class Transcriber:
                 initial_prompt=win_prompt,
                 no_speech_threshold=0.6,
                 compression_ratio_threshold=comp_ratio_thr,
-                log_prob_threshold=-1.15,
+                log_prob_threshold=-1.0,
+                repetition_penalty=1.08,
+                hallucination_silence_threshold=1.5,
                 beam_size=beam_size,
                 temperature=temperatures,
             )
@@ -2160,7 +2264,6 @@ class Transcriber:
                 transcribe_kwargs["vad_parameters"] = dict(
                     min_silence_duration_ms=350, speech_pad_ms=220
                 )
-                transcribe_kwargs["hallucination_silence_threshold"] = 2.0
 
             segments_iter, _ = model.transcribe(samples[s_idx:e_idx], **transcribe_kwargs)
 
@@ -2172,7 +2275,13 @@ class Transcriber:
                 abs_seg_start = w_start + float(seg.start)
                 abs_seg_end = min(w_end, w_start + float(seg.end))
 
-                if getattr(seg, "no_speech_prob", 0.0) > 0.78 and getattr(seg, "avg_logprob", 0.0) < -1.0:
+                seg_no_speech = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
+                seg_logprob = float(getattr(seg, "avg_logprob", 0.0) or 0.0)
+                seg_comp_ratio = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
+
+                if seg_no_speech > 0.78 and seg_logprob < -1.0:
+                    continue
+                if seg_comp_ratio > 2.6:
                     continue
 
                 if not used_diar_windows:
@@ -2183,6 +2292,12 @@ class Transcriber:
 
                 cleaned_seg_text = clean_hallucinated_text(seg.text or "")
                 if not cleaned_seg_text:
+                    continue
+                if is_whisper_phantom_hallucination(
+                    cleaned_seg_text,
+                    no_speech_prob=seg_no_speech,
+                    avg_logprob=seg_logprob,
+                ):
                     continue
 
                 if seg.words:
@@ -2271,6 +2386,7 @@ class Transcriber:
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         status_cb: Optional[Callable[[str], None]] = None,
         cancel_token: Optional[CancellationToken] = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
     ) -> list[TimedUnit]:
         if cancel_token:
             cancel_token.check()
@@ -2287,6 +2403,7 @@ class Transcriber:
                 threads=threads,
                 status_cb=status_cb,
                 cancel_token=cancel_token,
+                language=language,
             )
         except RuntimeError as err:
             if device == "cuda":
@@ -2307,6 +2424,7 @@ class Transcriber:
                             threads=threads,
                             status_cb=status_cb,
                             cancel_token=cancel_token,
+                            language=language,
                         )
                     except RuntimeError as err_fp32:
                         err = err_fp32
@@ -2323,35 +2441,53 @@ class Transcriber:
                     threads=threads,
                     status_cb=status_cb,
                     cancel_token=cancel_token,
+                    language=language,
                 )
             raise
 
     @staticmethod
-    def _run_sherpa_parakeet(
+    def _run_sherpa_transducer(
         samples: np.ndarray,
         sample_rate: int,
         model_dir: str,
         diar_segments: list[DiarizationSegment],
+        profile_id: str = "gigaam-v3",
         threads: int = 4,
         status_cb: Optional[Callable[[str], None]] = None,
         cancel_token: Optional[CancellationToken] = None,
     ) -> list[TimedUnit]:
+        """
+        Runs offline NeMo transducer ONNX models via sherpa-onnx (GigaAM v3 e2e RNN-T
+        with feature_dim=64 and Parakeet TDT v3 with feature_dim=80).
+        """
         if cancel_token:
             cancel_token.check()
 
+        profile = ASR_MODEL_PROFILES.get(profile_id, {})
+        encoder_file = profile.get("encoder_file", "encoder.int8.onnx")
+        decoder_file = profile.get("decoder_file", "decoder.onnx")
+        joiner_file = profile.get("joiner_file", "joiner.onnx")
+        tokens_file = profile.get("tokens_file", "tokens.txt")
+        feature_dim = int(profile.get("feature_dim", 64))
+        max_chunk_sec = float(profile.get("max_chunk_sec", 18.0))
+        progress_tag = "Parakeet" if profile_id == "parakeet" else "GigaAM v3"
+
         asr_threads = max(1, int(threads))
-        cache_key = ("sherpa_parakeet", model_dir, asr_threads)
+        if profile_id == "parakeet":
+            cache_key: tuple = ("sherpa_parakeet", model_dir, asr_threads)
+        else:
+            cache_key = ("sherpa_transducer", profile_id, model_dir, asr_threads)
 
         recognizer = _ModelCache.get_or_create(
             cache_key,
             lambda: sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=os.path.join(model_dir, "encoder.int8.onnx"),
-                decoder=os.path.join(model_dir, "decoder.int8.onnx"),
-                joiner=os.path.join(model_dir, "joiner.int8.onnx"),
-                tokens=os.path.join(model_dir, "tokens.txt"),
+                encoder=os.path.join(model_dir, encoder_file),
+                decoder=os.path.join(model_dir, decoder_file),
+                joiner=os.path.join(model_dir, joiner_file),
+                tokens=os.path.join(model_dir, tokens_file),
                 num_threads=asr_threads,
                 sample_rate=16000,
-                feature_dim=80,
+                feature_dim=feature_dim,
                 decoding_method="greedy_search",
                 model_type="nemo_transducer",
                 provider="cpu",
@@ -2359,7 +2495,7 @@ class Transcriber:
         )
 
         chunks = split_audio_ranges_at_silence(
-            samples, sample_rate, diar_segments, max_chunk_sec=18.0
+            samples, sample_rate, diar_segments, max_chunk_sec=max_chunk_sec
         )
         if not chunks:
             return []
@@ -2388,7 +2524,8 @@ class Transcriber:
             streams = []
             for _, _, s_idx, e_idx in batch:
                 stream = recognizer.create_stream()
-                stream.accept_waveform(sample_rate, samples[s_idx:e_idx])
+                chunk_samples = np.ascontiguousarray(samples[s_idx:e_idx], dtype=np.float32)
+                stream.accept_waveform(sample_rate, chunk_samples)
                 streams.append(stream)
 
             if hasattr(recognizer, "decode_streams") and len(streams) > 1:
@@ -2403,13 +2540,16 @@ class Transcriber:
             for (c_start, c_end, _, _), stream in zip(batch, streams):
                 res = stream.result
                 if res.tokens and res.timestamps and len(res.tokens) == len(res.timestamps):
-                    units.extend(
-                        group_bpe_tokens_to_units(
-                            list(res.tokens), list(res.timestamps), c_start, c_end
-                        )
+                    chunk_units = group_bpe_tokens_to_units(
+                        list(res.tokens), list(res.timestamps), c_start, c_end
                     )
+                    for u in chunk_units:
+                        if u.text and u.text.strip() and not is_repetitive_noise_token(u.text):
+                            units.append(u)
                 elif res.text and res.text.strip():
-                    units.append(TimedUnit(start=c_start, end=c_end, text=res.text.strip()))
+                    cleaned = clean_hallucinated_text(res.text.strip())
+                    if cleaned:
+                        units.append(TimedUnit(start=c_start, end=c_end, text=cleaned))
 
             done_idx = b_start + len(batch)
             if status_cb and total_chunks > 0:
@@ -2418,10 +2558,31 @@ class Transcriber:
                 if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
                     last_pct = pct
                     last_log_t = now
-                    status_cb(f"Распознавание речи (Parakeet): {pct}% ({done_idx}/{total_chunks})...")
+                    status_cb(f"Распознавание речи ({progress_tag}): {pct}% ({done_idx}/{total_chunks})...")
 
         return units
 
+    @classmethod
+    def _run_sherpa_parakeet(
+        cls,
+        samples: np.ndarray,
+        sample_rate: int,
+        model_dir: str,
+        diar_segments: list[DiarizationSegment],
+        threads: int = 4,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+    ) -> list[TimedUnit]:
+        return cls._run_sherpa_transducer(
+            samples=samples,
+            sample_rate=sample_rate,
+            model_dir=model_dir,
+            diar_segments=diar_segments,
+            profile_id="parakeet",
+            threads=threads,
+            status_cb=status_cb,
+            cancel_token=cancel_token,
+        )
 
     @classmethod
     def transcribe_units_only(
@@ -2432,6 +2593,7 @@ class Transcriber:
         threads: int = 1,
         status_cb: Optional[Callable[[str], None]] = None,
         cancel_token: Optional[CancellationToken] = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
     ) -> dict:
         """
         Phase A of hardware-decoupled GPU mode: runs Silero VAD + Whisper on
@@ -2486,6 +2648,7 @@ class Transcriber:
             compute_device=req_dev,
             status_cb=update,
             cancel_token=cancel_token,
+            language=language,
         )
         elapsed_asr = time.time() - t_asr
         update(f"[Profile] GPU ASR завершена за {elapsed_asr:.2f}s (единиц текста: {len(units)})")
@@ -2620,9 +2783,10 @@ class Transcriber:
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         status_cb: Optional[Callable[[str], None]] = None,
         cancel_token: Optional[CancellationToken] = None,
+        language: str = DEFAULT_ASR_LANGUAGE,
     ) -> dict:
         """
-        Runs local speaker diarization + multilingual ASR on a 16 kHz mono WAV
+        Runs local speaker diarization + speech recognition on a 16 kHz mono WAV
         file and writes the formatted role-split transcript to output_txt_path.
         """
         def update(msg: str):
@@ -2690,7 +2854,7 @@ class Transcriber:
             f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
         )
 
-        # 3. Multilingual Speech Recognition
+        # 3. Speech Recognition
         req_dev = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
         t_asr = time.time()
         if profile["engine"] == "faster_whisper":
@@ -2707,18 +2871,21 @@ class Transcriber:
                 compute_device=req_dev,
                 status_cb=update,
                 cancel_token=cancel_token,
+                language=language,
             )
-        elif profile["engine"] == "sherpa_parakeet":
+        elif profile["engine"] in ("sherpa_transducer", "sherpa_parakeet"):
             if req_dev == "cuda":
                 update(
-                    "Модель Parakeet оптимизирована под CPU (INT8); для GPU рекомендуется Whisper Turbo или Large v3."
+                    f"Модель {profile['short_name']} работает на CPU (ONNX INT8); "
+                    "для GPU CUDA доступны Whisper Large v3 RU, Turbo и Large v3."
                 )
             update(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
-            units = cls._run_sherpa_parakeet(
+            units = cls._run_sherpa_transducer(
                 samples=samples,
                 sample_rate=sample_rate,
                 model_dir=asr_dir,
                 diar_segments=diar_segments,
+                profile_id=profile_id,
                 threads=threads,
                 status_cb=update,
                 cancel_token=cancel_token,
@@ -2760,4 +2927,5 @@ class Transcriber:
             "num_turns": len(turns),
             "elapsed": total_elapsed,
         }
+
 

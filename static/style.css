@@ -712,6 +712,199 @@ main {
     transform: none;
 }
 
+/* Mode Switcher (Claymorphism Segmented Control) */
+.mode-switcher {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.45rem;
+    padding: 0.4rem;
+    margin-bottom: 1.35rem;
+    border-radius: 18px;
+    background: var(--sec-bg);
+    box-shadow:
+        inset 5px 5px 10px var(--sec-out-1),
+        inset -5px -5px 10px var(--sec-out-2);
+}
+
+.mode-tab {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.9rem;
+    font-weight: 600;
+    padding: 0.72rem 0.85rem;
+    border-radius: 14px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-align: center;
+    line-height: 1.2;
+}
+
+.mode-tab:hover:not(.is-active) {
+    color: var(--text-primary);
+    background: var(--dropdown-hover);
+}
+
+.mode-tab.is-active {
+    background: var(--btn-bg);
+    color: var(--btn-text);
+    box-shadow:
+        4px 4px 10px var(--btn-out-1),
+        -3px -3px 8px var(--btn-out-2),
+        inset 2px 2px 4px var(--btn-in-1);
+}
+
+/* Post-Recording Separate Transcription Section */
+.post-transcribe-section {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    text-align: left;
+}
+
+.post-transcribe-form {
+    padding: 1.15rem;
+    border-radius: 20px;
+    background: var(--sec-bg);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    box-shadow:
+        inset 5px 5px 12px var(--sec-out-1),
+        inset -5px -5px 12px var(--sec-out-2);
+}
+
+.post-transcribe-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+/* Existing Created Recordings List */
+.recordings-section {
+    margin-top: 1.35rem;
+    padding-top: 1.35rem;
+    border-top: 1px solid var(--clay-in-2);
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    text-align: left;
+}
+
+.recordings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.recordings-count {
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.16rem 0.56rem;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--accent);
+}
+
+.recordings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    max-height: 260px;
+    overflow-y: auto;
+    padding-right: 0.15rem;
+}
+
+.recording-item {
+    background: var(--sec-bg);
+    border-radius: 16px;
+    padding: 0.8rem 0.95rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    box-shadow:
+        inset 4px 4px 8px var(--sec-out-1),
+        inset -4px -4px 8px var(--sec-out-2);
+}
+
+.recording-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+}
+
+.recording-name {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.recording-meta {
+    font-size: 0.76rem;
+    color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    flex-wrap: wrap;
+}
+
+.recording-badge {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+}
+
+.recording-badge.muted {
+    background: rgba(148, 163, 184, 0.16);
+    color: var(--text-secondary);
+}
+
+.recording-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+}
+
+.recording-chip {
+    border: 1px solid var(--dropdown-border);
+    background: var(--clay-bg);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.42rem 0.72rem;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.16s ease;
+}
+
+.recording-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.recording-chip-primary {
+    background: linear-gradient(135deg, #10b981, #059669);
+    border-color: transparent;
+    color: #ffffff;
+}
+
+.recording-chip-primary:hover {
+    color: #ffffff;
+    filter: brightness(1.06);
+}
+
 @media (max-width: 520px) {
     .container {
         padding: 1rem;
@@ -726,6 +919,11 @@ main {
         padding: 2.5rem 1rem;
     }
 
+    .mode-tab {
+        font-size: 0.84rem;
+        padding: 0.65rem 0.55rem;
+    }
+
     .transcribe-grid-2 {
         grid-template-columns: 1fr;
     }
@@ -736,3 +934,4 @@ main {
         font-size: 0.88rem;
     }
 }
+
