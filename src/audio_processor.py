@@ -11,10 +11,13 @@ class AudioProcessor:
         output_audio_path: str,
         sample_rate: int = 44100,
         cancel_token: CancellationToken | None = None,
+        num_audio_streams: int = 1,
+        mix_all_streams: bool = False,
     ) -> bool:
         """
         Applies pitch shifting to the audio file using FFmpeg's native filters.
-        Extremely fast (does not load full file into RAM).
+        Extremely fast (does not load full file into RAM). When mix_all_streams is
+        True on multi-track OBS recordings, mixes all audio tracks before pitch shifting.
         """
         if not os.path.exists(input_audio_path):
             return False
@@ -33,12 +36,34 @@ class AudioProcessor:
             out_rate = sample_rate if sample_rate in valid_aac_rates else 44100
             af_filter = f"asetrate={new_rate},aresample={out_rate},atempo={atempo:.4f}"
 
-            out_kwargs = {"map": "0:a:0", "vn": None, "af": af_filter}
+            out_kwargs = {"vn": None}
             if output_audio_path.lower().endswith((".m4a", ".aac", ".mp4")):
                 out_kwargs["acodec"] = "aac"
                 out_kwargs["audio_bitrate"] = "128k"
 
-            spec = ffmpeg.input(input_audio_path).output(output_audio_path, **out_kwargs)
+            inp = ffmpeg.input(input_audio_path)
+            if mix_all_streams and int(num_audio_streams) > 1:
+                n = int(num_audio_streams)
+                audio_inputs = [inp[f"a:{i}"] for i in range(n)]
+                mixed = (
+                    ffmpeg.filter(
+                        audio_inputs,
+                        "amix",
+                        inputs=n,
+                        duration="longest",
+                        dropout_transition=0,
+                        normalize=0,
+                    )
+                    .filter("asetrate", new_rate)
+                    .filter("aresample", out_rate)
+                    .filter("atempo", f"{atempo:.4f}")
+                )
+                spec = ffmpeg.output(mixed, output_audio_path, **out_kwargs)
+            else:
+                out_kwargs["map"] = "0:a:0"
+                out_kwargs["af"] = af_filter
+                spec = inp.output(output_audio_path, **out_kwargs)
+
             FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
             return True
         except TaskCancelledError:

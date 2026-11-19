@@ -2,7 +2,7 @@ import os
 import multiprocessing
 
 # Base paths
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.6.0"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
 AUDIO_CACHE_DIR = os.path.join(TMP_BASE_DIR, "audio_cache")
@@ -88,7 +88,8 @@ ASR_MODEL_PROFILES = {
         "joiner_file": "joiner.onnx",
         "tokens_file": "tokens.txt",
         "feature_dim": 64,
-        "max_chunk_sec": 18.0,
+        "max_chunk_sec": 20.0,
+        "overlap_sec": 1.5,
         "required_files": ["encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
         "allow_patterns": ["encoder.int8.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"],
         "min_total_bytes": 180_000_000,
@@ -180,17 +181,96 @@ DIARIZATION_MODELS = {
     },
 }
 
-SPEAKER_COUNT_OPTIONS = ["auto", "2", "3", "4+"]
+SPEAKER_COUNT_OPTIONS = ["auto", "2", "3", "4", "5", "6", "4+"]
+
+# Diarization sensitivity presets for similar voices (e.g. multiple same-gender speakers)
+DIARIZATION_SENSITIVITY_OPTIONS = ["normal", "high", "low"]
+DEFAULT_DIARIZATION_SENSITIVITY = os.environ.get("DIARIZATION_SENSITIVITY", "normal").strip().lower()
+if DEFAULT_DIARIZATION_SENSITIVITY not in DIARIZATION_SENSITIVITY_OPTIONS:
+    DEFAULT_DIARIZATION_SENSITIVITY = "normal"
+
 # Fine-grained turn boundary threshold for initial pyannote segmentation pass
 DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.35"))
-# Cosine similarity thresholds for Anchor-Centroid voiceprint clustering (CAM++)
-DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.54"))
-DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.58"))
+# Cosine similarity thresholds for Anchor-Linkage voiceprint clustering (CAM++).
+# Raised from 0.54 -> 0.60 so similar same-gender speakers are not over-merged into 2 clusters.
+DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.60"))
+DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.64"))
+
+DIARIZATION_SENSITIVITY_PROFILES = {
+    "normal": {
+        "id": "normal",
+        "label": "Обычная (баланс)",
+        "sim_threshold": DIARIZATION_CENTROID_SIM_THRESHOLD,
+        "multi_sim_threshold": DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
+        "seg_threshold": DIARIZATION_SEGMENTATION_THRESHOLD,
+        "minor_min_sec": 4.5,
+    },
+    "high": {
+        "id": "high",
+        "label": "Высокая (похожие голоса / один пол)",
+        "sim_threshold": max(DIARIZATION_CENTROID_SIM_THRESHOLD + 0.06, 0.66),
+        "multi_sim_threshold": max(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD + 0.06, 0.70),
+        "seg_threshold": min(DIARIZATION_SEGMENTATION_THRESHOLD, 0.30),
+        "minor_min_sec": 3.0,
+    },
+    "low": {
+        "id": "low",
+        "label": "Низкая (строже объединять)",
+        "sim_threshold": min(DIARIZATION_CENTROID_SIM_THRESHOLD - 0.06, 0.54),
+        "multi_sim_threshold": min(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD - 0.06, 0.58),
+        "seg_threshold": max(DIARIZATION_SEGMENTATION_THRESHOLD, 0.40),
+        "minor_min_sec": 6.0,
+    },
+}
+
+# Multi-track audio handling (e.g. OBS recordings with separate Mic + System Audio tracks)
+AUDIO_TRACK_MODE_OPTIONS = ["auto", "separate", "mix", "first"]
+AUDIO_TRACK_MODE_LABELS = {
+    "auto": "Авто (2 дорожки → раздельно, иначе 1)",
+    "separate": "Раздельно (1-я = Спикер 1, 2-я = собеседники)",
+    "mix": "Смешать все аудиодорожки",
+    "first": "Только 1-я аудиодорожка",
+}
+DEFAULT_AUDIO_TRACK_MODE = os.environ.get("AUDIO_TRACK_MODE", "auto").strip().lower()
+if DEFAULT_AUDIO_TRACK_MODE not in AUDIO_TRACK_MODE_OPTIONS:
+    DEFAULT_AUDIO_TRACK_MODE = "auto"
+
+# Optional user-selectable domain glossary presets (EMPTY by default — never auto-injected!)
+ASR_PROMPT_PRESETS = {
+    "system_analyst": {
+        "id": "system_analyst",
+        "label": "Системный аналитик",
+        "prompt": (
+            "Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, "
+            "OAuth 2, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, "
+            "Camunda, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code"
+        ),
+    },
+    "backend_devops": {
+        "id": "backend_devops",
+        "label": "Backend / DevOps",
+        "prompt": (
+            "Техническое собеседование: Python, Go, Java, Docker, Kubernetes, CI/CD, GitLab, "
+            "PostgreSQL, Redis, Kafka, RabbitMQ, gRPC, REST API, GraphQL, OpenAPI, Prometheus, "
+            "Grafana, Terraform, Linux"
+        ),
+    },
+    "frontend_qa": {
+        "id": "frontend_qa",
+        "label": "Frontend / QA",
+        "prompt": (
+            "Техническое собеседование: JavaScript, TypeScript, React, Vue, Next.js, REST, "
+            "GraphQL, WebSocket, Playwright, Cypress, Selenium, Postman, Swagger, Allure, Jira, Git"
+        ),
+    },
+}
+
 # Backwards-compatible alias
 DIARIZATION_CLUSTER_THRESHOLD = DIARIZATION_CENTROID_SIM_THRESHOLD
 DIARIZATION_MERGE_GAP_SEC = 0.45
 DIARIZATION_MIN_SEGMENT_SEC = 0.18
 TRANSCRIPT_PAUSE_BREAK_SEC = 2.5
+
 
 
 

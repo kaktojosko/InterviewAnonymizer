@@ -905,6 +905,65 @@ main {
     filter: brightness(1.06);
 }
 
+/* Custom Glossary Prompt Textarea & Preset Chips */
+.prompt-textarea {
+    width: 100%;
+    padding: 0.72rem 0.9rem;
+    border: 1px solid var(--dropdown-border);
+    border-radius: 14px;
+    background: var(--clay-bg);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.84rem;
+    line-height: 1.4;
+    resize: vertical;
+    min-height: 58px;
+    max-height: 150px;
+    box-shadow:
+        inset 3px 3px 6px var(--sec-out-1),
+        inset -3px -3px 6px var(--sec-out-2);
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.prompt-textarea::placeholder {
+    color: var(--text-secondary);
+    opacity: 0.75;
+}
+
+.prompt-textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.prompt-presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.15rem;
+}
+
+.prompt-chip {
+    border: 1px solid var(--dropdown-border);
+    background: var(--clay-bg);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 0.74rem;
+    font-weight: 600;
+    padding: 0.3rem 0.62rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.16s ease;
+}
+
+.prompt-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.prompt-chip-clear {
+    opacity: 0.8;
+}
+
 @media (max-width: 520px) {
     .container {
         padding: 1rem;

@@ -15,6 +15,8 @@ from src.transcriber import (
     Transcriber,
     _ModelCache,
     align_units_to_speakers,
+    apply_custom_glossary_terms,
+    build_longform_asr_chunks,
     build_speaker_asr_windows,
     build_vad_asr_windows,
     clean_hallucinated_text,
@@ -25,7 +27,9 @@ from src.transcriber import (
     group_bpe_tokens_to_units,
     is_narrowband_tone,
     is_repetitive_noise_token,
+    is_whisper_prompt_echo,
     load_wav_16k_mono,
+    normalize_chunk_level,
     resolve_compute_device,
     smooth_diarization_segments,
     split_audio_ranges_at_silence,
@@ -258,7 +262,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v4.5.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v4.6.0)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -1194,5 +1198,401 @@ def test_load_wav_16k_mono_click_resistant_normalization(tmp_path):
     # Quiet speech body (excluding click) must still be boosted ~10x (0.04 -> ~0.40)
     speech_p95 = float(np.percentile(np.abs(samples[500:]), 95))
     assert speech_p95 >= 0.35
+
+
+def test_build_longform_asr_chunks_enforces_20s_cap_with_overlap_and_dedup(monkeypatch):
+    from types import SimpleNamespace
+
+    sr = 16000
+    rng = np.random.RandomState(42)
+
+    # 1. Per-chunk quiet speech leveling boosts quiet remote speakers while keeping loud audio intact
+    quiet = rng.normal(0.0, 0.015, sr).astype(np.float32)
+    leveled = normalize_chunk_level(quiet)
+    assert float(np.percentile(np.abs(leveled), 99.0)) >= 0.30
+    loud = rng.normal(0.0, 0.25, sr).astype(np.float32)
+    assert np.allclose(normalize_chunk_level(loud), loud)
+
+    # 2. 75-second breathless monologue (no pauses): MUST split <=20.0s with 1.5s overlap
+    #    and exact non-overlapping [keep_start, keep_end] ownership cores covering [0, 75]
+    samples_75 = rng.normal(0.0, 0.12, sr * 75).astype(np.float32)
+    diar_75 = [DiarizationSegment(0.0, 75.0, speaker=0)]
+    monkeypatch.setattr(
+        tr_mod,
+        "get_speech_timestamps",
+        lambda audio, vad_options=None, sampling_rate=16000, **kw: [{"start": 0, "end": len(audio)}],
+    )
+    chunks = build_longform_asr_chunks(
+        samples=samples_75,
+        sample_rate=sr,
+        diar_segments=diar_75,
+        max_chunk_sec=20.0,
+        overlap_sec=1.5,
+        use_silero_vad=True,
+    )
+    assert len(chunks) >= 4
+    assert chunks[0][2] == pytest.approx(0.0, abs=1e-3)
+    assert chunks[-1][3] == pytest.approx(75.0, abs=1e-3)
+    for idx, (c_s, c_e, k_s, k_e) in enumerate(chunks):
+        assert (c_e - c_s) <= 20.01
+        assert c_s <= k_s < k_e <= c_e
+        if idx > 0:
+            prev_s, prev_e, prev_ks, prev_ke = chunks[idx - 1]
+            # Sliding overlap ~1.5s and contiguous non-overlapping ownership cores
+            assert prev_e - c_s == pytest.approx(1.5, abs=0.05)
+            assert k_s == pytest.approx(prev_ke, abs=1e-4)
+
+    # 3. Genuine silent breath pause at 16.5s -> splits cleanly right at the pause valley
+    samples_pause = rng.normal(0.0, 0.12, sr * 32).astype(np.float32)
+    samples_pause[int(16.2 * sr) : int(16.8 * sr)] = 0.0
+    pause_chunks = build_longform_asr_chunks(
+        samples=samples_pause,
+        sample_rate=sr,
+        diar_segments=[DiarizationSegment(0.0, 32.0, speaker=0)],
+        max_chunk_sec=20.0,
+        overlap_sec=1.5,
+        use_silero_vad=False,
+    )
+    assert len(pause_chunks) == 2
+    assert 16.0 <= pause_chunks[0][1] <= 17.0
+    assert pause_chunks[1][0] == pytest.approx(pause_chunks[0][1], abs=1e-4)
+
+    # 4. Silero VAD rescues quiet speech missed completely by diarization!
+    samples_rescue = rng.normal(0.0, 0.10, sr * 25).astype(np.float32)
+    monkeypatch.setattr(
+        tr_mod,
+        "get_speech_timestamps",
+        lambda audio, vad_options=None, sampling_rate=16000, **kw: [
+            {"start": 1 * sr, "end": 4 * sr},
+            {"start": 12 * sr, "end": 18 * sr},
+        ],
+    )
+    rescued_chunks = build_longform_asr_chunks(
+        samples=samples_rescue,
+        sample_rate=sr,
+        diar_segments=[DiarizationSegment(1.0, 4.0, speaker=0)],
+        max_chunk_sec=20.0,
+        overlap_sec=1.5,
+        use_silero_vad=True,
+    )
+    assert any(c_s <= 12.1 and c_e >= 17.9 for c_s, c_e, _, _ in rescued_chunks)
+
+    # 5. _run_sherpa_transducer deduplicates overlap boundary words, recovers from batch exception,
+    #    and bisects an energetic chunk that initially returned empty output!
+    samples_35 = rng.normal(0.0, 0.12, sr * 35).astype(np.float32)
+    monkeypatch.setattr(
+        tr_mod,
+        "get_speech_timestamps",
+        lambda audio, vad_options=None, sampling_rate=16000, **kw: [{"start": 0, "end": len(audio)}],
+    )
+
+    decode_calls = []
+
+    class _FakeStream:
+        def __init__(self):
+            self.dur = 0.0
+            self.result = SimpleNamespace(tokens=[], timestamps=[], text="")
+
+        def accept_waveform(self, s_rate, wav):
+            self.dur = len(wav) / float(s_rate)
+
+    class _FlakyTransducer:
+        def create_stream(self):
+            return _FakeStream()
+
+        def decode_streams(self, streams):
+            # Force fallback path to per-stream decode_stream
+            raise RuntimeError("simulated batch decode failure")
+
+        def decode_stream(self, stream):
+            decode_calls.append(round(stream.dur, 2))
+            if len(decode_calls) == 1:
+                # First chunk (0..20s, keep_end=19.25s): emit a token inside core AND an overlap tail at 19.6s
+                stream.result = SimpleNamespace(
+                    tokens=["▁Первый", "▁стык"],
+                    timestamps=[5.0, 19.6],
+                    text="Первый стык",
+                )
+            elif len(decode_calls) == 2:
+                # Second chunk (18.5..35s, dur=16.5s): return empty first to trigger >10s bisection retry!
+                stream.result = SimpleNamespace(tokens=[], timestamps=[], text="")
+            elif len(decode_calls) == 3:
+                # Left half of bisected chunk 2 (18.5..26.75s): emit word before keep_start (18.7s -> dropped!)
+                # and the real boundary word at 19.6s (rel=1.1s -> kept once!)
+                stream.result = SimpleNamespace(
+                    tokens=["▁дубль", "▁стык", "▁второй"],
+                    timestamps=[0.2, 1.1, 4.0],
+                    text="дубль стык второй",
+                )
+            else:
+                # Right half of bisected chunk 2 (26.75..35.0s)
+                stream.result = SimpleNamespace(
+                    tokens=["▁финал"],
+                    timestamps=[3.0],
+                    text="финал",
+                )
+
+    _ModelCache.active_key = ("sherpa_transducer", "gigaam-v3", "/tmp/fake_longform_gigaam", 2)
+    _ModelCache.active_engine = _FlakyTransducer()
+
+    units = Transcriber._run_sherpa_transducer(
+        samples=samples_35,
+        sample_rate=sr,
+        model_dir="/tmp/fake_longform_gigaam",
+        diar_segments=[DiarizationSegment(0.0, 35.0, speaker=0)],
+        profile_id="gigaam-v3",
+        threads=2,
+    )
+    texts = [u.text.strip() for u in units]
+    assert texts == ["Первый", "стык", "второй", "финал"]
+    # Verify bisection retry happened (2 initial chunks + 2 bisected sub-chunks = 4 single calls)
+    assert len(decode_calls) == 4
+
+
+def test_custom_glossary_initial_prompt_echo_guard_and_phonetic_normalizer(monkeypatch):
+    from types import SimpleNamespace
+    from src.config import ASR_PROMPT_PRESETS
+
+    sa_prompt = ASR_PROMPT_PRESETS["system_analyst"]["prompt"]
+
+    # 1. Empty custom_prompt MUST be a 100% no-op (never silently rewrites anything)
+    raw_text = "Мы обсуждали джи эр пи си, gpc, оауф 2, джвт, постгрес, сваггер, камунду, сиквенс и докс эз код."
+    assert apply_custom_glossary_terms(raw_text, "") == raw_text
+    assert apply_custom_glossary_terms(raw_text, "   ") == raw_text
+
+    # 2. With System Analyst preset, requested IT terms are normalized cleanly
+    norm_sa = apply_custom_glossary_terms(raw_text, sa_prompt)
+    for expected_term in ("gRPC", "OAuth 2", "JWT", "PostgreSQL", "Swagger", "Camunda", "Sequence", "Docs as Code"):
+        assert expected_term in norm_sa
+    assert "gpc" not in norm_sa.lower()
+
+    # 3. Selective activation: terms NOT in custom_prompt remain untouched!
+    norm_partial = apply_custom_glossary_terms(
+        "Используем джи эр пи си, постгрес и камунду.", "REST, gRPC"
+    )
+    assert "gRPC" in norm_partial
+    assert "постгрес" in norm_partial
+    assert "камунду" in norm_partial
+
+    # 4. Whisper prompt-echo guard blocks verbatim echoes while preserving real technical answers
+    assert is_whisper_prompt_echo(
+        "Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT",
+        sa_prompt,
+    ) is True
+    assert is_whisper_prompt_echo(
+        "REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, OAuth 2",
+        sa_prompt,
+        no_speech_prob=0.45,
+    ) is True
+    assert is_whisper_prompt_echo(
+        "Мы перевели наш сервис с REST на gRPC и подключили OAuth 2.",
+        sa_prompt,
+        no_speech_prob=0.05,
+        avg_logprob=-0.2,
+    ) is False
+    assert is_whisper_prompt_echo("Обычная фраза.", "") is False
+
+    # 5. _decode_whisper_windows passes custom_prompt into initial_prompt and filters echoed segments
+    seen_prompts = []
+
+    class _FakePromptWhisper:
+        def __init__(self, model_dir, **kwargs):
+            pass
+
+        def transcribe(self, audio_slice, **kwargs):
+            seen_prompts.append(kwargs.get("initial_prompt"))
+            echo_seg = SimpleNamespace(
+                start=0.0,
+                end=1.5,
+                text=" Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP",
+                words=[
+                    SimpleNamespace(
+                        start=0.0,
+                        end=1.5,
+                        word=" Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP",
+                    )
+                ],
+                no_speech_prob=0.4,
+                avg_logprob=-0.6,
+            )
+            real_seg = SimpleNamespace(
+                start=1.8,
+                end=4.0,
+                text=" Используем gRPC и OAuth 2.",
+                words=[
+                    SimpleNamespace(start=1.8, end=2.5, word=" Используем"),
+                    SimpleNamespace(start=2.6, end=3.1, word=" gRPC"),
+                    SimpleNamespace(start=3.2, end=3.4, word=" и"),
+                    SimpleNamespace(start=3.5, end=4.0, word=" OAuth 2."),
+                ],
+                no_speech_prob=0.03,
+                avg_logprob=-0.15,
+            )
+            return [echo_seg, real_seg], SimpleNamespace(language="ru")
+
+    monkeypatch.setattr(tr_mod, "WhisperModel", _FakePromptWhisper)
+    monkeypatch.setattr(tr_mod, "build_vad_asr_windows", lambda *a, **kw: [])
+    _ModelCache.active_key = None
+    _ModelCache.active_engine = None
+
+    sr = 16000
+    samples = np.ones(sr * 6, dtype=np.float32) * 0.05
+    diar = [DiarizationSegment(0.2, 5.0, speaker=0)]
+
+    units = Transcriber._decode_whisper_windows(
+        samples=samples,
+        sample_rate=sr,
+        model_dir="/tmp/fake_whisper_prompt",
+        profile_id="large-v3-ru",
+        device="cpu",
+        compute_type="int8",
+        diar_segments=diar,
+        threads=4,
+        status_cb=None,
+        language="ru",
+        custom_prompt=sa_prompt,
+    )
+    assert seen_prompts == [sa_prompt]
+    assert [u.text.strip() for u in units] == ["Используем", "gRPC", "и", "OAuth 2."]
+
+
+def test_cluster_anchor_embeddings_separates_4_similar_female_voices():
+    """
+    Reproduces the real 4-female-participant interview failure where pairwise
+    inter-speaker CAM++ cosine similarity sits around ~0.59 (same gender + same
+    conference codec). UPGMA average-linkage with 'high' sensitivity (auto) or
+    exact speaker_count='4' MUST preserve all 4 speakers instead of collapsing to 2.
+    """
+    rng = np.random.RandomState(202604)
+    dim = 192
+    qr, _ = np.linalg.qr(rng.randn(dim, 5))
+    common_female_axis = qr[:, 0].astype(np.float32)
+
+    # Inter-speaker cosine similarity = 0.59 across every pair of the 4 speakers!
+    shared_w = float(np.sqrt(0.59))
+    indiv_w = float(np.sqrt(0.41))
+    true_centers = []
+    for i in range(4):
+        v = shared_w * common_female_axis + indiv_w * qr[:, i + 1].astype(np.float32)
+        v /= np.linalg.norm(v)
+        true_centers.append(v)
+
+    segments: list[DiarizationSegment] = []
+    embeddings: list[np.ndarray] = []
+    expected_speakers: list[int] = []
+    cur_t = 0.0
+    for turn_idx in range(48):
+        true_spk = turn_idx % 4
+        is_short = (turn_idx % 4 == 3) and (turn_idx >= 12)
+        dur = 0.9 if is_short else 3.6
+        noise = 0.045 if is_short else 0.025
+        emb = true_centers[true_spk] + noise * rng.randn(dim).astype(np.float32)
+        emb /= np.linalg.norm(emb)
+        segments.append(DiarizationSegment(cur_t, cur_t + dur, speaker=turn_idx))
+        embeddings.append(emb)
+        expected_speakers.append(true_spk)
+        cur_t += dur + 1.2
+
+    # Case A: Auto speaker discovery with sensitivity='high' (recommended for similar voices)
+    clustered_high = cluster_anchor_embeddings(
+        segments, embeddings, speaker_count="auto", sensitivity="high"
+    )
+    assert len({s.speaker for s in clustered_high}) == 4
+    by_true_high: dict[int, set[int]] = {0: set(), 1: set(), 2: set(), 3: set()}
+    for idx in range(48):
+        by_true_high[expected_speakers[idx]].add(clustered_high[idx].speaker)
+    for spk in range(4):
+        assert len(by_true_high[spk]) == 1
+
+    # Case B: Exact speaker_count='4' even with default sensitivity='normal'
+    clustered_exact4 = cluster_anchor_embeddings(
+        segments, embeddings, speaker_count="4", sensitivity="normal"
+    )
+    assert len({s.speaker for s in clustered_exact4}) == 4
+    by_true_4: dict[int, set[int]] = {0: set(), 1: set(), 2: set(), 3: set()}
+    for idx in range(48):
+        by_true_4[expected_speakers[idx]].add(clustered_exact4[idx].speaker)
+    for spk in range(4):
+        assert len(by_true_4[spk]) == 1
+
+
+def test_transcribe_dual_track_files_separates_speaker_1_deterministically(tmp_path, monkeypatch):
+    sr = 16000
+    t1_wav = str(tmp_path / "track1_candidate.wav")
+    t2_wav = str(tmp_path / "track2_interviewers.wav")
+    out_txt = str(tmp_path / "dual_transcript.txt")
+
+    t = np.linspace(0, 10.0, sr * 10, endpoint=False)
+    tone = (0.15 * np.sin(2 * np.pi * 300 * t) * 32767).astype(np.int16)
+    _write_pcm16_wav(t1_wav, tone, sample_rate=sr)
+    _write_pcm16_wav(t2_wav, tone, sample_rate=sr)
+
+    monkeypatch.setattr(ModelManager, "ensure_asr_model", classmethod(lambda cls, pid, status_cb=None: "/tmp/asr"))
+    monkeypatch.setattr(
+        ModelManager,
+        "ensure_diarization_models",
+        classmethod(lambda cls, status_cb=None: ("/tmp/seg.onnx", "/tmp/emb.onnx")),
+    )
+
+    diar_calls = []
+
+    def _mock_diar(cls, **kw):
+        diar_calls.append(
+            {"speaker_count": kw.get("speaker_count"), "sensitivity": kw.get("sensitivity")}
+        )
+        segs = [
+            DiarizationSegment(0.2, 2.5, speaker=0),
+            DiarizationSegment(5.0, 7.0, speaker=1),
+            DiarizationSegment(7.5, 9.5, speaker=2),
+        ]
+        return (segs, {}, None) if kw.get("return_voiceprints") else segs
+
+    asr_call_idx = {"n": 0}
+
+    def _mock_asr_engine(cls, **kw):
+        asr_call_idx["n"] += 1
+        if asr_call_idx["n"] == 1:
+            # Track 1 (Candidate Mic): must have diar_segments=None!
+            assert kw["diar_segments"] is None
+            return [TimedUnit(3.0, 4.8, " Мы используем джи эр пи си и постгрес.")]
+        # Track 2 (3 Interviewers)
+        assert kw["diar_segments"] is not None
+        return [
+            TimedUnit(0.3, 2.2, " Добрый день, расскажите про интеграции."),
+            TimedUnit(5.1, 6.8, " А как насчёт оауф 2?"),
+            TimedUnit(7.6, 9.2, " Спасибо, всё понятно."),
+        ]
+
+    monkeypatch.setattr(Transcriber, "_run_diarization", classmethod(_mock_diar))
+    monkeypatch.setattr(Transcriber, "_run_asr_engine", classmethod(_mock_asr_engine))
+
+    res = Transcriber.transcribe_dual_track_files(
+        track1_wav_path=t1_wav,
+        track2_wav_path=t2_wav,
+        output_txt_path=out_txt,
+        asr_model="gigaam-v3",
+        speaker_count="4",
+        threads=2,
+        language="ru",
+        custom_prompt="gRPC, OAuth 2, PostgreSQL",
+        diarization_sensitivity="high",
+    )
+
+    # Diarization ran ONLY ONCE (for Track 2), allocating speaker_count = 4 - 1 = '3'!
+    assert diar_calls == [{"speaker_count": "3", "sensitivity": "high"}]
+    assert res["dual_track"] is True
+    assert res["num_speakers"] == 4
+    assert res["num_turns"] == 4
+
+    txt = open(out_txt, encoding="utf-8").read()
+    assert "Дорожка 1 = Спикер 1" in txt
+    assert "Обнаружено спикеров: 4" in txt
+    lines = [ln for ln in txt.splitlines() if ln.startswith("[00:")]
+    assert len(lines) == 4
+    assert "Спикер 2: Добрый день, расскажите про интеграции." in lines[0]
+    assert "Спикер 1: Мы используем gRPC и PostgreSQL." in lines[1]
+    assert "Спикер 3: А как насчёт OAuth 2?" in lines[2]
+    assert "Спикер 4: Спасибо, всё понятно." in lines[3]
+
 
 

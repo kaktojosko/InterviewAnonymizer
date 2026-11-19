@@ -63,6 +63,10 @@ const asrModelSelect = document.getElementById('asrModelSelect');
 const languageSelect = document.getElementById('languageSelect');
 const computeDeviceSelect = document.getElementById('computeDeviceSelect');
 const speakerCountSelect = document.getElementById('speakerCountSelect');
+const diarizationSensitivitySelect = document.getElementById('diarizationSensitivitySelect');
+const audioTracksSelect = document.getElementById('audioTracksSelect');
+const customPromptInput = document.getElementById('customPromptInput');
+const promptPresetsEl = document.getElementById('promptPresets');
 const transcribeHintText = document.getElementById('transcribeHintText');
 
 const recordingsSection = document.getElementById('recordingsSection');
@@ -77,6 +81,10 @@ const postAsrModelSelect = document.getElementById('postAsrModelSelect');
 const postLanguageSelect = document.getElementById('postLanguageSelect');
 const postComputeDeviceSelect = document.getElementById('postComputeDeviceSelect');
 const postSpeakerCountSelect = document.getElementById('postSpeakerCountSelect');
+const postDiarizationSensitivitySelect = document.getElementById('postDiarizationSensitivitySelect');
+const postAudioTracksSelect = document.getElementById('postAudioTracksSelect');
+const postCustomPromptInput = document.getElementById('postCustomPromptInput');
+const postPromptPresetsEl = document.getElementById('postPromptPresets');
 const postAudioSourceHint = document.getElementById('postAudioSourceHint');
 const postTranscribeBtn = document.getElementById('postTranscribeBtn');
 
@@ -99,6 +107,14 @@ let serverCpuCount = null;
 let serverMaxWorkers = null;
 let serverCudaAvailable = null;
 let serverAsrModelsMeta = new Map();
+let promptPresetMap = {
+    system_analyst:
+        'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, OAuth 2, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, Camunda, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code',
+    backend_devops:
+        'Техническое собеседование: Python, Go, Java, Docker, Kubernetes, CI/CD, GitLab, PostgreSQL, Redis, Kafka, RabbitMQ, gRPC, REST API, GraphQL, OpenAPI, Prometheus, Grafana, Terraform, Linux',
+    frontend_qa:
+        'Техническое собеседование: JavaScript, TypeScript, React, Vue, Next.js, REST, GraphQL, WebSocket, Playwright, Cypress, Selenium, Postman, Swagger, Allure, Jira, Git',
+};
 let transcribeOnlyExtensions = [
     '.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v',
     '.mp3', '.wav', '.m4a', '.ogg', '.opus', '.flac', '.aac', '.wma',
@@ -110,12 +126,18 @@ let selectedAsrModel = localStorage.getItem('selectedAsrModel') || 'gigaam-v3';
 let selectedLanguage = localStorage.getItem('selectedLanguage') || 'ru';
 let selectedComputeDevice = localStorage.getItem('selectedComputeDevice') || 'cpu';
 let selectedSpeakers = localStorage.getItem('selectedSpeakers') || 'auto';
+let selectedSensitivity = localStorage.getItem('selectedSensitivity') || 'normal';
+let selectedAudioTracks = localStorage.getItem('selectedAudioTracks') || 'auto';
+let selectedCustomPrompt = localStorage.getItem('selectedCustomPrompt') || '';
 
 // Post-recording separate transcription form state (initialized from main settings)
 let postAsrModel = selectedAsrModel;
 let postLanguage = selectedLanguage;
 let postComputeDevice = selectedComputeDevice;
 let postSpeakers = selectedSpeakers;
+let postSensitivity = selectedSensitivity;
+let postAudioTracks = selectedAudioTracks;
+let postCustomPrompt = selectedCustomPrompt;
 
 function isCpuOnlyAsrModel(modelId) {
     if (serverAsrModelsMeta.has(modelId)) {
@@ -324,10 +346,14 @@ document.addEventListener('click', () => closeAllClaySelects());
     languageSelect,
     computeDeviceSelect,
     speakerCountSelect,
+    diarizationSensitivitySelect,
+    audioTracksSelect,
     postAsrModelSelect,
     postLanguageSelect,
     postComputeDeviceSelect,
     postSpeakerCountSelect,
+    postDiarizationSensitivitySelect,
+    postAudioTracksSelect,
 ].forEach(enhanceSelect);
 
 function stopPolling() {
@@ -438,16 +464,29 @@ function applyComputeDeviceAvailability() {
     );
 }
 
+function hasLatinTerms(text) {
+    return /[A-Za-z]{2,}/.test(String(text || ''));
+}
+
 function updateTranscribeHint() {
     if (!transcribeHintText) return;
     if (selectedAsrModel === 'gigaam-v3') {
-        transcribeHintText.textContent = selectedLanguage === 'en'
-            ? 'GigaAM v3 специализирована на русском языке; для английской речи выберите Whisper.'
-            : 'Sber GigaAM v3: лучшая точность на русской речи, встроенная пунктуация и регистр. Офлайн на CPU.';
+        if (selectedLanguage === 'en') {
+            transcribeHintText.textContent =
+                'GigaAM v3 специализирована на русском языке; для английской речи выберите Whisper.';
+        } else if (hasLatinTerms(selectedCustomPrompt)) {
+            transcribeHintText.textContent =
+                'В словаре есть латинские термины — для нативного вывода латиницы выберите Whisper Large v3 RU или Turbo (для GigaAM v3 сработает автозамена по словарю).';
+        } else {
+            transcribeHintText.textContent =
+                'Sber GigaAM v3: лучшая точность на русской речи (нарезка ≤20с с Silero VAD), пунктуация и регистр. Офлайн на CPU.';
+        }
     } else if (selectedAsrModel === 'large-v3-ru') {
-        transcribeHintText.textContent = 'Русский файнтюн Whisper Large v3: высокая точность на русской речи и английских терминах (CPU/GPU).';
+        transcribeHintText.textContent =
+            'Русский файнтюн Whisper Large v3: высокая точность на русской речи и IT-терминах с поддержкой словаря (CPU/GPU).';
     } else {
-        transcribeHintText.textContent = 'Отдельный .txt с таймкодами и ролями. Выбор «Русский (RU)» отключает случайное переключение языка.';
+        transcribeHintText.textContent =
+            'Отдельный .txt с таймкодами и ролями. Словарь терминов передаётся напрямую в initial_prompt Whisper.';
     }
 }
 
@@ -530,6 +569,31 @@ function renderTranscriptionControls() {
         speakerCountSelect.value = 'auto';
     }
     syncClaySelect(speakerCountSelect);
+
+    if (diarizationSensitivitySelect) {
+        if (Array.from(diarizationSensitivitySelect.options).some((opt) => opt.value === selectedSensitivity)) {
+            diarizationSensitivitySelect.value = selectedSensitivity;
+        } else {
+            selectedSensitivity = 'normal';
+            diarizationSensitivitySelect.value = 'normal';
+        }
+        syncClaySelect(diarizationSensitivitySelect);
+    }
+
+    if (audioTracksSelect) {
+        if (Array.from(audioTracksSelect.options).some((opt) => opt.value === selectedAudioTracks)) {
+            audioTracksSelect.value = selectedAudioTracks;
+        } else {
+            selectedAudioTracks = 'auto';
+            audioTracksSelect.value = 'auto';
+        }
+        syncClaySelect(audioTracksSelect);
+    }
+
+    if (customPromptInput && customPromptInput.value !== selectedCustomPrompt) {
+        customPromptInput.value = selectedCustomPrompt;
+    }
+
     updateTranscribeHint();
 }
 
@@ -541,6 +605,9 @@ function updatePostAudioSourceHint() {
     if (postAsrModel === 'gigaam-v3' && postLanguage === 'en') {
         postAudioSourceHint.textContent =
             `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Whisper.`;
+    } else if (postAsrModel === 'gigaam-v3' && hasLatinTerms(postCustomPrompt)) {
+        postAudioSourceHint.textContent =
+            `${sourceText} Для латинских IT-терминов из словаря лучше подходит Whisper Large v3 RU / Turbo (для GigaAM v3 сработает автозамена).`;
     } else {
         postAudioSourceHint.textContent = sourceText;
     }
@@ -595,6 +662,31 @@ function renderPostTranscribeControls() {
         }
         syncClaySelect(postSpeakerCountSelect);
     }
+
+    if (postDiarizationSensitivitySelect) {
+        if (Array.from(postDiarizationSensitivitySelect.options).some((opt) => opt.value === postSensitivity)) {
+            postDiarizationSensitivitySelect.value = postSensitivity;
+        } else {
+            postSensitivity = 'normal';
+            postDiarizationSensitivitySelect.value = 'normal';
+        }
+        syncClaySelect(postDiarizationSensitivitySelect);
+    }
+
+    if (postAudioTracksSelect) {
+        if (Array.from(postAudioTracksSelect.options).some((opt) => opt.value === postAudioTracks)) {
+            postAudioTracksSelect.value = postAudioTracks;
+        } else {
+            postAudioTracks = 'auto';
+            postAudioTracksSelect.value = 'auto';
+        }
+        syncClaySelect(postAudioTracksSelect);
+    }
+
+    if (postCustomPromptInput && postCustomPromptInput.value !== postCustomPrompt) {
+        postCustomPromptInput.value = postCustomPrompt;
+    }
+
     updatePostAudioSourceHint();
 }
 
@@ -767,6 +859,9 @@ function renderRecordingsList(recordings) {
                     language: selectedLanguage,
                     computeDevice: selectedComputeDevice,
                     speakers: selectedSpeakers,
+                    sensitivity: selectedSensitivity,
+                    audioTracks: selectedAudioTracks,
+                    customPrompt: selectedCustomPrompt,
                 });
             });
             actions.appendChild(trBtn);
@@ -775,7 +870,7 @@ function renderRecordingsList(recordings) {
             cfgBtn.type = 'button';
             cfgBtn.className = 'recording-chip';
             cfgBtn.textContent = 'Настроить';
-            cfgBtn.title = 'Выбрать модель, язык и число спикеров перед транскрибацией';
+            cfgBtn.title = 'Выбрать модель, язык, словарь и число спикеров перед транскрибацией';
             cfgBtn.addEventListener('click', () => openRecordingPanel(rec));
             actions.appendChild(cfgBtn);
         }
@@ -806,6 +901,9 @@ function openRecordingPanel(rec) {
         language: rec.language || selectedLanguage,
         compute_device: selectedComputeDevice,
         speakers: selectedSpeakers,
+        diarization_sensitivity: selectedSensitivity,
+        audio_tracks: selectedAudioTracks,
+        custom_prompt: selectedCustomPrompt,
         original_filename: rec.original_filename || '',
     };
     lastTaskData = taskData;
@@ -878,6 +976,30 @@ async function loadServerConfig() {
             }
         }
 
+        if (Array.isArray(data.diarization_sensitivities) && data.diarization_sensitivities.length > 0) {
+            syncSelectOptionsIfChanged(diarizationSensitivitySelect, data.diarization_sensitivities);
+            syncSelectOptionsIfChanged(postDiarizationSensitivitySelect, data.diarization_sensitivities);
+            if (!localStorage.getItem('selectedSensitivity') && data.default_diarization_sensitivity) {
+                selectedSensitivity = data.default_diarization_sensitivity;
+            }
+        }
+
+        if (Array.isArray(data.audio_track_modes) && data.audio_track_modes.length > 0) {
+            syncSelectOptionsIfChanged(audioTracksSelect, data.audio_track_modes);
+            syncSelectOptionsIfChanged(postAudioTracksSelect, data.audio_track_modes);
+            if (!localStorage.getItem('selectedAudioTracks') && data.default_audio_track_mode) {
+                selectedAudioTracks = data.default_audio_track_mode;
+            }
+        }
+
+        if (Array.isArray(data.prompt_presets) && data.prompt_presets.length > 0) {
+            data.prompt_presets.forEach((p) => {
+                if (p && p.id && typeof p.prompt === 'string') {
+                    promptPresetMap[p.id] = p.prompt;
+                }
+            });
+        }
+
         if (Array.isArray(data.compute_devices) && data.compute_devices.length > 0 && computeDeviceSelect) {
             syncSelectOptionsIfChanged(computeDeviceSelect, data.compute_devices);
             syncSelectOptionsIfChanged(postComputeDeviceSelect, data.compute_devices);
@@ -894,6 +1016,9 @@ async function loadServerConfig() {
         postLanguage = selectedLanguage;
         postComputeDevice = selectedComputeDevice;
         postSpeakers = selectedSpeakers;
+        postSensitivity = selectedSensitivity;
+        postAudioTracks = selectedAudioTracks;
+        postCustomPrompt = selectedCustomPrompt;
 
         applyWorkerAvailability();
         renderModeControls();
@@ -902,6 +1027,20 @@ async function loadServerConfig() {
     } catch (error) {
         console.warn('Could not load server config:', error);
     }
+}
+
+function bindPromptPresetButtons(containerEl, onApply) {
+    if (!containerEl || !containerEl.querySelectorAll) return;
+    containerEl.querySelectorAll('.prompt-chip').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const presetId = (btn.dataset && btn.dataset.preset) || (btn.getAttribute && btn.getAttribute('data-preset'));
+            if (presetId === 'clear') {
+                onApply('');
+            } else if (presetId && promptPresetMap[presetId]) {
+                onApply(promptPresetMap[presetId]);
+            }
+        });
+    });
 }
 
 if (modeAnonymizeBtn) {
@@ -963,6 +1102,37 @@ speakerCountSelect.addEventListener('change', () => {
     syncClaySelect(speakerCountSelect);
 });
 
+if (diarizationSensitivitySelect) {
+    diarizationSensitivitySelect.addEventListener('change', () => {
+        selectedSensitivity = diarizationSensitivitySelect.value;
+        localStorage.setItem('selectedSensitivity', selectedSensitivity);
+        syncClaySelect(diarizationSensitivitySelect);
+    });
+}
+
+if (audioTracksSelect) {
+    audioTracksSelect.addEventListener('change', () => {
+        selectedAudioTracks = audioTracksSelect.value;
+        localStorage.setItem('selectedAudioTracks', selectedAudioTracks);
+        syncClaySelect(audioTracksSelect);
+    });
+}
+
+if (customPromptInput) {
+    customPromptInput.addEventListener('input', () => {
+        selectedCustomPrompt = customPromptInput.value.trim();
+        localStorage.setItem('selectedCustomPrompt', selectedCustomPrompt);
+        updateTranscribeHint();
+    });
+}
+
+bindPromptPresetButtons(promptPresetsEl, (val) => {
+    selectedCustomPrompt = val;
+    localStorage.setItem('selectedCustomPrompt', selectedCustomPrompt);
+    if (customPromptInput) customPromptInput.value = val;
+    updateTranscribeHint();
+});
+
 // Post-recording separate transcription form events
 if (postAsrModelSelect) {
     postAsrModelSelect.addEventListener('change', () => {
@@ -999,6 +1169,33 @@ if (postSpeakerCountSelect) {
     });
 }
 
+if (postDiarizationSensitivitySelect) {
+    postDiarizationSensitivitySelect.addEventListener('change', () => {
+        postSensitivity = postDiarizationSensitivitySelect.value;
+        syncClaySelect(postDiarizationSensitivitySelect);
+    });
+}
+
+if (postAudioTracksSelect) {
+    postAudioTracksSelect.addEventListener('change', () => {
+        postAudioTracks = postAudioTracksSelect.value;
+        syncClaySelect(postAudioTracksSelect);
+    });
+}
+
+if (postCustomPromptInput) {
+    postCustomPromptInput.addEventListener('input', () => {
+        postCustomPrompt = postCustomPromptInput.value.trim();
+        updatePostAudioSourceHint();
+    });
+}
+
+bindPromptPresetButtons(postPromptPresetsEl, (val) => {
+    postCustomPrompt = val;
+    if (postCustomPromptInput) postCustomPromptInput.value = val;
+    updatePostAudioSourceHint();
+});
+
 if (togglePostTranscribeBtn) {
     togglePostTranscribeBtn.addEventListener('click', () => {
         if (!postTranscribeForm) return;
@@ -1018,6 +1215,9 @@ if (postTranscribeBtn) {
             language: postLanguage,
             computeDevice: postComputeDevice,
             speakers: postSpeakers,
+            sensitivity: postSensitivity,
+            audioTracks: postAudioTracks,
+            customPrompt: postCustomPrompt,
         });
     });
 }
@@ -1140,6 +1340,9 @@ async function uploadFile(file) {
     formData.append('language', selectedLanguage);
     formData.append('compute_device', selectedComputeDevice);
     formData.append('speakers', selectedSpeakers);
+    formData.append('diarization_sensitivity', selectedSensitivity);
+    formData.append('audio_tracks', selectedAudioTracks);
+    formData.append('custom_prompt', selectedCustomPrompt);
 
     uploadAbortController = new AbortController();
 
@@ -1206,20 +1409,32 @@ async function startPostTranscription(taskId, opts = {}) {
     const chosenLang = opts.language || selectedLanguage;
     const chosenDev = opts.computeDevice || selectedComputeDevice;
     const chosenSpk = opts.speakers || selectedSpeakers;
+    const chosenSens = opts.sensitivity || selectedSensitivity;
+    const chosenTracks = opts.audioTracks || selectedAudioTracks;
+    const chosenPrompt = opts.customPrompt !== undefined ? String(opts.customPrompt) : selectedCustomPrompt;
 
     // Remember user's latest transcription choices
     selectedAsrModel = chosenModel;
     selectedLanguage = chosenLang;
     selectedComputeDevice = chosenDev;
     selectedSpeakers = chosenSpk;
+    selectedSensitivity = chosenSens;
+    selectedAudioTracks = chosenTracks;
+    selectedCustomPrompt = chosenPrompt;
     postAsrModel = chosenModel;
     postLanguage = chosenLang;
     postComputeDevice = chosenDev;
     postSpeakers = chosenSpk;
+    postSensitivity = chosenSens;
+    postAudioTracks = chosenTracks;
+    postCustomPrompt = chosenPrompt;
     localStorage.setItem('selectedAsrModel', selectedAsrModel);
     localStorage.setItem('selectedLanguage', selectedLanguage);
     localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
     localStorage.setItem('selectedSpeakers', selectedSpeakers);
+    localStorage.setItem('selectedSensitivity', selectedSensitivity);
+    localStorage.setItem('selectedAudioTracks', selectedAudioTracks);
+    localStorage.setItem('selectedCustomPrompt', selectedCustomPrompt);
 
     prepareStatusPanelForRun('Транскрибация...', 'Запуск распознавания речи для готовой записи...');
 
@@ -1229,6 +1444,9 @@ async function startPostTranscription(taskId, opts = {}) {
     formData.append('language', chosenLang);
     formData.append('compute_device', chosenDev);
     formData.append('speakers', chosenSpk);
+    formData.append('diarization_sensitivity', chosenSens);
+    formData.append('audio_tracks', chosenTracks);
+    formData.append('custom_prompt', chosenPrompt);
 
     try {
         const response = await fetch(`/api/transcribe/${taskId}`, {
@@ -1333,6 +1551,9 @@ function renderPostTranscribeSection(data = {}, opts = {}) {
     postLanguage = data.language || selectedLanguage;
     postComputeDevice = data.compute_device || selectedComputeDevice;
     postSpeakers = data.speakers || selectedSpeakers;
+    postSensitivity = data.diarization_sensitivity || selectedSensitivity;
+    postAudioTracks = data.audio_tracks || selectedAudioTracks;
+    postCustomPrompt = data.custom_prompt !== undefined ? String(data.custom_prompt) : selectedCustomPrompt;
     renderPostTranscribeControls();
 
     postTranscribeSection.classList.remove('hidden');

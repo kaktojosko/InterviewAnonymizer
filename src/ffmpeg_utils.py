@@ -201,28 +201,88 @@ class FFmpegUtils:
 
 
     @staticmethod
+    def get_audio_streams(input_path: str) -> list[dict]:
+        """Returns metadata for all audio streams in the input media file."""
+        streams_out: list[dict] = []
+        if not input_path or not os.path.exists(input_path):
+            return streams_out
+        try:
+            probe = ffmpeg.probe(input_path)
+            audio_idx = 0
+            for stream in probe.get('streams', []):
+                if stream.get('codec_type') != 'audio':
+                    continue
+                try:
+                    sr = int(stream.get('sample_rate', 44100))
+                except (TypeError, ValueError):
+                    sr = 44100
+                try:
+                    ch = int(stream.get('channels', 1))
+                except (TypeError, ValueError):
+                    ch = 1
+                tags = stream.get('tags') or {}
+                title = str(tags.get('title') or tags.get('handler_name') or '').strip()
+                streams_out.append(
+                    {
+                        'stream_index': audio_idx,
+                        'channels': ch,
+                        'sample_rate': sr,
+                        'title': title,
+                    }
+                )
+                audio_idx += 1
+        except ffmpeg.Error:
+            pass
+        return streams_out
+
+    @staticmethod
     def extract_transcription_audio(
         input_path: str,
         output_wav_path: str,
         cancel_token: CancellationToken | None = None,
+        stream_index: int = 0,
+        mix_all_streams: bool = False,
+        num_streams: int = 1,
     ) -> bool:
-        """Extracts original 16 kHz mono 16-bit PCM WAV for speaker diarization and ASR."""
+        """
+        Extracts original 16 kHz mono 16-bit PCM WAV for speaker diarization and ASR.
+        Supports extracting a specific audio track (stream_index) or mixing multiple
+        audio tracks (mix_all_streams=True, e.g. OBS multi-track recordings).
+        """
         if not os.path.exists(input_path):
             return False
         try:
-            spec = (
-                ffmpeg
-                .input(input_path)
-                .output(
+            inp = ffmpeg.input(input_path)
+            if mix_all_streams and int(num_streams) > 1:
+                n = int(num_streams)
+                audio_inputs = [inp[f'a:{i}'] for i in range(n)]
+                mixed = ffmpeg.filter(
+                    audio_inputs,
+                    'amix',
+                    inputs=n,
+                    duration='longest',
+                    dropout_transition=0,
+                    normalize=0,
+                ).filter('highpass', f=65)
+                spec = ffmpeg.output(
+                    mixed,
                     output_wav_path,
-                    map='0:a:0',
+                    vn=None,
+                    ac=1,
+                    ar=16000,
+                    acodec='pcm_s16le',
+                )
+            else:
+                idx = max(0, int(stream_index))
+                spec = inp.output(
+                    output_wav_path,
+                    map=f'0:a:{idx}',
                     vn=None,
                     af='highpass=f=65',
                     ac=1,
                     ar=16000,
                     acodec='pcm_s16le',
                 )
-            )
             FFmpegUtils._run_stream(spec, cancel_token=cancel_token)
             return os.path.isfile(output_wav_path) and os.path.getsize(output_wav_path) > 44
         except TaskCancelledError:
@@ -231,4 +291,5 @@ class FFmpegUtils:
             err_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
             print(f"Error extracting transcription audio with FFmpeg: {err_msg}")
             return False
+
 

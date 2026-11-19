@@ -22,7 +22,9 @@ from src.config import (
     CPU_COUNT,
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
+    DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DIARIZATION_SENSITIVITY,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     TRANSCRIPTION_ENABLED_DEFAULT,
@@ -101,6 +103,26 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _resolve_audio_track_strategy(audio_tracks: str, num_audio_streams: int) -> str:
+        """
+        Determines how multi-track recordings (e.g. OBS Mic + Desktop) are handled:
+          - 'single': extract stream 0 only
+          - 'dual': extract stream 0 (Спикер 1) + stream 1 (diarized Спикер 2..N)
+          - 'mix': mix all streams into a single mono 16 kHz WAV
+        """
+        if num_audio_streams <= 1:
+            return "single"
+        mode = (audio_tracks or DEFAULT_AUDIO_TRACK_MODE).strip().lower()
+        if mode == "first":
+            return "single"
+        if mode == "mix":
+            return "mix"
+        if mode == "separate":
+            return "dual"
+        # auto: 2 tracks -> OBS dual-track split; 3+ tracks -> mix all so nothing is dropped
+        return "dual" if num_audio_streams == 2 else "mix"
+
+    @staticmethod
     def process_video_job(
         input_path: str,
         output_path: str,
@@ -115,6 +137,10 @@ class Orchestrator:
         cancel_token: CancellationToken | None = None,
         language: str = DEFAULT_ASR_LANGUAGE,
         cached_audio_path: str | None = None,
+        cached_track2_path: str | None = None,
+        custom_prompt: str = "",
+        diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+        audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
     ) -> dict:
         log_lock = threading.Lock()
 
@@ -138,18 +164,28 @@ class Orchestrator:
         # during video blurring so final muxing is an instant stream copy!
         audio_pitched_path = os.path.join(job_dir, "audio_pitched.m4a")
         audio_16k_path = os.path.join(job_dir, "audio_16k.wav")
+        audio_16k_track2_path = os.path.join(job_dir, "audio_16k_track2.wav")
         if transcribe and not transcript_path:
             stem, _ = os.path.splitext(output_path)
             transcript_path = f"{stem}_transcript.txt"
 
-        # 1. Probe (Metadata)
+        # 1. Probe (Metadata + multi-track audio streams)
         update("Анализ видеофайла...")
         t0 = time.time()
         width, height, fps_str, duration, has_audio, sample_rate = FFmpegUtils.get_video_metadata(input_path)
+        audio_streams = FFmpegUtils.get_audio_streams(input_path) if has_audio else []
+        num_audio_streams = max(1, len(audio_streams)) if has_audio else 0
+        track_strategy = (
+            Orchestrator._resolve_audio_track_strategy(audio_tracks, num_audio_streams)
+            if has_audio
+            else "single"
+        )
         if cancel_token is not None:
             cancel_token.check()
         update(f"[Profile] Probe finished in {time.time() - t0:.2f}s")
         update(f"Целевой FPS обработки: {fps_str}")
+        if num_audio_streams > 1:
+            update(f"Обнаружено аудиодорожек: {num_audio_streams} (стратегия: {track_strategy})")
 
         profile_info = ASR_MODEL_PROFILES.get(asr_model, ASR_MODEL_PROFILES[DEFAULT_ASR_MODEL])
         use_parallel_gpu = False
@@ -157,6 +193,7 @@ class Orchestrator:
             has_audio
             and transcribe
             and transcript_path
+            and track_strategy != "dual"
             and requested_device == "cuda"
             and profile_info.get("engine") == "faster_whisper"
         ):
@@ -194,14 +231,25 @@ class Orchestrator:
 
             if has_audio:
                 update("Запуск обработки аудио (в фоне)...")
+                mix_for_video = num_audio_streams > 1 and track_strategy in ("dual", "mix")
                 audio_future = audio_executor.submit(
-                    AudioProcessor.process, input_path, audio_pitched_path, sample_rate, cancel_token
+                    AudioProcessor.process,
+                    input_path,
+                    audio_pitched_path,
+                    sample_rate,
+                    cancel_token,
+                    num_audio_streams,
+                    mix_for_video,
                 )
                 if need_raw_wav:
                     if use_parallel_gpu:
                         def _extract_and_run_gpu_asr() -> tuple[bool, dict | None]:
                             raw_ok = FFmpegUtils.extract_transcription_audio(
-                                input_path, audio_16k_path, cancel_token=cancel_token
+                                input_path,
+                                audio_16k_path,
+                                cancel_token=cancel_token,
+                                mix_all_streams=(track_strategy == "mix"),
+                                num_streams=num_audio_streams,
                             )
                             if not raw_ok:
                                 return False, None
@@ -218,17 +266,37 @@ class Orchestrator:
                                 status_cb=update,
                                 cancel_token=cancel_token,
                                 language=language,
+                                custom_prompt=custom_prompt,
                             )
                             return True, asr_state
 
                         parallel_gpu_future = audio_executor.submit(_extract_and_run_gpu_asr)
                     else:
-                        transcribe_extract_future = audio_executor.submit(
-                            FFmpegUtils.extract_transcription_audio,
-                            input_path,
-                            audio_16k_path,
-                            cancel_token,
-                        )
+                        def _extract_raw_tracks() -> tuple[bool, bool]:
+                            if track_strategy == "dual":
+                                ok1 = FFmpegUtils.extract_transcription_audio(
+                                    input_path,
+                                    audio_16k_path,
+                                    cancel_token=cancel_token,
+                                    stream_index=0,
+                                )
+                                ok2 = FFmpegUtils.extract_transcription_audio(
+                                    input_path,
+                                    audio_16k_track2_path,
+                                    cancel_token=cancel_token,
+                                    stream_index=1,
+                                )
+                                return ok1, ok2
+                            ok1 = FFmpegUtils.extract_transcription_audio(
+                                input_path,
+                                audio_16k_path,
+                                cancel_token=cancel_token,
+                                mix_all_streams=(track_strategy == "mix"),
+                                num_streams=num_audio_streams,
+                            )
+                            return ok1, False
+
+                        transcribe_extract_future = audio_executor.submit(_extract_raw_tracks)
 
             input_chunks = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
             list_file_path = None
@@ -367,6 +435,7 @@ class Orchestrator:
                 cancel_token.check()
             final_audio_path = None
             raw_wav_ready = False
+            raw_track2_ready = False
             if has_audio and audio_future:
                 update("Ожидание завершения обработки аудио...")
                 t0 = time.time()
@@ -375,7 +444,11 @@ class Orchestrator:
                 if audio_success:
                     final_audio_path = audio_pitched_path
             if transcribe_extract_future is not None:
-                raw_wav_ready = bool(transcribe_extract_future.result())
+                raw_res = transcribe_extract_future.result()
+                if isinstance(raw_res, tuple):
+                    raw_wav_ready, raw_track2_ready = bool(raw_res[0]), bool(raw_res[1])
+                else:
+                    raw_wav_ready = bool(raw_res)
 
             # 5. Single-pass stream-copy concat & mux of final MP4
             if cancel_token is not None:
@@ -416,6 +489,8 @@ class Orchestrator:
 
                 if raw_wav_ready and cached_audio_path:
                     audio_cached = Orchestrator._save_cached_audio(audio_16k_path, cached_audio_path)
+                if raw_track2_ready and cached_track2_path:
+                    Orchestrator._save_cached_audio(audio_16k_track2_path, cached_track2_path)
 
                 if not has_audio or not raw_wav_ready:
                     update("Аудиодорожка отсутствует — формирование пустого файла транскрибации...")
@@ -439,6 +514,25 @@ class Orchestrator:
                         threads=diar_cpu_threads,
                         status_cb=update,
                         cancel_token=cancel_token,
+                        diarization_sensitivity=diarization_sensitivity,
+                        custom_prompt=custom_prompt,
+                    )
+                    transcript_ready = os.path.isfile(transcript_path)
+                elif track_strategy == "dual" and raw_track2_ready:
+                    update("Запуск двухдорожечной транскрибации (Дорожка 1 = Спикер 1, Дорожка 2 = собеседники)...")
+                    Transcriber.transcribe_dual_track_files(
+                        track1_wav_path=audio_16k_path,
+                        track2_wav_path=audio_16k_track2_path,
+                        output_txt_path=transcript_path,
+                        asr_model=asr_model,
+                        speaker_count=speaker_count,
+                        threads=post_video_threads,
+                        compute_device=requested_device,
+                        status_cb=update,
+                        cancel_token=cancel_token,
+                        language=language,
+                        custom_prompt=custom_prompt,
+                        diarization_sensitivity=diarization_sensitivity,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
                 else:
@@ -453,10 +547,14 @@ class Orchestrator:
                         status_cb=update,
                         cancel_token=cancel_token,
                         language=language,
+                        custom_prompt=custom_prompt,
+                        diarization_sensitivity=diarization_sensitivity,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
             elif raw_wav_ready and cached_audio_path:
                 audio_cached = Orchestrator._save_cached_audio(audio_16k_path, cached_audio_path)
+                if raw_track2_ready and cached_track2_path:
+                    Orchestrator._save_cached_audio(audio_16k_track2_path, cached_track2_path)
 
         finally:
             if cancel_token is not None and cancel_token.is_cancelled():
@@ -480,6 +578,7 @@ class Orchestrator:
             "transcript_ready": transcript_ready,
             "transcript_path": transcript_path if transcript_ready else None,
             "audio_cached": audio_cached,
+            "dual_track_cached": bool(raw_track2_ready and cached_track2_path and os.path.isfile(cached_track2_path)),
         }
 
     @staticmethod
@@ -495,12 +594,17 @@ class Orchestrator:
         compute_device: str = DEFAULT_COMPUTE_DEVICE,
         cancel_token: CancellationToken | None = None,
         cached_audio_path: str | None = None,
+        cached_track2_path: str | None = None,
         input_is_wav_16k: bool = False,
+        input_track2_path: str | None = None,
         source_note: str | None = None,
+        custom_prompt: str = "",
+        diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+        audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
     ) -> dict:
         """
         Runs speaker-diarized transcription directly on a video/audio file (or
-        cached 16 kHz mono WAV) without splitting, face blurring, pitch-shifting,
+        cached 16 kHz mono WAV(s)) without splitting, face blurring, pitch-shifting,
         or video re-encoding. Used by 'Только транскрибация' mode and post-recording
         separate transcript generation.
         """
@@ -531,7 +635,9 @@ class Orchestrator:
         duration = 0.0
         has_audio = False
         wav_path: str | None = None
+        track2_wav_path: str | None = None
         audio_cached = False
+        dual_track_cached = False
 
         if input_is_wav_16k and os.path.isfile(input_path):
             update("Использование сохранённой оригинальной аудиодорожки (без искажения голоса)...")
@@ -545,37 +651,95 @@ class Orchestrator:
                 duration = 0.0
             if cached_audio_path:
                 audio_cached = Orchestrator._save_cached_audio(wav_path, cached_audio_path)
+
+            if (
+                input_track2_path
+                and os.path.isfile(input_track2_path)
+                and (audio_tracks or DEFAULT_AUDIO_TRACK_MODE).strip().lower() in ("auto", "separate")
+            ):
+                track2_wav_path = input_track2_path
+                if cached_track2_path:
+                    dual_track_cached = Orchestrator._save_cached_audio(
+                        track2_wav_path, cached_track2_path
+                    )
         else:
             update("Анализ медиафайла...")
             t0 = time.time()
             _, _, _, duration, has_audio, _ = FFmpegUtils.get_video_metadata(input_path)
+            audio_streams = FFmpegUtils.get_audio_streams(input_path) if has_audio else []
+            num_audio_streams = max(1, len(audio_streams)) if has_audio else 0
+            track_strategy = (
+                Orchestrator._resolve_audio_track_strategy(audio_tracks, num_audio_streams)
+                if has_audio
+                else "single"
+            )
             if cancel_token is not None:
                 cancel_token.check()
             update(f"[Profile] Probe finished in {time.time() - t0:.2f}s (Длительность: {duration:.1f}с)")
+            if num_audio_streams > 1:
+                update(f"Обнаружено аудиодорожек: {num_audio_streams} (стратегия: {track_strategy})")
 
             if has_audio:
-                update("Извлечение аудиодорожки (16 кГц моно)...")
                 t0 = time.time()
                 extracted_wav = os.path.join(job_dir, "audio_16k.wav")
-                raw_ok = FFmpegUtils.extract_transcription_audio(
-                    input_path, extracted_wav, cancel_token=cancel_token
-                )
-                if cancel_token is not None:
-                    cancel_token.check()
-                update(f"[Profile] Audio extract finished in {time.time() - t0:.2f}s")
-                if raw_ok:
-                    wav_path = extracted_wav
-                    if duration <= 0.0:
-                        try:
-                            with wave.open(extracted_wav, "rb") as wf:
-                                fr = wf.getframerate() or 16000
-                                duration = wf.getnframes() / float(fr)
-                        except Exception:
-                            pass
-                    if cached_audio_path:
-                        audio_cached = Orchestrator._save_cached_audio(extracted_wav, cached_audio_path)
+                if track_strategy == "dual":
+                    update("Извлечение 2 раздельных аудиодорожек (16 кГц моно)...")
+                    extracted_wav2 = os.path.join(job_dir, "audio_16k_track2.wav")
+                    raw_ok = FFmpegUtils.extract_transcription_audio(
+                        input_path, extracted_wav, cancel_token=cancel_token, stream_index=0
+                    )
+                    raw_ok2 = FFmpegUtils.extract_transcription_audio(
+                        input_path, extracted_wav2, cancel_token=cancel_token, stream_index=1
+                    )
+                    if cancel_token is not None:
+                        cancel_token.check()
+                    update(f"[Profile] Dual-track audio extract finished in {time.time() - t0:.2f}s")
+                    if raw_ok:
+                        wav_path = extracted_wav
+                        if cached_audio_path:
+                            audio_cached = Orchestrator._save_cached_audio(extracted_wav, cached_audio_path)
+                    if raw_ok2:
+                        track2_wav_path = extracted_wav2
+                        if cached_track2_path:
+                            dual_track_cached = Orchestrator._save_cached_audio(
+                                extracted_wav2, cached_track2_path
+                            )
+                    if not raw_ok and raw_ok2:
+                        wav_path = extracted_wav2
+                        track2_wav_path = None
+                    elif not raw_ok and not raw_ok2:
+                        has_audio = False
                 else:
-                    has_audio = False
+                    msg_ex = (
+                        f"Смешивание {num_audio_streams} аудиодорожек (16 кГц моно)..."
+                        if track_strategy == "mix"
+                        else "Извлечение аудиодорожки (16 кГц моно)..."
+                    )
+                    update(msg_ex)
+                    raw_ok = FFmpegUtils.extract_transcription_audio(
+                        input_path,
+                        extracted_wav,
+                        cancel_token=cancel_token,
+                        mix_all_streams=(track_strategy == "mix"),
+                        num_streams=num_audio_streams,
+                    )
+                    if cancel_token is not None:
+                        cancel_token.check()
+                    update(f"[Profile] Audio extract finished in {time.time() - t0:.2f}s")
+                    if raw_ok:
+                        wav_path = extracted_wav
+                        if cached_audio_path:
+                            audio_cached = Orchestrator._save_cached_audio(extracted_wav, cached_audio_path)
+                    else:
+                        has_audio = False
+
+                if wav_path and duration <= 0.0:
+                    try:
+                        with wave.open(wav_path, "rb") as wf:
+                            fr = wf.getframerate() or 16000
+                            duration = wf.getnframes() / float(fr)
+                    except Exception:
+                        pass
 
         if cancel_token is not None:
             cancel_token.check()
@@ -596,6 +760,22 @@ class Orchestrator:
             )
             with open(staged_txt_path, "w", encoding="utf-8") as f:
                 f.write(empty_txt)
+        elif track2_wav_path and os.path.isfile(track2_wav_path):
+            update("Запуск двухдорожечной транскрибации (Дорожка 1 = Спикер 1, Дорожка 2 = собеседники)...")
+            Transcriber.transcribe_dual_track_files(
+                track1_wav_path=wav_path,
+                track2_wav_path=track2_wav_path,
+                output_txt_path=staged_txt_path,
+                asr_model=asr_model,
+                speaker_count=speaker_count,
+                threads=asr_threads,
+                compute_device=requested_device,
+                status_cb=update,
+                cancel_token=cancel_token,
+                language=language,
+                custom_prompt=custom_prompt,
+                diarization_sensitivity=diarization_sensitivity,
+            )
         else:
             update("Запуск локальной транскрибации по ролям...")
             Transcriber.transcribe_audio_file(
@@ -608,6 +788,8 @@ class Orchestrator:
                 status_cb=update,
                 cancel_token=cancel_token,
                 language=language,
+                custom_prompt=custom_prompt,
+                diarization_sensitivity=diarization_sensitivity,
             )
 
         if cancel_token is not None:
@@ -626,5 +808,6 @@ class Orchestrator:
             "transcript_ready": transcript_ready,
             "transcript_path": transcript_path if transcript_ready else None,
             "audio_cached": audio_cached,
+            "dual_track_cached": dual_track_cached,
         }
 

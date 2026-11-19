@@ -6,10 +6,14 @@ from src.config import (
     APP_VERSION,
     ASR_LANGUAGE_OPTIONS,
     ASR_MODEL_PROFILES,
+    AUDIO_TRACK_MODE_OPTIONS,
     COMPUTE_DEVICE_OPTIONS,
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
+    DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DIARIZATION_SENSITIVITY,
+    DIARIZATION_SENSITIVITY_OPTIONS,
     MAX_ALLOWED_WORKERS,
     MAX_WORKERS,
     SPEAKER_COUNT_OPTIONS,
@@ -59,10 +63,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"Speech recognition language: ru, auto, en (default: {DEFAULT_ASR_LANGUAGE})",
     )
     parser.add_argument(
+        "--prompt",
+        default="",
+        help="Optional custom domain glossary / initial_prompt (e.g. 'REST, gRPC, OAuth 2, JWT, PostgreSQL')",
+    )
+    parser.add_argument(
         "--speakers",
         choices=SPEAKER_COUNT_OPTIONS,
         default="auto",
         help="Speaker count hint for diarization (default: auto)",
+    )
+    parser.add_argument(
+        "--sensitivity",
+        choices=DIARIZATION_SENSITIVITY_OPTIONS,
+        default=DEFAULT_DIARIZATION_SENSITIVITY,
+        help=f"Diarization sensitivity for similar voices: normal, high, low (default: {DEFAULT_DIARIZATION_SENSITIVITY})",
+    )
+    parser.add_argument(
+        "--audio-tracks",
+        choices=AUDIO_TRACK_MODE_OPTIONS,
+        default=DEFAULT_AUDIO_TRACK_MODE,
+        help=f"Multi-track audio handling (e.g. OBS separate mic+system tracks): auto, separate, mix, first (default: {DEFAULT_AUDIO_TRACK_MODE})",
     )
     parser.add_argument(
         "--device",
@@ -91,6 +112,9 @@ def process_video(
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     workers: int = MAX_WORKERS,
     transcribe_only: bool = False,
+    custom_prompt: str = "",
+    diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+    audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
 ) -> dict:
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
@@ -115,6 +139,9 @@ def process_video(
                 language=language,
                 speaker_count=speaker_count,
                 compute_device=compute_device,
+                custom_prompt=custom_prompt,
+                diarization_sensitivity=diarization_sensitivity,
+                audio_tracks=audio_tracks,
             )
         else:
             if not output_path:
@@ -130,6 +157,9 @@ def process_video(
                 language=language,
                 speaker_count=speaker_count,
                 compute_device=compute_device,
+                custom_prompt=custom_prompt,
+                diarization_sensitivity=diarization_sensitivity,
+                audio_tracks=audio_tracks,
             )
         if result.get("transcript_ready") and result.get("transcript_path"):
             print(f"Transcript saved to: {result['transcript_path']}")
@@ -167,6 +197,9 @@ def main():
         compute_device=args.device,
         workers=args.workers,
         transcribe_only=args.transcribe_only,
+        custom_prompt=args.prompt,
+        diarization_sensitivity=args.sensitivity,
+        audio_tracks=args.audio_tracks,
     )
 
 

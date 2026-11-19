@@ -14,13 +14,20 @@ from src.config import (
     ASR_LANGUAGE_LABELS,
     ASR_LANGUAGE_OPTIONS,
     ASR_MODEL_PROFILES,
+    ASR_PROMPT_PRESETS,
     AUDIO_CACHE_DIR,
+    AUDIO_TRACK_MODE_LABELS,
+    AUDIO_TRACK_MODE_OPTIONS,
     COMPUTE_DEVICE_OPTIONS,
     CPU_COUNT,
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
+    DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_JOB_MODE,
+    DIARIZATION_SENSITIVITY_OPTIONS,
+    DIARIZATION_SENSITIVITY_PROFILES,
     JOB_MODE_OPTIONS,
     MAX_ALLOWED_WORKERS,
     MAX_CACHED_AUDIO_FILES,
@@ -83,36 +90,47 @@ def _audio_cache_path(task_id: str) -> str:
     return os.path.join(AUDIO_CACHE_DIR, f"{task_id}.wav")
 
 
+def _audio_cache_track2_path(task_id: str) -> str:
+    return os.path.join(AUDIO_CACHE_DIR, f"{task_id}.track2.wav")
+
+
 def _prune_audio_cache(keep_task_id: str | None = None) -> None:
     if not os.path.isdir(AUDIO_CACHE_DIR):
         return
-    entries: list[tuple[float, str]] = []
-    keep_name = f"{keep_task_id}.wav" if keep_task_id else None
+    # Group cached audio files by task_id so track1 + track2 are pruned together
+    by_task: dict[str, tuple[float, list[str]]] = {}
     for fname in os.listdir(AUDIO_CACHE_DIR):
         if not fname.endswith(".wav"):
             continue
         full = os.path.join(AUDIO_CACHE_DIR, fname)
         if not os.path.isfile(full):
             continue
+        if fname.endswith(".track2.wav"):
+            tid = fname[: -len(".track2.wav")]
+        else:
+            tid = fname[: -len(".wav")]
         try:
             mtime = os.path.getmtime(full)
         except OSError:
             mtime = 0.0
-        entries.append((mtime, fname))
+        prev_mtime, paths = by_task.get(tid, (0.0, []))
+        paths.append(full)
+        by_task[tid] = (max(prev_mtime, mtime), paths)
 
-    if len(entries) <= MAX_CACHED_AUDIO_FILES:
+    if len(by_task) <= MAX_CACHED_AUDIO_FILES:
         return
 
-    entries.sort(key=lambda item: item[0], reverse=True)
+    ordered = sorted(by_task.items(), key=lambda item: item[1][0], reverse=True)
     kept = 0
-    for _, fname in entries:
-        if fname == keep_name:
+    for tid, (_, paths) in ordered:
+        if keep_task_id and tid == keep_task_id:
             kept += 1
             continue
         if kept < MAX_CACHED_AUDIO_FILES:
             kept += 1
             continue
-        _safe_remove(os.path.join(AUDIO_CACHE_DIR, fname))
+        for p in paths:
+            _safe_remove(p)
 
 
 def parse_worker_count(raw_workers: str | None) -> int:
@@ -184,6 +202,28 @@ def parse_compute_device(raw_device: str | None) -> str:
     return device
 
 
+def parse_diarization_sensitivity(raw_sens: str | None) -> str:
+    sens = (raw_sens or DEFAULT_DIARIZATION_SENSITIVITY).strip().lower()
+    if sens not in DIARIZATION_SENSITIVITY_OPTIONS:
+        valid = ", ".join(DIARIZATION_SENSITIVITY_OPTIONS)
+        raise HTTPException(status_code=400, detail=f"Unsupported sensitivity '{sens}'. Valid options: {valid}.")
+    return sens
+
+
+def parse_audio_tracks(raw_tracks: str | None) -> str:
+    mode = (raw_tracks or DEFAULT_AUDIO_TRACK_MODE).strip().lower()
+    if mode not in AUDIO_TRACK_MODE_OPTIONS:
+        valid = ", ".join(AUDIO_TRACK_MODE_OPTIONS)
+        raise HTTPException(status_code=400, detail=f"Unsupported audio_tracks '{mode}'. Valid options: {valid}.")
+    return mode
+
+
+def parse_custom_prompt(raw_prompt: str | None) -> str:
+    if not raw_prompt:
+        return ""
+    return " ".join(str(raw_prompt).split())[:600]
+
+
 def _safe_remove(path: str | None) -> None:
     if path and os.path.exists(path):
         try:
@@ -204,6 +244,9 @@ def background_process(
     compute_device: str = DEFAULT_COMPUTE_DEVICE,
     language: str = DEFAULT_ASR_LANGUAGE,
     original_filename: str = "",
+    custom_prompt: str = "",
+    diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+    audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -218,7 +261,8 @@ def background_process(
     init_logs = ["Initializing...", f"Worker count: {worker_count}"]
     if transcribe_enabled:
         init_logs.append(
-            f"Auto-transcription: ON (model={asr_model}, lang={language}, device={compute_device}, speakers={speakers})"
+            f"Auto-transcription: ON (model={asr_model}, lang={language}, device={compute_device}, "
+            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks})"
         )
     else:
         init_logs.append("Auto-transcription: OFF")
@@ -239,6 +283,9 @@ def background_process(
         "language": language,
         "speakers": speakers,
         "compute_device": compute_device,
+        "custom_prompt": custom_prompt,
+        "diarization_sensitivity": diarization_sensitivity,
+        "audio_tracks": audio_tracks,
         "original_filename": original_filename or tasks.get(task_id, {}).get("original_filename", ""),
     }
 
@@ -254,6 +301,7 @@ def background_process(
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
     cached_audio_path = _audio_cache_path(task_id)
+    cached_track2_path = _audio_cache_track2_path(task_id)
 
     try:
         result = Orchestrator.process_video_job(
@@ -270,6 +318,10 @@ def background_process(
             cancel_token=cancel_token,
             language=language,
             cached_audio_path=cached_audio_path,
+            cached_track2_path=cached_track2_path,
+            custom_prompt=custom_prompt,
+            diarization_sensitivity=diarization_sensitivity,
+            audio_tracks=audio_tracks,
         )
         cancel_token.check()
         video_ready = bool(result.get("video_ready"))
@@ -318,6 +370,7 @@ def background_process(
             _safe_remove(output_path)
             _safe_remove(transcript_path)
             _safe_remove(cached_audio_path)
+            _safe_remove(cached_track2_path)
 
 
 def background_transcribe_only(
@@ -334,6 +387,10 @@ def background_transcribe_only(
     delete_input_after: bool = True,
     source_note: str | None = None,
     original_filename: str = "",
+    custom_prompt: str = "",
+    diarization_sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+    audio_tracks: str = DEFAULT_AUDIO_TRACK_MODE,
+    input_track2_path: str | None = None,
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -355,7 +412,10 @@ def background_transcribe_only(
     mode_label = "Отдельная транскрибация записи" if is_post_transcribe else "Режим «Только транскрибация»"
     init_logs = [
         f"{mode_label}...",
-        f"Параметры: model={asr_model}, lang={language}, device={compute_device}, speakers={speakers}, threads={worker_count}",
+        (
+            f"Параметры: model={asr_model}, lang={language}, device={compute_device}, "
+            f"speakers={speakers}, sensitivity={diarization_sensitivity}, tracks={audio_tracks}, threads={worker_count}"
+        ),
     ]
 
     tasks[task_id] = {
@@ -374,6 +434,9 @@ def background_transcribe_only(
         "language": language,
         "speakers": speakers,
         "compute_device": compute_device,
+        "custom_prompt": custom_prompt,
+        "diarization_sensitivity": diarization_sensitivity,
+        "audio_tracks": audio_tracks,
         "original_filename": saved_filename,
     }
 
@@ -389,9 +452,11 @@ def background_transcribe_only(
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
     cached_audio_path = _audio_cache_path(task_id)
+    cached_track2_path = _audio_cache_track2_path(task_id)
     # Cache original 16 kHz audio for fresh transcribe_only uploads so user can
     # re-transcribe with another model without re-uploading the media file.
     cache_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_audio_path
+    cache_track2_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_track2_path
 
     try:
         result = Orchestrator.process_transcription_only_job(
@@ -406,8 +471,13 @@ def background_transcribe_only(
             compute_device=compute_device,
             cancel_token=cancel_token,
             cached_audio_path=cache_target,
+            cached_track2_path=cache_track2_target,
             input_is_wav_16k=input_is_wav_16k,
+            input_track2_path=input_track2_path,
             source_note=source_note,
+            custom_prompt=custom_prompt,
+            diarization_sensitivity=diarization_sensitivity,
+            audio_tracks=audio_tracks,
         )
         cancel_token.check()
         has_orig_audio = os.path.isfile(cached_audio_path)
@@ -461,6 +531,7 @@ def background_transcribe_only(
         ):
             _safe_remove(transcript_path)
             _safe_remove(cached_audio_path)
+            _safe_remove(cached_track2_path)
 
 
 @app.get("/")
@@ -500,6 +571,20 @@ async def get_config():
             for code in ASR_LANGUAGE_OPTIONS
         ],
         "speaker_options": SPEAKER_COUNT_OPTIONS,
+        "default_diarization_sensitivity": DEFAULT_DIARIZATION_SENSITIVITY,
+        "diarization_sensitivities": [
+            {"id": p["id"], "label": p["label"]}
+            for p in DIARIZATION_SENSITIVITY_PROFILES.values()
+        ],
+        "default_audio_track_mode": DEFAULT_AUDIO_TRACK_MODE,
+        "audio_track_modes": [
+            {"id": code, "label": AUDIO_TRACK_MODE_LABELS.get(code, code)}
+            for code in AUDIO_TRACK_MODE_OPTIONS
+        ],
+        "prompt_presets": [
+            {"id": p["id"], "label": p["label"], "prompt": p["prompt"]}
+            for p in ASR_PROMPT_PRESETS.values()
+        ],
         "cuda_available": probe_cuda_available(),
         "default_compute_device": DEFAULT_COMPUTE_DEVICE,
         "compute_devices": [
@@ -520,6 +605,9 @@ async def upload_video(
     language: str = Form(DEFAULT_ASR_LANGUAGE),
     speakers: str = Form("auto"),
     compute_device: str = Form(DEFAULT_COMPUTE_DEVICE),
+    custom_prompt: str = Form(""),
+    diarization_sensitivity: str = Form(DEFAULT_DIARIZATION_SENSITIVITY),
+    audio_tracks: str = Form(DEFAULT_AUDIO_TRACK_MODE),
 ):
     job_mode = parse_job_mode(mode)
     filename = file.filename or ""
@@ -544,6 +632,9 @@ async def upload_video(
     language_id = parse_language(language)
     speaker_mode = parse_speaker_count(speakers)
     device_mode = parse_compute_device(compute_device)
+    prompt_clean = parse_custom_prompt(custom_prompt)
+    sensitivity_mode = parse_diarization_sensitivity(diarization_sensitivity)
+    track_mode = parse_audio_tracks(audio_tracks)
 
     task_id = str(uuid.uuid4())
     input_path = os.path.join("uploads", f"{task_id}{ext}")
@@ -580,6 +671,9 @@ async def upload_video(
         "language": language_id,
         "speakers": speaker_mode,
         "compute_device": device_mode,
+        "custom_prompt": prompt_clean,
+        "diarization_sensitivity": sensitivity_mode,
+        "audio_tracks": track_mode,
         "original_filename": os.path.basename(filename),
     }
 
@@ -599,6 +693,10 @@ async def upload_video(
             True,
             None,
             os.path.basename(filename),
+            prompt_clean,
+            sensitivity_mode,
+            track_mode,
+            None,
         )
     else:
         background_tasks.add_task(
@@ -614,6 +712,9 @@ async def upload_video(
             device_mode,
             language_id,
             os.path.basename(filename),
+            prompt_clean,
+            sensitivity_mode,
+            track_mode,
         )
 
     return {
@@ -627,6 +728,9 @@ async def upload_video(
         "language": language_id,
         "speakers": speaker_mode,
         "compute_device": device_mode,
+        "custom_prompt": prompt_clean,
+        "diarization_sensitivity": sensitivity_mode,
+        "audio_tracks": track_mode,
     }
 
 
@@ -639,12 +743,15 @@ async def transcribe_existing_recording(
     language: str = Form(DEFAULT_ASR_LANGUAGE),
     speakers: str = Form("auto"),
     compute_device: str = Form(DEFAULT_COMPUTE_DEVICE),
+    custom_prompt: str = Form(""),
+    diarization_sensitivity: str = Form(DEFAULT_DIARIZATION_SENSITIVITY),
+    audio_tracks: str = Form(DEFAULT_AUDIO_TRACK_MODE),
 ):
     """
     Creates (or re-creates) a speaker-diarized .txt transcript separately for
     an already-created recording without re-uploading or re-blurring video.
-    Prefers cached original un-pitched 16 kHz audio when available, falling
-    back seamlessly to output/<task_id>_anonymized.mp4.
+    Prefers cached original un-pitched 16 kHz audio (incl. dual-track cache)
+    when available, falling back seamlessly to output/<task_id>_anonymized.mp4.
     """
     _validate_task_id(task_id)
 
@@ -657,20 +764,27 @@ async def transcribe_existing_recording(
     language_id = parse_language(language)
     speaker_mode = parse_speaker_count(speakers)
     device_mode = parse_compute_device(compute_device)
+    prompt_clean = parse_custom_prompt(custom_prompt)
+    sensitivity_mode = parse_diarization_sensitivity(diarization_sensitivity)
+    track_mode = parse_audio_tracks(audio_tracks)
 
     cached_wav = _audio_cache_path(task_id)
+    cached_track2_wav = _audio_cache_track2_path(task_id)
     video_path = os.path.join("output", f"{task_id}_anonymized.mp4")
     transcript_path = os.path.join("output", f"{task_id}_transcript.txt")
 
     has_cached_wav = os.path.isfile(cached_wav)
+    has_cached_track2 = os.path.isfile(cached_track2_wav)
     has_video = os.path.isfile(video_path)
 
     if has_cached_wav:
         source_path = cached_wav
+        source_track2_path = cached_track2_wav if has_cached_track2 else None
         input_is_wav_16k = True
         source_note = None
     elif has_video:
         source_path = video_path
+        source_track2_path = None
         input_is_wav_16k = False
         source_note = (
             "Оригинальное аудио не найдено в кэше сессии — извлечение звука из сохранённой записи..."
@@ -702,6 +816,9 @@ async def transcribe_existing_recording(
         "language": language_id,
         "speakers": speaker_mode,
         "compute_device": device_mode,
+        "custom_prompt": prompt_clean,
+        "diarization_sensitivity": sensitivity_mode,
+        "audio_tracks": track_mode,
         "original_filename": prev_filename,
     }
 
@@ -720,6 +837,10 @@ async def transcribe_existing_recording(
         False,
         source_note,
         prev_filename,
+        prompt_clean,
+        sensitivity_mode,
+        track_mode,
+        source_track2_path,
     )
 
     return {
@@ -732,6 +853,9 @@ async def transcribe_existing_recording(
         "language": language_id,
         "speakers": speaker_mode,
         "compute_device": device_mode,
+        "custom_prompt": prompt_clean,
+        "diarization_sensitivity": sensitivity_mode,
+        "audio_tracks": track_mode,
         "using_original_audio": has_cached_wav,
     }
 

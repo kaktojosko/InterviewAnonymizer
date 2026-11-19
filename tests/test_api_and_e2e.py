@@ -79,6 +79,9 @@ def test_cli_arg_parser():
     assert args_default.asr_model == "gigaam-v3"
     assert args_default.language == "ru"
     assert args_default.speakers == "auto"
+    assert args_default.sensitivity == "normal"
+    assert args_default.audio_tracks == "auto"
+    assert args_default.prompt == ""
     assert args_default.device == "cpu"
     assert args_default.transcript_output is None
 
@@ -96,7 +99,13 @@ def test_cli_arg_parser():
             "--language",
             "auto",
             "--speakers",
-            "2",
+            "4",
+            "--sensitivity",
+            "high",
+            "--audio-tracks",
+            "separate",
+            "--prompt",
+            "REST, gRPC, OAuth 2",
             "--device",
             "cuda",
             "-w",
@@ -106,7 +115,10 @@ def test_cli_arg_parser():
     assert args_custom.no_transcribe is True
     assert args_custom.asr_model == "large-v3-ru"
     assert args_custom.language == "auto"
-    assert args_custom.speakers == "2"
+    assert args_custom.speakers == "4"
+    assert args_custom.sensitivity == "high"
+    assert args_custom.audio_tracks == "separate"
+    assert args_custom.prompt == "REST, gRPC, OAuth 2"
     assert args_custom.device == "cuda"
     assert args_custom.transcript_output == "dialog.txt"
     assert args_custom.workers == 1
@@ -126,6 +138,11 @@ def test_api_root_and_config():
     assert "transcribeToggle" in root_resp.text
     assert "languageSelect" in root_resp.text
     assert "computeDeviceSelect" in root_resp.text
+    assert "diarizationSensitivitySelect" in root_resp.text
+    assert "audioTracksSelect" in root_resp.text
+    assert "customPromptInput" in root_resp.text
+    assert "promptPresets" in root_resp.text
+    assert "postCustomPromptInput" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
     assert "postTranscribeBtn" in root_resp.text
     assert "recordingsSection" in root_resp.text
@@ -135,7 +152,7 @@ def test_api_root_and_config():
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
     data = cfg_resp.json()
-    assert data["version"] == "4.5.0"
+    assert data["version"] == "4.6.0"
 
     assert data["default_job_mode"] == "anonymize"
     assert [m["id"] for m in data["job_modes"]] == ["anonymize", "transcribe_only"]
@@ -148,7 +165,14 @@ def test_api_root_and_config():
     assert [d["id"] for d in data["compute_devices"]] == ["cpu", "cuda"]
     model_ids = [m["id"] for m in data["asr_models"]]
     assert model_ids == ["gigaam-v3", "large-v3-ru", "turbo", "large-v3", "parakeet", "small"]
-    assert data["speaker_options"] == ["auto", "2", "3", "4+"]
+    assert data["speaker_options"] == ["auto", "2", "3", "4", "5", "6", "4+"]
+    assert data["default_diarization_sensitivity"] == "normal"
+    assert [s["id"] for s in data["diarization_sensitivities"]] == ["normal", "high", "low"]
+    assert data["default_audio_track_mode"] == "auto"
+    assert [m["id"] for m in data["audio_track_modes"]] == ["auto", "separate", "mix", "first"]
+    preset_ids = [p["id"] for p in data["prompt_presets"]]
+    assert "system_analyst" in preset_ids
+    assert "backend_devops" in preset_ids
 
 
 def test_api_upload_validation_errors():
@@ -194,6 +218,20 @@ def test_api_upload_validation_errors():
         data={"speakers": "99"},
     )
     assert r_spk.status_code == 400
+
+    r_sens = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"diarization_sensitivity": "ultra_invalid"},
+    )
+    assert r_sens.status_code == 400
+
+    r_tracks = client.post(
+        "/api/upload",
+        files={"file": ("clip.mp4", b"dummy", "video/mp4")},
+        data={"audio_tracks": "stereo_magic"},
+    )
+    assert r_tracks.status_code == 400
 
     r_dev = client.post(
         "/api/upload",
@@ -313,6 +351,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         status_cb=None,
         cancel_token=None,
         language: str = "ru",
+        custom_prompt: str = "",
     ):
         events.append(("gpu_asr", compute_device, threads))
         if status_cb:
@@ -323,6 +362,7 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
             "duration_sec": 2.4,
             "units": [TimedUnit(0.1, 0.9, " GPU OK")],
             "profile_id": asr_model,
+            "custom_prompt": custom_prompt,
             "elapsed_asr": 0.01,
         }
 
@@ -334,6 +374,8 @@ def test_orchestrator_parallel_gpu_mode(tmp_path, monkeypatch):
         threads: int = 4,
         status_cb=None,
         cancel_token=None,
+        diarization_sensitivity: str = "normal",
+        custom_prompt: str = "",
     ):
         events.append(("cpu_diarize", speaker_count, threads))
         if status_cb:
@@ -564,6 +606,8 @@ def test_fastapi_e2e_upload_transcribe_on_and_off(tmp_path, monkeypatch):
         status_cb=None,
         cancel_token=None,
         language: str = "ru",
+        custom_prompt: str = "",
+        diarization_sensitivity: str = "normal",
     ):
         assert os.path.isfile(wav_path)
         turns = [
@@ -1225,6 +1269,8 @@ def test_post_recording_separate_transcription_cache_fallback_and_recordings_api
         status_cb=None,
         cancel_token=None,
         language: str = "ru",
+        custom_prompt: str = "",
+        diarization_sensitivity: str = "normal",
     ):
         calls.append({"wav_path": wav_path, "asr_model": asr_model, "language": language, "speakers": speaker_count})
         turns = [SpeakerTurn(0.1, 1.2, "Спикер 1", f"Модель {asr_model} ({language})")]
@@ -1451,6 +1497,8 @@ def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, m
         status_cb=None,
         cancel_token=None,
         language: str = "ru",
+        custom_prompt: str = "",
+        diarization_sensitivity: str = "normal",
     ):
         seen_models.append((asr_model, language))
         turns = [SpeakerTurn(0.0, 1.0, "Спикер 1", "Тест только транскрибации.")]
@@ -2040,6 +2088,640 @@ def test_ffmpeg_metadata_handles_na_duration_and_invalid_sample_rate(monkeypatch
     assert has_audio is True
     assert abs(duration - 12.5) < 1e-6
     assert sample_rate == 44100
+
+
+def test_dual_track_obs_mp4_automatic_split_and_mix_e2e(tmp_path, monkeypatch):
+    from app import _audio_cache_path, _audio_cache_track2_path
+
+    obs_mp4 = str(tmp_path / "obs_dual_track.mp4")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=15:duration=1.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=44100:duration=1.6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:sample_rate=44100:duration=1.6",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-map",
+            "2:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
+            obs_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    streams = FFmpegUtils.get_audio_streams(obs_mp4)
+    assert len(streams) == 2
+
+    dual_calls = []
+    single_calls = []
+
+    def _mock_dual(
+        cls,
+        track1_wav_path: str,
+        track2_wav_path: str,
+        output_txt_path: str,
+        asr_model: str = "gigaam-v3",
+        speaker_count: str = "auto",
+        threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
+        status_cb=None,
+        cancel_token=None,
+        language: str = "ru",
+        custom_prompt: str = "",
+        diarization_sensitivity: str = "normal",
+    ):
+        assert os.path.isfile(track1_wav_path)
+        assert os.path.isfile(track2_wav_path)
+        assert os.path.abspath(track1_wav_path) != os.path.abspath(track2_wav_path)
+        with wave.open(track1_wav_path, "rb") as w1, wave.open(track2_wav_path, "rb") as w2:
+            assert w1.getframerate() == 16000 and w1.getnchannels() == 1
+            assert w2.getframerate() == 16000 and w2.getnchannels() == 1
+        dual_calls.append(
+            {
+                "t1": track1_wav_path,
+                "t2": track2_wav_path,
+                "speakers": speaker_count,
+                "sensitivity": diarization_sensitivity,
+                "prompt": custom_prompt,
+            }
+        )
+        txt = format_transcript_txt(
+            [
+                SpeakerTurn(0.1, 0.8, "Спикер 1", "Привет из микрофона."),
+                SpeakerTurn(0.9, 1.5, "Спикер 2", "Привет из второй дорожки."),
+            ],
+            duration_sec=1.6,
+            model_name=asr_model,
+            num_speakers=2,
+        )
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return {"num_speakers": 2, "num_turns": 2, "elapsed": 0.01, "dual_track": True}
+
+    def _mock_single(
+        cls,
+        wav_path: str,
+        output_txt_path: str,
+        asr_model: str = "gigaam-v3",
+        speaker_count: str = "auto",
+        threads: int = 1,
+        diar_threads=None,
+        compute_device: str = "cpu",
+        status_cb=None,
+        cancel_token=None,
+        language: str = "ru",
+        custom_prompt: str = "",
+        diarization_sensitivity: str = "normal",
+    ):
+        assert os.path.isfile(wav_path)
+        single_calls.append({"wav": wav_path, "prompt": custom_prompt, "sensitivity": diarization_sensitivity})
+        txt = format_transcript_txt(
+            [SpeakerTurn(0.1, 1.4, "Спикер 1", "Смикшированный звук.")],
+            duration_sec=1.6,
+            model_name=asr_model,
+            num_speakers=1,
+        )
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        return {"num_speakers": 1, "num_turns": 1, "elapsed": 0.01}
+
+    monkeypatch.setattr(Transcriber, "transcribe_dual_track_files", classmethod(_mock_dual))
+    monkeypatch.setattr(Transcriber, "transcribe_audio_file", classmethod(_mock_single))
+
+    client = TestClient(app)
+    created_ids = []
+    try:
+        # 1. Auto mode on 2-track OBS MP4 -> automatic dual-track split + caches BOTH tracks + mixes audio in anon MP4
+        with open(obs_mp4, "rb") as f:
+            r1 = client.post(
+                "/api/upload",
+                files={"file": ("obs_interview.mp4", f, "video/mp4")},
+                data={
+                    "workers": "1",
+                    "mode": "anonymize",
+                    "transcribe": "true",
+                    "asr_model": "gigaam-v3",
+                    "speakers": "4",
+                    "diarization_sensitivity": "high",
+                    "audio_tracks": "auto",
+                    "custom_prompt": "REST, gRPC, OAuth 2",
+                },
+            )
+        assert r1.status_code == 200
+        tid1 = r1.json()["task_id"]
+        created_ids.append(tid1)
+
+        st1 = client.get(f"/api/status/{tid1}").json()
+        assert st1["status"] == "completed"
+        assert st1["video_ready"] is True
+        assert st1["transcript_ready"] is True
+        assert len(dual_calls) == 1
+        assert dual_calls[0]["speakers"] == "4"
+        assert dual_calls[0]["sensitivity"] == "high"
+        assert dual_calls[0]["prompt"] == "REST, gRPC, OAuth 2"
+        assert os.path.isfile(_audio_cache_path(tid1))
+        assert os.path.isfile(_audio_cache_track2_path(tid1))
+
+        # Anonymized video must contain an audio stream (mixed from both OBS tracks)
+        out_mp4 = os.path.join("output", f"{tid1}_anonymized.mp4")
+        assert len(FFmpegUtils.get_audio_streams(out_mp4)) == 1
+
+        # Post-recording re-transcription reuses BOTH cached original tracks!
+        r_post = client.post(
+            f"/api/transcribe/{tid1}",
+            data={
+                "workers": "1",
+                "asr_model": "large-v3-ru",
+                "speakers": "4",
+                "diarization_sensitivity": "high",
+                "audio_tracks": "separate",
+                "custom_prompt": "REST, gRPC",
+            },
+        )
+        assert r_post.status_code == 200
+        assert len(dual_calls) == 2
+        assert os.path.abspath(dual_calls[1]["t1"]) == os.path.abspath(_audio_cache_path(tid1))
+        assert os.path.abspath(dual_calls[1]["t2"]) == os.path.abspath(_audio_cache_track2_path(tid1))
+
+        # 2. Explicit audio_tracks='mix' in transcribe_only mode -> mixes tracks and calls transcribe_audio_file
+        with open(obs_mp4, "rb") as f:
+            r2 = client.post(
+                "/api/upload",
+                files={"file": ("obs_mix.mp4", f, "video/mp4")},
+                data={
+                    "workers": "1",
+                    "mode": "transcribe_only",
+                    "asr_model": "gigaam-v3",
+                    "audio_tracks": "mix",
+                    "diarization_sensitivity": "low",
+                    "custom_prompt": "Kafka, Redis",
+                },
+            )
+        assert r2.status_code == 200
+        tid2 = r2.json()["task_id"]
+        created_ids.append(tid2)
+
+        st2 = client.get(f"/api/status/{tid2}").json()
+        assert st2["status"] == "completed"
+        assert st2["transcript_ready"] is True
+        assert len(dual_calls) == 2
+        assert len(single_calls) == 1
+        assert single_calls[0]["sensitivity"] == "low"
+        assert single_calls[0]["prompt"] == "Kafka, Redis"
+    finally:
+        for tid in created_ids:
+            tasks.pop(tid, None)
+            for p in (
+                os.path.join("output", f"{tid}_anonymized.mp4"),
+                os.path.join("output", f"{tid}_transcript.txt"),
+                _audio_cache_path(tid),
+                _audio_cache_track2_path(tid),
+            ):
+                if os.path.exists(p):
+                    os.remove(p)
+
+
+def test_frontend_v46_glossary_presets_sensitivity_and_tracks():
+    """
+    Executes static/script.js in Node.js to verify v4.6.0 frontend features:
+      1. Custom prompt starts empty (no unsolicited SQL prompt).
+      2. Clicking 'Системный аналитик' preset chip populates #customPromptInput with the
+         System Analyst glossary and shows the GigaAM Latin-terms hint in #transcribeHintText.
+      3. Selecting speakers='4', diarization_sensitivity='high', audio_tracks='separate'
+         submits all v4.6.0 fields to /api/upload and propagates them to /api/transcribe/{tid}.
+      4. Clicking 'Очистить' clears the prompt back to ''.
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const storage = new Map();
+const localStorage = {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+};
+
+class ClassList {
+    constructor(el, initial = []) { this.el = el; this.set = new Set(initial.filter(Boolean)); }
+    add(...cls) { cls.forEach((c) => this.set.add(c)); }
+    remove(...cls) { cls.forEach((c) => this.set.delete(c)); }
+    contains(c) { return this.set.has(c); }
+    toggle(c, force) {
+        const next = force !== undefined ? Boolean(force) : !this.set.has(c);
+        if (next) this.set.add(c); else this.set.delete(c);
+        return next;
+    }
+}
+
+class FakeEvent {
+    constructor(type, opts = {}) {
+        this.type = type;
+        this.bubbles = Boolean(opts.bubbles);
+        this.defaultPrevented = false;
+        this.propagationStopped = false;
+    }
+    preventDefault() { this.defaultPrevented = true; }
+    stopPropagation() { this.propagationStopped = true; }
+}
+
+const byId = new Map();
+let activeElement = null;
+
+class FakeElement {
+    constructor(tagName, { id = '', classes = [], attrs = {}, dataset = {}, text = '' } = {}) {
+        this.tagName = tagName.toUpperCase();
+        this.id = id;
+        if (id) byId.set(id, this);
+        this.classList = new ClassList(this, classes);
+        this.attrs = { ...attrs };
+        this.dataset = { ...dataset };
+        this.children = [];
+        this.parentNode = null;
+        this.listeners = {};
+        this._textContent = text;
+        this._innerHTML = '';
+        this.disabled = false;
+        this.checked = Boolean(attrs.checked);
+        this.title = '';
+        this.accept = attrs.accept || '';
+        this.tabIndex = 0;
+        this.scrollTop = 0;
+        this.scrollHeight = 100;
+        this.files = [];
+        this._value = attrs.value !== undefined ? String(attrs.value) : '';
+        this.selected = Boolean(attrs.selected);
+        this.onclick = null;
+    }
+    get className() { return Array.from(this.classList.set).join(' '); }
+    set className(v) { this.classList = new ClassList(this, String(v).split(/\s+/)); }
+    get textContent() {
+        if (this.children.length === 0) return this._textContent;
+        return this._textContent + this.children.map((c) => c.textContent).join('');
+    }
+    set textContent(v) { this._textContent = String(v); this.children = []; }
+    get innerHTML() { return this._innerHTML; }
+    set innerHTML(v) {
+        this._innerHTML = String(v);
+        if (v === '') {
+            this.children.forEach((c) => { c.parentNode = null; });
+            this.children = [];
+        }
+    }
+    get options() { return this.children.filter((c) => c.tagName === 'OPTION'); }
+    get selectedIndex() {
+        const opts = this.options;
+        const idx = opts.findIndex((o) => o.value === this.value);
+        return idx >= 0 ? idx : 0;
+    }
+    get value() {
+        if (this.tagName === 'SELECT') {
+            const opts = this.options;
+            if (this._value && opts.some((o) => o.value === this._value)) return this._value;
+            const sel = opts.find((o) => o.selected) || opts[0];
+            return sel ? sel.value : '';
+        }
+        return this._value;
+    }
+    set value(v) { this._value = String(v); }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    getAttribute(k) { return this.attrs[k] ?? null; }
+    appendChild(child) {
+        if (child.parentNode) {
+            const idx = child.parentNode.children.indexOf(child);
+            if (idx >= 0) child.parentNode.children.splice(idx, 1);
+        }
+        child.parentNode = this;
+        this.children.push(child);
+        return child;
+    }
+    insertBefore(newNode, refNode) {
+        if (newNode.parentNode) {
+            const oldIdx = newNode.parentNode.children.indexOf(newNode);
+            if (oldIdx >= 0) newNode.parentNode.children.splice(oldIdx, 1);
+        }
+        newNode.parentNode = this;
+        const idx = this.children.indexOf(refNode);
+        if (idx >= 0) this.children.splice(idx, 0, newNode);
+        else this.children.push(newNode);
+        return newNode;
+    }
+    addEventListener(type, fn) {
+        if (!this.listeners[type]) this.listeners[type] = [];
+        this.listeners[type].push(fn);
+    }
+    dispatchEvent(evt) {
+        (this.listeners[evt.type] || []).forEach((fn) => fn.call(this, evt));
+        if (evt.type === 'click' && typeof this.onclick === 'function') this.onclick.call(this, evt);
+        if (evt.bubbles && !evt.propagationStopped) {
+            if (this.parentNode) this.parentNode.dispatchEvent(evt);
+            else documentObj.dispatchEvent(evt);
+        }
+        return !evt.defaultPrevented;
+    }
+    click() { this.dispatchEvent(new FakeEvent('click', { bubbles: true })); }
+    focus() { activeElement = this; }
+    matchesSelector(sel) {
+        if (sel === '.sun-icon') return this.classList.contains('sun-icon');
+        if (sel === '.moon-icon') return this.classList.contains('moon-icon');
+        if (sel === '.prompt-chip') return this.classList.contains('prompt-chip');
+        const lm = sel.match(/^label\[for="(.+)"\]$/);
+        if (lm) return this.tagName === 'LABEL' && this.attrs.for === lm[1];
+        if (sel === '.clay-select-option:not(:disabled)') return this.classList.contains('clay-select-option') && !this.disabled;
+        if (sel === '.clay-select-option.is-selected:not(:disabled)') {
+            return this.classList.contains('clay-select-option') && this.classList.contains('is-selected') && !this.disabled;
+        }
+        return false;
+    }
+    querySelectorAll(sel) {
+        const out = [];
+        const walk = (n) => { n.children.forEach((ch) => { if (ch.matchesSelector(sel)) out.push(ch); walk(ch); }); };
+        walk(this);
+        return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+}
+
+const root = new FakeElement('div', { id: 'root' });
+const makeSelect = (id, opts) => {
+    const container = new FakeElement('div');
+    const sel = new FakeElement('select', { id, classes: ['worker-select'] });
+    opts.forEach(([val, text, selected]) => sel.appendChild(new FakeElement('option', { attrs: { value: val, selected }, text })));
+    container.appendChild(sel);
+    root.appendChild(container);
+    return sel;
+};
+
+const themeBtn = root.appendChild(new FakeElement('button', { id: 'themeToggle' }));
+themeBtn.appendChild(new FakeElement('svg', { classes: ['sun-icon', 'hidden'] }));
+themeBtn.appendChild(new FakeElement('svg', { classes: ['moon-icon', 'hidden'] }));
+
+const uploadPanel = root.appendChild(new FakeElement('div', { id: 'uploadPanel' }));
+uploadPanel.appendChild(new FakeElement('button', { id: 'modeAnonymizeBtn', classes: ['mode-tab', 'is-active'] }));
+uploadPanel.appendChild(new FakeElement('button', { id: 'modeTranscribeOnlyBtn', classes: ['mode-tab'] }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'dropZone' }));
+uploadPanel.appendChild(new FakeElement('h2', { id: 'dropZoneTitle' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'dropZoneHint' }));
+const fileInput = uploadPanel.appendChild(new FakeElement('input', { id: 'fileInput', attrs: { accept: '.mp4' } }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'workerValue', text: '4' }));
+makeSelect('workerSelect', [['1', '1'], ['4', '4', true], ['custom', 'Другое']]);
+uploadPanel.appendChild(new FakeElement('div', { id: 'customWorkerWrap', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'customWorkerInput' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'workerLimitText' }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'transcribeToggle', attrs: { checked: true } }));
+uploadPanel.appendChild(new FakeElement('label', { id: 'transcribeSwitchWrap' }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'transcribeStateBadge', text: 'Вкл' }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
+const transcribeHintText = uploadPanel.appendChild(new FakeElement('p', { id: 'transcribeHintText' }));
+
+const modelOpts = [
+    ['gigaam-v3', 'GigaAM v3', true],
+    ['large-v3-ru', 'Whisper Large v3 RU'],
+    ['turbo', 'Whisper Turbo'],
+];
+const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто'], ['en', 'English (EN)']];
+const devOpts = [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']];
+const spkOpts = [['auto', 'Авто', true], ['2', '2'], ['3', '3'], ['4', '4'], ['5', '5'], ['6', '6'], ['4+', '4+']];
+const sensOpts = [['normal', 'Стандартное', true], ['high', 'Высокое (похожие голоса)'], ['low', 'Мягкое']];
+const trackOpts = [['auto', 'Авто (2 дорожки → Спикер 1 + собеседники)', true], ['separate', 'Раздельно'], ['mix', 'Смешать'], ['first', 'Только 1-я']];
+
+makeSelect('asrModelSelect', modelOpts);
+makeSelect('languageSelect', langOpts);
+makeSelect('computeDeviceSelect', devOpts);
+const speakerCountSelect = makeSelect('speakerCountSelect', spkOpts);
+const diarizationSensitivitySelect = makeSelect('diarizationSensitivitySelect', sensOpts);
+const audioTracksSelect = makeSelect('audioTracksSelect', trackOpts);
+const customPromptInput = uploadPanel.appendChild(new FakeElement('textarea', { id: 'customPromptInput' }));
+const promptPresets = uploadPanel.appendChild(new FakeElement('div', { id: 'promptPresets' }));
+const saChip = promptPresets.appendChild(new FakeElement('button', { classes: ['prompt-chip'], dataset: { preset: 'system_analyst' }, text: 'Системный аналитик' }));
+const clearChip = promptPresets.appendChild(new FakeElement('button', { classes: ['prompt-chip'], dataset: { preset: 'clear' }, text: 'Очистить' }));
+
+uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsSection', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'recordingsCount' }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'recordingsList' }));
+
+const statusPanel = root.appendChild(new FakeElement('div', { id: 'statusPanel', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('div', { id: 'spinner' }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'successIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'cancelIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('h2', { id: 'statusText' }));
+statusPanel.appendChild(new FakeElement('p', { id: 'statusSubText' }));
+statusPanel.appendChild(new FakeElement('div', { id: 'debugLog', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'cancelBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'downloadBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'downloadTranscriptBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeSection', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'togglePostTranscribeBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('div', { id: 'postTranscribeForm', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('span', { id: 'postTranscribeTitle' }));
+makeSelect('postAsrModelSelect', modelOpts);
+makeSelect('postLanguageSelect', langOpts);
+makeSelect('postComputeDeviceSelect', devOpts);
+makeSelect('postSpeakerCountSelect', spkOpts);
+makeSelect('postDiarizationSensitivitySelect', sensOpts);
+makeSelect('postAudioTracksSelect', trackOpts);
+const postCustomPromptInput = statusPanel.appendChild(new FakeElement('textarea', { id: 'postCustomPromptInput' }));
+const postPromptPresets = statusPanel.appendChild(new FakeElement('div', { id: 'postPromptPresets' }));
+postPromptPresets.appendChild(new FakeElement('button', { classes: ['prompt-chip'], dataset: { preset: 'system_analyst' }, text: 'Системный аналитик' }));
+statusPanel.appendChild(new FakeElement('p', { id: 'postAudioSourceHint' }));
+const postTranscribeBtn = statusPanel.appendChild(new FakeElement('button', { id: 'postTranscribeBtn' }));
+statusPanel.appendChild(new FakeElement('button', { id: 'resetBtn', classes: ['hidden'] }));
+
+const docListeners = {};
+const documentObj = {
+    documentElement: new FakeElement('html'),
+    get activeElement() { return activeElement; },
+    getElementById: (id) => byId.get(id) || null,
+    querySelector: (sel) => root.querySelector(sel),
+    querySelectorAll: (sel) => root.querySelectorAll(sel),
+    createElement: (tag) => new FakeElement(tag),
+    createElementNS: (_ns, tag) => new FakeElement(tag),
+    addEventListener: (t, fn) => { (docListeners[t] ||= []).push(fn); },
+    dispatchEvent: (evt) => { (docListeners[evt.type] || []).forEach((fn) => fn(evt)); },
+};
+
+class FakeFormData {
+    constructor() { this.entries = {}; }
+    append(k, v) { this.entries[k] = v; }
+}
+
+const uploadCalls = [];
+const postCalls = [];
+const fakeFetch = async (url, opts = {}) => {
+    if (url === '/api/config') {
+        return {
+            ok: true,
+            json: async () => ({
+                version: '4.6.0',
+                cpu_count: 8,
+                default_workers: 4,
+                max_workers: 7,
+                transcription_default: true,
+                default_asr_model: 'gigaam-v3',
+                default_language: 'ru',
+                default_diarization_sensitivity: 'normal',
+                default_audio_track_mode: 'auto',
+                asr_models: [
+                    { id: 'gigaam-v3', label: 'GigaAM v3', supports_cuda: false },
+                    { id: 'large-v3-ru', label: 'Whisper Large v3 RU', supports_cuda: true },
+                    { id: 'turbo', label: 'Whisper Turbo', supports_cuda: true },
+                ],
+                languages: [{ id: 'ru', label: 'Русский (RU)' }, { id: 'auto', label: 'Авто' }],
+                diarization_sensitivities: [
+                    { id: 'normal', label: 'Стандартное' },
+                    { id: 'high', label: 'Высокое (похожие голоса)' },
+                    { id: 'low', label: 'Мягкое' },
+                ],
+                audio_track_modes: [
+                    { id: 'auto', label: 'Авто' },
+                    { id: 'separate', label: 'Раздельно' },
+                    { id: 'mix', label: 'Смешать' },
+                    { id: 'first', label: 'Только 1-я' },
+                ],
+                prompt_presets: [
+                    {
+                        id: 'system_analyst',
+                        label: 'Системный аналитик',
+                        prompt: 'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, OAuth 2',
+                    },
+                ],
+                cuda_available: false,
+                default_compute_device: 'cpu',
+                compute_devices: [{ id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU (CUDA)' }],
+            }),
+        };
+    }
+    if (url === '/api/recordings') return { ok: true, json: async () => ({ recordings: [] }) };
+    if (url === '/api/upload') {
+        uploadCalls.push({ ...opts.body.entries });
+        return { ok: true, json: async () => ({ task_id: 'v46-task', status: 'queued', worker_count: 4 }) };
+    }
+    if (url === '/api/status/v46-task') {
+        return {
+            ok: true,
+            json: async () => ({
+                status: 'completed',
+                mode: 'anonymize',
+                video_ready: true,
+                transcript_ready: true,
+                can_transcribe: true,
+                has_original_audio: true,
+                asr_model: 'gigaam-v3',
+                language: 'ru',
+                speakers: '4',
+                diarization_sensitivity: 'high',
+                audio_tracks: 'separate',
+                custom_prompt: uploadCalls[0].custom_prompt,
+                logs: ['Done!'],
+            }),
+        };
+    }
+    if (url === '/api/transcribe/v46-task') {
+        postCalls.push({ ...opts.body.entries });
+        return { ok: true, json: async () => ({ task_id: 'v46-task', status: 'queued' }) };
+    }
+    throw new Error('Unexpected URL: ' + url);
+};
+
+const ctx = vm.createContext({
+    document: documentObj,
+    window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+    localStorage,
+    Event: FakeEvent,
+    FormData: FakeFormData,
+    AbortController: class { constructor() { this.signal = {}; } abort() {} },
+    fetch: fakeFetch,
+    setInterval: () => 1,
+    clearInterval: () => {},
+    alert: (m) => { throw new Error('Unexpected alert: ' + m); },
+    console,
+    Number, String, Boolean, Array, Map, Set, Date,
+});
+vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
+
+(async () => {
+    await new Promise((r) => setTimeout(r, 25));
+
+    // 1. Default prompt is strictly empty (never auto-injected!)
+    assert.strictEqual(customPromptInput.value, '');
+
+    // 2. Click 'Системный аналитик' preset chip -> fills glossary & shows GigaAM Latin hint
+    saChip.click();
+    assert.ok(customPromptInput.value.includes('gRPC'));
+    assert.ok(customPromptInput.value.includes('OAuth 2'));
+    assert.ok(transcribeHintText.textContent.includes('латинские термины'));
+
+    // 3. Pick 4 speakers, high sensitivity, separate tracks -> upload sends all fields
+    speakerCountSelect.value = '4';
+    speakerCountSelect.dispatchEvent(new ctx.Event('change'));
+    diarizationSensitivitySelect.value = 'high';
+    diarizationSensitivitySelect.dispatchEvent(new ctx.Event('change'));
+    audioTracksSelect.value = 'separate';
+    audioTracksSelect.dispatchEvent(new ctx.Event('change'));
+
+    fileInput.files = [{ name: 'obs_4_women.mp4' }];
+    fileInput.dispatchEvent(new ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 25));
+
+    assert.strictEqual(uploadCalls.length, 1);
+    assert.strictEqual(uploadCalls[0].speakers, '4');
+    assert.strictEqual(uploadCalls[0].diarization_sensitivity, 'high');
+    assert.strictEqual(uploadCalls[0].audio_tracks, 'separate');
+    assert.ok(uploadCalls[0].custom_prompt.includes('gRPC'));
+
+    // 4. Post-transcribe form inherited v4.6.0 values and submits them on /api/transcribe/{tid}
+    assert.ok(postCustomPromptInput.value.includes('gRPC'));
+    postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(postCalls.length, 1);
+    assert.strictEqual(postCalls[0].speakers, '4');
+    assert.strictEqual(postCalls[0].diarization_sensitivity, 'high');
+    assert.strictEqual(postCalls[0].audio_tracks, 'separate');
+    assert.ok(postCalls[0].custom_prompt.includes('OAuth 2'));
+
+    // 5. Clicking 'Очистить' resets customPromptInput back to ''
+    clearChip.click();
+    assert.strictEqual(customPromptInput.value, '');
+
+    console.log('FRONTEND_V46_GLOSSARY_SENSITIVITY_TRACKS_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node v4.6 UI test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_V46_GLOSSARY_SENSITIVITY_TRACKS_OK" in proc.stdout
+
 
 
 

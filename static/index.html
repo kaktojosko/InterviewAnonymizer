@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=18">
+    <link rel="stylesheet" href="/static/style.css?v=20">
 </head>
 <body>
     <div class="container">
@@ -107,14 +107,45 @@
                                 </select>
                             </div>
                         </div>
+                        <div class="transcribe-grid-2">
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="speakerCountSelect">Число спикеров</label>
+                                <select id="speakerCountSelect" class="worker-select">
+                                    <option value="auto" selected>Авто</option>
+                                    <option value="2">2 спикера</option>
+                                    <option value="3">3 спикера</option>
+                                    <option value="4">4 спикера</option>
+                                    <option value="5">5 спикеров</option>
+                                    <option value="6">6 спикеров</option>
+                                    <option value="4+">4+ спикеров</option>
+                                </select>
+                            </div>
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="diarizationSensitivitySelect">Разделение голосов</label>
+                                <select id="diarizationSensitivitySelect" class="worker-select">
+                                    <option value="normal" selected>Обычная (баланс)</option>
+                                    <option value="high">Высокая (похожие голоса / один пол)</option>
+                                    <option value="low">Низкая (строже объединять)</option>
+                                </select>
+                            </div>
+                        </div>
                         <div class="transcribe-field">
-                            <label class="custom-worker-label" for="speakerCountSelect">Число спикеров</label>
-                            <select id="speakerCountSelect" class="worker-select">
-                                <option value="auto" selected>Авто</option>
-                                <option value="2">2 спикера</option>
-                                <option value="3">3 спикера</option>
-                                <option value="4+">4+ спикеров</option>
+                            <label class="custom-worker-label" for="audioTracksSelect">Аудиодорожки (OBS / раздельный звук)</label>
+                            <select id="audioTracksSelect" class="worker-select">
+                                <option value="auto" selected>Авто (2 дорожки → раздельно, иначе 1)</option>
+                                <option value="separate">Раздельно (1-я = Спикер 1, 2-я = собеседники)</option>
+                                <option value="mix">Смешать все аудиодорожки</option>
+                                <option value="first">Только 1-я аудиодорожка</option>
                             </select>
+                        </div>
+                        <div class="transcribe-field">
+                            <label class="custom-worker-label" for="customPromptInput">Словарь терминов / контекст (опционально)</label>
+                            <textarea id="customPromptInput" class="prompt-textarea" rows="2" maxlength="600" placeholder="Пусто по умолчанию. Укажите IT-термины или аббревиатуры (например: REST, gRPC, OAuth 2, JWT, PostgreSQL, Camunda)..."></textarea>
+                            <div class="prompt-presets" id="promptPresets">
+                                <button type="button" class="prompt-chip" data-preset="system_analyst">Системный аналитик</button>
+                                <button type="button" class="prompt-chip" data-preset="backend_devops">Backend / DevOps</button>
+                                <button type="button" class="prompt-chip prompt-chip-clear" data-preset="clear">Очистить</button>
+                            </div>
                         </div>
                         <p class="worker-settings-hint" id="transcribeHintText">Sber GigaAM v3: лучшая точность на русской речи, пунктуация и регистр. Офлайн на CPU.</p>
                     </div>
@@ -182,14 +213,45 @@
                                         </select>
                                     </div>
                                 </div>
+                                <div class="transcribe-grid-2">
+                                    <div class="transcribe-field">
+                                        <label class="custom-worker-label" for="postSpeakerCountSelect">Число спикеров</label>
+                                        <select id="postSpeakerCountSelect" class="worker-select">
+                                            <option value="auto" selected>Авто</option>
+                                            <option value="2">2 спикера</option>
+                                            <option value="3">3 спикера</option>
+                                            <option value="4">4 спикера</option>
+                                            <option value="5">5 спикеров</option>
+                                            <option value="6">6 спикеров</option>
+                                            <option value="4+">4+ спикеров</option>
+                                        </select>
+                                    </div>
+                                    <div class="transcribe-field">
+                                        <label class="custom-worker-label" for="postDiarizationSensitivitySelect">Разделение голосов</label>
+                                        <select id="postDiarizationSensitivitySelect" class="worker-select">
+                                            <option value="normal" selected>Обычная (баланс)</option>
+                                            <option value="high">Высокая (похожие голоса / один пол)</option>
+                                            <option value="low">Низкая (строже объединять)</option>
+                                        </select>
+                                    </div>
+                                </div>
                                 <div class="transcribe-field">
-                                    <label class="custom-worker-label" for="postSpeakerCountSelect">Число спикеров</label>
-                                    <select id="postSpeakerCountSelect" class="worker-select">
-                                        <option value="auto" selected>Авто</option>
-                                        <option value="2">2 спикера</option>
-                                        <option value="3">3 спикера</option>
-                                        <option value="4+">4+ спикеров</option>
+                                    <label class="custom-worker-label" for="postAudioTracksSelect">Аудиодорожки</label>
+                                    <select id="postAudioTracksSelect" class="worker-select">
+                                        <option value="auto" selected>Авто (2 дорожки → раздельно, иначе 1)</option>
+                                        <option value="separate">Раздельно (1-я = Спикер 1, 2-я = собеседники)</option>
+                                        <option value="mix">Смешать все аудиодорожки</option>
+                                        <option value="first">Только 1-я аудиодорожка</option>
                                     </select>
+                                </div>
+                                <div class="transcribe-field">
+                                    <label class="custom-worker-label" for="postCustomPromptInput">Словарь терминов / контекст (опционально)</label>
+                                    <textarea id="postCustomPromptInput" class="prompt-textarea" rows="2" maxlength="600" placeholder="Пусто по умолчанию. Укажите IT-термины или аббревиатуры..."></textarea>
+                                    <div class="prompt-presets" id="postPromptPresets">
+                                        <button type="button" class="prompt-chip" data-preset="system_analyst">Системный аналитик</button>
+                                        <button type="button" class="prompt-chip" data-preset="backend_devops">Backend / DevOps</button>
+                                        <button type="button" class="prompt-chip prompt-chip-clear" data-preset="clear">Очистить</button>
+                                    </div>
                                 </div>
                                 <p class="worker-settings-hint" id="postAudioSourceHint">Используется оригинальная аудиодорожка (без искажения голоса).</p>
                                 <button id="postTranscribeBtn" class="clay-btn clay-btn-transcript" type="button">Создать транскрипт</button>
@@ -203,10 +265,10 @@
         </main>
         
         <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v4.5.0 (Stable Edition)
+            v4.6.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=19"></script>
+    <script src="/static/script.js?v=20"></script>
 </body>
 </html>
 
