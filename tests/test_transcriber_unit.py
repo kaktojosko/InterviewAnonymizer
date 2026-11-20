@@ -262,7 +262,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v5.1.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v5.2.0)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -3289,5 +3289,345 @@ def test_v511_overlap_pack_batched_pyannote_cloud_llm_concurrency_retry_and_deep
     assert dg_attempts["n"] == 2
     assert len(dg_units) == 1 and dg_units[0].text.strip() == "Ок."
     assert len(dg_diar) == 1
+
+
+def test_v520_long_monologue_split_global_glossary_anti_hallucination_and_diar_edge_fixes(monkeypatch):
+    import json as json_mod
+    from types import SimpleNamespace
+    import httpx
+    import src.llm_postprocessor as llm_mod
+    from src.config import ASR_PROMPT_PRESETS
+    from src.llm_postprocessor import (
+        _build_polish_messages,
+        _merge_glossaries,
+        _parse_glossary_terms,
+        _split_long_turn_into_chunks,
+        _validate_batch_response_detailed,
+        polish_turns_with_local_llm,
+    )
+    from src.transcriber import apply_custom_glossary_terms
+
+    # 1. Sub-turn splitting breaks a ~900-word 6.5-minute monologue along sentence boundaries
+    #    into focused <=155-word chunks, polishes every chunk with Pass-0 global glossary,
+    #    and seamlessly reassembles under the EXACT original (start, end, speaker_label).
+    sentences = [
+        f"Этап {i}: в проекте SmartBio мы интегрировали ЦФ-систему поджирописью с пазгр и ST3 через API-шлюз."
+        for i in range(60)
+    ]
+    monologue_text = " ".join(sentences)  # ~900 words, ~5800 chars
+    chunks = _split_long_turn_into_chunks(monologue_text, max_words=155, max_chars=1050)
+    assert len(chunks) >= 5
+    assert all(len(c.split()) <= 195 for c in chunks)
+    assert " ".join(chunks) == monologue_text
+
+    # 2. End-to-end Pass-0 global glossary + monologue sub-chunking + partial sub-chunk regex rescue
+    sa_prompt = ASR_PROMPT_PRESETS["system_analyst"]["prompt"]
+    assert "DBeaver" in sa_prompt and "S3" in sa_prompt
+
+    long_turns = [
+        SpeakerTurn(10.0, 14.0, "Спикер 1", "Расскажи подробно про опыт работы в Smart Bio."),
+        SpeakerTurn(15.0, 405.0, "Спикер 2", monologue_text),
+        SpeakerTurn(406.0, 412.0, "Спикер 1", "Спасибо, а вы также вели документацию в соSкодо и дебивере?"),
+    ]
+
+    recorded_requests: list[dict] = []
+
+    class _Pass0AndBatchClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            body = dict(json or {})
+            recorded_requests.append(body)
+            sys_txt = body["messages"][0]["content"]
+            usr_txt = body["messages"][1]["content"]
+            # Pass 0 glossary extraction call
+            if "единый глоссарий ключевых сущностей" in sys_txt:
+                content = json_mod.dumps(
+                    {"terms": ["SmartBio", "gRPC", "Docs as Code", "DBeaver", "SmartBio"]},
+                    ensure_ascii=False,
+                )
+                return SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda c=content: {"choices": [{"finish_reason": "stop", "message": {"content": c}}]},
+                )
+
+            payload = json_mod.loads(usr_txt)
+            turns_in = payload["turns"]
+            # Fail the VERY LAST batch (which holds the tail sub-chunk of the split monologue + turn 2)
+            # to verify BOTH partial sub-chunk chunk_fallback_fn rescue AND failed_indices=[2]!
+            if any(t["id"] == len(chunks) + 1 for t in turns_in):
+                return SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"choices": [{"finish_reason": "stop", "message": {"content": "BROKEN JSON"}}]},
+                )
+
+            out_items = []
+            for item in turns_in:
+                fixed = (
+                    item["text"]
+                    .replace("Smart Bio", "SmartBio")
+                    .replace("поджирописью", "по gRPC (LLM)")
+                    .replace("ЦФ-систему", "SFA-систему")
+                    .replace("пазгр", "PostgreSQL")
+                    .replace("ST3", "S3")
+                )
+                out_items.append({"id": item["id"], "text": fixed})
+            content = json_mod.dumps({"turns": out_items}, ensure_ascii=False)
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda c=content: {"choices": [{"finish_reason": "stop", "message": {"content": c}}]},
+            )
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _Pass0AndBatchClient())
+    logs: list[str] = []
+    polished, stats = polish_turns_with_local_llm(
+        turns=long_turns,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+        custom_prompt="gRPC, DBeaver, Docs as Code, S3, PostgreSQL, SFA",
+        api_key="sk-test-v520",
+        status_cb=logs.append,
+        chunk_fallback_fn=lambda t: apply_custom_glossary_terms(t, sa_prompt),
+    )
+
+    assert stats["applied"] is True
+    assert stats["split_turns"] == 1
+    assert stats["chunks_total"] == len(chunks) + 2
+    assert stats["auto_glossary_count"] == 4
+    # Pass 0 fired FIRST and injected canonical 'SmartBio' into every subsequent polish batch without duplicating 'gRPC'
+    assert "единый глоссарий ключевых сущностей" in recorded_requests[0]["messages"][0]["content"]
+    batch_sys_prompts = [r["messages"][0]["content"] for r in recorded_requests[1:]]
+    assert all("SmartBio" in sp for sp in batch_sys_prompts)
+    # Turn 1 (6.5-min monologue) preserved EXACT original timestamps/speaker and reassembled cleanly:
+    # LLM-polished sub-chunks have '(LLM)' AND any failed tail sub-chunk was rescued via chunk_fallback_fn!
+    assert len(polished) == 3
+    assert polished[1].start == pytest.approx(15.0)
+    assert polished[1].end == pytest.approx(405.0)
+    assert polished[1].speaker_label == "Спикер 2"
+    assert "поджирописью" not in polished[1].text
+    assert "по gRPC (LLM)" in polished[1].text and "PostgreSQL" in polished[1].text and "S3" in polished[1].text
+    # Turn 2 failed completely -> recorded in failed_indices
+    assert stats["failed_indices"] == [2]
+    assert any("глобальный глоссарий записи" in m for m in logs)
+
+    # 2b. Verify _merge_glossaries gives user's explicit spelling priority & deduplicates
+    merged = _merge_glossaries("gRPC, PostgreSQL, DBeaver", ["grpc", "SmartBio", "dbeaver", "Docs as Code"])
+    assert "SmartBio" in merged and "Docs as Code" in merged
+    assert merged.lower().count("grpc") == 1
+    assert merged.lower().count("dbeaver") == 1
+    assert _parse_glossary_terms("not json at all") == []
+
+    # 2c. Pass-0 garbage JSON degrades gracefully (polish batches still succeed!)
+    class _Pass0GarbageClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            sys_txt = json["messages"][0]["content"]
+            if "единый глоссарий ключевых сущностей" in sys_txt:
+                return SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda: {"choices": [{"finish_reason": "stop", "message": {"content": "GARBAGE!!!"}}]},
+                )
+            payload = json_mod.loads(json["messages"][1]["content"])
+            out = [{"id": t["id"], "text": t["text"].replace("поджирописью", "по gRPC")} for t in payload["turns"]]
+            content = json_mod.dumps({"turns": out}, ensure_ascii=False)
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda c=content: {"choices": [{"finish_reason": "stop", "message": {"content": c}}]},
+            )
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _Pass0GarbageClient())
+    polished_fb, stats_fb = polish_turns_with_local_llm(
+        turns=long_turns,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+        api_key="sk-test-v520",
+    )
+    assert stats_fb["applied"] is True
+    assert stats_fb["auto_glossary_count"] == 0
+    assert "по gRPC" in polished_fb[1].text
+
+    # 2d. Pass-0 HTTP 401 aborts fast in 1 request (zero wasted batch requests!)
+    auth_calls = {"n": 0}
+
+    class _Pass0401Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            auth_calls["n"] += 1
+            req = httpx.Request("POST", url)
+            raise httpx.HTTPStatusError("401", request=req, response=httpx.Response(401, request=req))
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _Pass0401Client())
+    polished_401, stats_401 = polish_turns_with_local_llm(
+        turns=long_turns,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+        api_key="sk-bad",
+    )
+    assert auth_calls["n"] == 1
+    assert stats_401["applied"] is False
+    assert stats_401["failed_indices"] == [0, 1, 2]
+    assert polished_401[1].text == long_turns[1].text
+
+    # 3. Anti-hallucination script-neutral rewrite_drift guardrail + prompt Russian-disguise instructions:
+    #    - Rejects hallucinated semantic rewrite (sim < 0.42) on turn 0
+    #    - ACCEPTS dense Cyrillic->Latin IT term transliteration on turn 1 in the SAME batch!
+    batch_spec = [
+        (
+            0,
+            "Спикер 1",
+            "Мы хотели пригласить начно С.может сильный специалист а потом ещё обсудить график работы в офисе.",
+        ),
+        (
+            1,
+            "Спикер 2",
+            "Наш стек: постгрес, рэдис, монго дб, конфлюенс, дженкинс, докс эз код.",
+        ),
+    ]
+    raw_resp = json_mod.dumps(
+        {
+            "turns": [
+                {
+                    "id": 0,
+                    "text": "Совет директоров утвердил бюджет квартального маркетинга и закрыл филиал в другом городе.",
+                },
+                {
+                    "id": 1,
+                    "text": "Наш стек: PostgreSQL, Redis, MongoDB, Confluence, Jenkins, Docs as Code.",
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+    validated_map, err_msg, fb_cnt = _validate_batch_response_detailed(raw_resp, batch_spec)
+    assert validated_map is not None and err_msg == ""
+    assert fb_cnt == 1
+    # Turn 0 hallucination rejected -> kept raw ASR; Turn 1 Cyrillic->Latin transliteration ACCEPTED!
+    assert validated_map[0] == batch_spec[0][2]
+    assert validated_map[1] == "Наш стек: PostgreSQL, Redis, MongoDB, Confluence, Jenkins, Docs as Code."
+
+    # Prompt teaches Russian-word disguises & phonetic-match rule while staying free of forbidden SA strings
+    neutral_sys = _build_polish_messages([(0, "Спикер 1", "Привет.")], [], custom_prompt="")[0]["content"]
+    assert "русские обманки" in neutral_sys
+    assert "ФОНЕТИЧЕСКОГО СХОДСТВА" in neutral_sys
+    for forbidden in ("Комунде", "План Юля", "в Джерри", "CRM-систему", "HR-специалиста"):
+        assert forbidden not in neutral_sys
+
+    # 4. New zero-homonym CTC/RNN-T regex fallback rules (only active when custom_prompt has triggers)
+    raw_ctc = (
+        "Документацию ведём в конплюенсе и соSкодо, рисуем вдруiO и сикнсы, "
+        "базы смотрим в Debeaver, пазгр, Reдисом, монгой и ST3, "
+        "интеграция ЦФ-система и SФ-систему через пиш-шлюз, от ТЛП и с дженткенсом."
+    )
+    fixed_ctc = apply_custom_glossary_terms(raw_ctc, sa_prompt)
+    for expected in (
+        "Confluence",
+        "Docs as Code",
+        "в draw.io",
+        "Sequence",
+        "DBeaver",
+        "PostgreSQL",
+        "Redis",
+        "MongoDB",
+        "S3",
+        "SFA-система",
+        "SFA-систему",
+        "API-шлюз",
+        "OTLP",
+        "Jenkins",
+    ):
+        assert expected in fixed_ctc, f"Missing '{expected}' in: {fixed_ctc}"
+    # Homonyms remain 100% protected (Cyrillic 'редис', 'GPT-токены', 'жиры', bare 'C+')
+    homonyms = "Свежий редис, полезные жиры, GPT-токены и оценка C+."
+    assert apply_custom_glossary_terms(homonyms, sa_prompt) == homonyms
+
+    # 5a. Diarization lookahead: leading 00:00:00 segment with emb=None inherits FOLLOWING speaker B (cluster 1),
+    #     NOT arbitrary cluster 0 (Speaker A whose first long anchor is at 1.5..7.5s)!
+    rng = np.random.RandomState(5202026)
+    qr, _ = np.linalg.qr(rng.randn(64, 3))
+    v_a, v_b = qr[:, 0].astype(np.float32), qr[:, 1].astype(np.float32)
+    lead_segs = [
+        DiarizationSegment(0.00, 0.30, speaker=0),   # emb=None leading 00:00:00 -> MUST inherit Speaker B (cluster 1)!
+        DiarizationSegment(0.35, 0.90, speaker=1),   # Short non-anchor (<1.4s) Speaker B continuation
+        DiarizationSegment(1.50, 7.50, speaker=2),   # Speaker A's FIRST long anchor -> cluster 0!
+        DiarizationSegment(8.00, 14.0, speaker=3),   # Speaker B's FIRST long anchor -> cluster 1!
+        DiarizationSegment(14.5, 20.5, speaker=4),   # Speaker A
+        DiarizationSegment(21.0, 27.0, speaker=5),   # Speaker B
+    ]
+    lead_embs = [None, v_b, v_a, v_b, v_a, v_b]
+    clustered_lead = cluster_anchor_embeddings(lead_segs, lead_embs, speaker_count="auto", sensitivity="normal")
+    # 0.00..0.30 inherited Speaker B and merged seamlessly with 0.35..0.90 into [0.00..0.90],
+    # matching Speaker B's 8.00..14.00 turn and NOT Speaker A's 1.50..7.50 turn!
+    assert clustered_lead[0].start == pytest.approx(0.0)
+    assert clustered_lead[0].end == pytest.approx(0.90)
+    spk_a_seg = next(s for s in clustered_lead if s.start >= 1.4 and s.end <= 7.6)
+    spk_b_seg = next(s for s in clustered_lead if s.start >= 7.9 and s.end <= 14.1)
+    assert clustered_lead[0].speaker == spk_b_seg.speaker
+    assert clustered_lead[0].speaker != spk_a_seg.speaker
+
+    # 5b. Edge-clause CAM++ verification: short 0.38s opening (00:00:00) and 0.40s closing clauses
+    #     ARE verified by CAM++ voiceprint even when adjacent clauses share the same initial diarization label!
+    sr = 16000
+    wav_12s = rng.normal(0.0, 0.12, sr * 12).astype(np.float32)
+    # Diarization falsely assigns EVERYTHING to speaker 0
+    all_spk0_diar = [DiarizationSegment(0.0, 12.0, speaker=0)]
+    edge_units = [
+        TimedUnit(0.05, 0.43, " Привет."),          # 0.38s opening spoken by Speaker 1!
+        TimedUnit(1.00, 5.00, " Рассказываю подробно про наш сервис."),  # Speaker 0
+        TimedUnit(6.00, 9.50, " На этом у меня всё."),                  # Speaker 0
+        TimedUnit(10.20, 10.60, " Пока!"),          # 0.40s closing spoken by Speaker 1!
+    ]
+
+    def _edge_embed_fn(_wav, _sr, t_s, t_e):
+        mid = 0.5 * (t_s + t_e)
+        return v_b if (mid < 0.8 or mid > 9.9) else v_a
+
+    edge_turns, edge_n = align_units_to_speakers(
+        edge_units,
+        all_spk0_diar,
+        samples=wav_12s,
+        sample_rate=sr,
+        speaker_centroids={0: v_a, 1: v_b},
+        clause_embed_fn=_edge_embed_fn,
+    )
+    assert edge_n == 2
+    assert len(edge_turns) == 3
+    assert edge_turns[0].text == "Привет."
+    assert edge_turns[1].speaker_label != edge_turns[0].speaker_label
+    assert edge_turns[2].text == "Пока!"
+    assert edge_turns[2].speaker_label == edge_turns[0].speaker_label
+
+    # 5c. Short high-purity leaked tail (0.52s, 2 words) glued onto start of next speaker's unpunctuated clause splits cleanly!
+    tail_diar = [
+        DiarizationSegment(0.0, 0.54, speaker=0),
+        DiarizationSegment(0.56, 3.20, speaker=1),
+    ]
+    tail_units = [
+        TimedUnit(0.02, 0.25, " Да,"),
+        TimedUnit(0.26, 0.54, " спасибо,"),
+        TimedUnit(0.58, 1.10, " хорошо,"),
+        TimedUnit(1.12, 1.80, " тогда"),
+        TimedUnit(1.82, 2.50, " продолжаем"),
+        TimedUnit(2.52, 3.15, " дальше."),
+    ]
+    tail_turns, tail_n = align_units_to_speakers(tail_units, tail_diar)
+    assert tail_n == 2
+    assert len(tail_turns) == 2
+    assert "спасибо" in tail_turns[0].text
+    assert "хорошо" in tail_turns[1].text and "дальше" in tail_turns[1].text
+
 
 

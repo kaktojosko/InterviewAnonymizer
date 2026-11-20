@@ -614,16 +614,46 @@ def cluster_anchor_embeddings(
                     clusters = [c for ci, c in enumerate(clusters) if ci not in to_drop]
 
     def _assign_to_centroids(cent_mat: np.ndarray) -> list[int]:
-        assigned_ids: list[int] = []
-        prev_spk: Optional[int] = None
+        raw_assigned: list[Optional[int]] = []
         for emb_vec in norm_embs:
             if emb_vec is None:
-                spk = prev_spk if prev_spk is not None else 0
+                raw_assigned.append(None)
             else:
                 sims = cent_mat @ emb_vec
-                spk = int(np.argmax(sims))
-            assigned_ids.append(spk)
-            prev_spk = spk
+                raw_assigned.append(int(np.argmax(sims)))
+
+        n_segs = len(raw_assigned)
+        assigned_ids: list[int] = [0] * n_segs
+        for idx, spk in enumerate(raw_assigned):
+            if spk is not None:
+                assigned_ids[idx] = spk
+                continue
+
+            # Find nearest preceding and following segments with a valid voiceprint embedding.
+            # Prevents leading 00:00:00 short/quiet segments from blindly inheriting arbitrary cluster 0.
+            prev_i: Optional[int] = None
+            for j in range(idx - 1, -1, -1):
+                if raw_assigned[j] is not None:
+                    prev_i = j
+                    break
+            next_i: Optional[int] = None
+            for j in range(idx + 1, n_segs):
+                if raw_assigned[j] is not None:
+                    next_i = j
+                    break
+
+            if prev_i is not None and next_i is not None:
+                gap_prev = max(0.0, segments[idx].start - segments[prev_i].end)
+                gap_next = max(0.0, segments[next_i].start - segments[idx].end)
+                assigned_ids[idx] = (
+                    int(raw_assigned[prev_i]) if gap_prev <= gap_next else int(raw_assigned[next_i])
+                )
+            elif next_i is not None:
+                assigned_ids[idx] = int(raw_assigned[next_i])
+            elif prev_i is not None:
+                assigned_ids[idx] = int(raw_assigned[prev_i])
+            else:
+                assigned_ids[idx] = 0
         return assigned_ids
 
     cent_mat = np.stack([_compute_centroid(c) for c in clusters], axis=0)
@@ -1657,26 +1687,29 @@ def _split_unpunctuated_multispeaker_units(
     depth: int = 0,
 ) -> list[list[TimedUnit]]:
     """
-    When Whisper omits punctuation across a fast turn transition (e.g. '...сложно
+    When ASR omits punctuation across a fast turn transition (e.g. '...сложно
     джойном отнести хорошо так ладно раз мы залезли...'), finds the most natural
     syntactic + acoustic speaker transition point without tearing trailing verbs
-    or 1-2 word prefixes away from their clause.
+    or 1-word prefixes away from their clause. Also splits shorter leaked
+    speaker tails (>=0.45s overlap, >=0.50s span) when both sides exhibit high
+    diarization purity (>=0.78).
     """
-    if depth >= 2 or len(clause_units) < 6 or not diar_segments:
+    if depth >= 2 or len(clause_units) < 4 or not diar_segments:
         return [clause_units]
 
     span_start = float(clause_units[0].start)
     span_end = float(clause_units[-1].end)
-    if (span_end - span_start) < 2.4:
+    if (span_end - span_start) < 1.5:
         return [clause_units]
 
     _, ov_map, _ = _score_span_overlap(span_start, span_end, diar_segments, seg_ends)
-    substantial_spks = [spk for spk, ov in ov_map.items() if ov >= 0.65]
+    substantial_spks = [spk for spk, ov in ov_map.items() if ov >= 0.45]
     if len(substantial_spks) < 2:
         return [clause_units]
 
     best_k: Optional[int] = None
     best_score = -1e9
+    best_is_short_tail = False
 
     for k in range(2, len(clause_units) - 1):
         left_s = float(clause_units[0].start)
@@ -1685,7 +1718,11 @@ def _split_unpunctuated_multispeaker_units(
         right_e = float(clause_units[-1].end)
         left_dur = left_e - left_s
         right_dur = right_e - right_s
-        if left_dur < 0.75 or right_dur < 0.75:
+        if left_dur < 0.50 or right_dur < 0.50:
+            continue
+
+        is_short_tail = left_dur < 0.75 or right_dur < 0.75
+        if is_short_tail and len(clause_units) < 4:
             continue
 
         left_spk, left_ov, _ = _score_span_overlap(left_s, left_e, diar_segments, seg_ends)
@@ -1697,7 +1734,9 @@ def _split_unpunctuated_multispeaker_units(
         right_total_ov = sum(right_ov.values()) or max(0.01, right_dur)
         left_purity = left_ov.get(left_spk, 0.0) / left_total_ov
         right_purity = right_ov.get(right_spk, 0.0) / right_total_ov
-        if left_purity < 0.58 or right_purity < 0.58:
+
+        min_purity = 0.78 if is_short_tail else 0.58
+        if left_purity < min_purity or right_purity < min_purity:
             continue
 
         prev_raw = clause_units[k - 1].text.rstrip()
@@ -1718,8 +1757,10 @@ def _split_unpunctuated_multispeaker_units(
         if score > best_score:
             best_score = score
             best_k = k
+            best_is_short_tail = is_short_tail
 
-    if best_k is None or best_score < 1.35:
+    min_accept_score = 1.65 if best_is_short_tail else 1.35
+    if best_k is None or best_score < min_accept_score:
         return [clause_units]
 
     left_part = _split_unpunctuated_multispeaker_units(
@@ -1892,12 +1933,21 @@ def align_units_to_speakers(
             contended = clause_contentions[idx]
             first_word = _clean_word_lower(cl.text.split()[0]) if cl.text.split() else ""
             is_short_reply = dur <= 2.8 and first_word in _RESPONSE_OPENER_WORDS
-            is_turn_boundary = dur >= 0.50 and (
+            is_edge_clause = idx == 0 or idx == len(clauses) - 1
+            is_turn_boundary = dur >= 0.30 and (
                 (idx > 0 and initial_spks[idx - 1] != initial_spks[idx])
                 or (idx + 1 < len(clauses) and initial_spks[idx + 1] != initial_spks[idx])
             )
 
-            if not (ends_q or prev_ends_q or next_ends_q or contended or is_short_reply or is_turn_boundary):
+            if not (
+                ends_q
+                or prev_ends_q
+                or next_ends_q
+                or contended
+                or is_short_reply
+                or is_turn_boundary
+                or is_edge_clause
+            ):
                 continue
 
             v_trim = min(0.05, 0.10 * dur) if dur >= 0.55 else 0.0
@@ -1949,7 +1999,7 @@ def align_units_to_speakers(
             elif contended:
                 req_margin = 0.065 if dur >= 0.90 else 0.090
                 min_abs_sim = 0.42
-            elif is_turn_boundary and not (ends_q or prev_ends_q or next_ends_q or is_short_reply):
+            elif (is_turn_boundary or is_edge_clause) and not (ends_q or prev_ends_q or next_ends_q or is_short_reply):
                 req_margin = 0.095 if dur >= 0.90 else 0.115
                 min_abs_sim = 0.45
             else:
@@ -2389,6 +2439,7 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("gRPC", "по gRPC", (r"поджирописью", r"под[\s\-]?жирописью")),
     ("gRPC", "gRPC", (r"джи[\s\-]?эр[\s\-]?пи[\s\-]?си", r"гэрпэцэ", r"грпц", r"грпс", r"gpc", r"джиэрпис[ию]?")),
     ("HTTP 2.0", "HTTP 2.0", (r"эйч[\s\-]?ти[\s\-]?ти[\s\-]?пи[\s\-]+(?:2\.0|два(?:\s+ноль)?)", r"хттп[\s\-]+(?:2\.0|два(?:\s+ноль)?)")),
+    ("HTTP/1.1", "HTTP/1.1", (r"эйч[\s\-]?ти[\s\-]?ти[\s\-]?пи[\s\-/]+1\.1", r"хттп[\s\-/]+1\.1")),
     ("OAuth 2", "OAuth 2", (r"оау[фтс](?:[\s\-]+(?:2(?:\.0)?|два))?", r"о[\s\-]+ау[фтс][\s\-]+(?:2(?:\.0)?|два)", r"ауф[\s\-]+(?:2(?:\.0)?|два)", r"аут[\s\-]+(?:2(?:\.0)?|два)")),
     ("JWT", "JWT", (r"джей[\s\-]?дабл[\s\-]?ю[\s\-]?ти", r"джей[\s\-]?ви[\s\-]?ти", r"джвт", r"живити", r"гвт", r"gwt")),
     ("Bearer", "Bearer-токены", (r"бирутокены", r"бир[\s\-]?токены")),
@@ -2396,35 +2447,38 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("Bearer", "Bearer-токенов", (r"бирутокенов", r"бир[\s\-]?токенов")),
     ("Bearer", "Bearer-токена", (r"бирутокена", r"бир[\s\-]?токена")),
     ("Bearer", "Bearer", (r"бирер", r"бэрер", r"берер")),
-    ("API-шлюз", "API-шлюз", (r"appi[\s\-]+plues", r"апи[\s\-]+шлюз")),
+    ("API-шлюз", "API-шлюз", (r"appi[\s\-]+plues", r"api[\s\-]+slus", r"апи[\s\-]+шлюз", r"пиш[\s\-]?шлюз", r"пишлюз")),
     ("SOAP", "SOAP", (r"соап", r"соуп")),
     ("JSON", "JSON", (r"джейсон(?:а|е|ом)?", r"джисон(?:а|е|ом)?", r"джесон(?:а|е|ом)?", r"жсон(?:а|е|ом)?", r"geson")),
     ("REST API", "REST API", (r"рест[\s\-]+апи", r"рест[\s\-]+эй[\s\-]?пи[\s\-]?ай")),
     ("REST", "REST", (r"рест(?:а|у|ом|е)?", r"рист(?:а|у|ы|ом|е)?", r"рыст(?:а|у|ом|е)?")),
-    ("PostgreSQL", "PostgreSQL", (r"постгрес[\s\-]?кью[\s\-]?эль", r"постгресс?", r"постгри")),
-    ("Redis", "Redis", (r"рэдис(?:а|е|ом)?",)),
-    ("MongoDB", "MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монга")),
+    ("PostgreSQL", "PostgreSQL", (r"постгрес[\s\-]?кью[\s\-]?эль", r"постгресс?", r"постгри", r"пазгр(?:и|е|а|у|ес)?")),
+    ("Redis", "Redis", (r"рэдис(?:а|е|ом)?", r"reдис(?:а|е|ом)?")),
+    ("MongoDB", "MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монг(?:а|ой|у|е|и)")),
+    ("S3", "S3", (r"st3", r"эс[\s\-]+три")),
+    ("DBeaver", "DBeaver", (r"дебив[еэ]р(?:а|е|ом|у)?", r"дибив[еэ]р(?:а|е|ом|у)?", r"debeaver", r"d[\s\-]?beaver")),
     ("Kafka", "Kafka", (r"кафк[аеуи]",)),
     ("RabbitMQ", "RabbitMQ", (r"рэббит[\s\-]?эм[\s\-]?кью", r"реббит[\s\-]?эм[\s\-]?кью", r"рэббит")),
-    ("Sequence", "Sequence", (r"сиквенс", r"секвенс", r"сиквэнс", r"sipens", r"siven")),
+    ("Sequence", "Sequence", (r"сиквенс", r"секвенс", r"сиквэнс", r"сикнс(?:ы|ов|а|е)?", r"sipens", r"siven")),
     ("Activity", "Activity", (r"активити",)),
     ("BPMN", "BPMN", (r"би[\s\-]?пи[\s\-]?эм[\s\-]?эн", r"бпмн", r"bpen", r"бпен", r"vipmencum")),
     ("ERD", "ERD", (r"и[\s\-]?ар[\s\-]?ди", r"ерд")),
     ("Camunda", "Camunda", (r"камунд[аеуы]", r"комунд[аеуы]")),
     ("PlantUML", "PlantUML", (r"плант[\s\-]?юэмэль", r"плант[\s\-]?юмл", r"план[\s\-]+юля")),
-    ("draw.io", "draw.io", (r"дроу?[\s\-]+ио", r"дру[\s\-]+ио")),
+    ("draw.io", "в draw.io", (r"вдруio",)),
+    ("draw.io", "draw.io", (r"дроу?[\s\-]+ио", r"дру[\s\-]+ио", r"друio")),
     ("UI-kit", "UI-kit", (r"юай[\s\-]?кит(?:а|е|ом)?", r"ui[\s\-]?гид(?:а|е|ом)?")),
     ("use cases", "use cases", (r"юз[\s\-]?кейс(?:ы|ов|ами)?", r"user[\s\-]+kase")),
     ("Spec-Driven Development", "Spec-Driven Development", (r"specdrive[\s\-]+and[\s\-]+development", r"спек[\s\-]+дривен[\s\-]+девелопмент")),
     ("Swagger", "Swagger", (r"сваг+ер(?:а|е|ом)?",)),
     ("Postman", "Postman", (r"постман(?:а|е|ом)?", r"постмэн(?:а|е|ом)?")),
-    ("Confluence", "Confluence", (r"конфлю[еэ]нс(?:а|е|ом)?",)),
+    ("Confluence", "Confluence", (r"конфлю[еэ]нс(?:а|е|ом)?", r"конплю[еэ]нс(?:а|е|ом)?", r"конфлинс(?:а|е|ом)?", r"коonflenc\w*")),
     ("Jira", "в Jira", (r"в\s+джерри",)),
     ("Jira", "Jira", (r"джир[аеуы]",)),
-    ("Jenkins", "Jenkins", (r"дженкинс(?:а|е|ом)?",)),
-    ("Docs as Code", "Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код", r"докс[\s\-]+ас[\s\-]+код")),
-    ("SFA", "SFA", (r"цфа(?=\-систем)",)),
-    ("OTLP", "OTLP", (r"от[\s\-]+лп", r"о[\s\-]?ти[\s\-]?эл[\s\-]?пи")),
+    ("Jenkins", "Jenkins", (r"дженкинс(?:а|е|ом)?", r"дженткенс(?:а|е|ом)?")),
+    ("Docs as Code", "Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код", r"докс[\s\-]+ас[\s\-]+код", r"соsкод\w*", r"со[\s\-]+скод(?:ом|а|е|у)?")),
+    ("SFA", "SFA", (r"цфа(?=\-систем)", r"цф(?=\-систем)", r"сф(?=\-систем)", r"sф(?=\-систем)")),
+    ("OTLP", "OTLP", (r"от[\s\-]+лп", r"от[\s\-]+тлп", r"о[\s\-]?ти[\s\-]?эл[\s\-]?пи")),
     ("C++", "C++", (r"си[\s\-]+плюс[\s\-]+плюс", r"(?:(?<=на\s)|(?<=с\s)|(?<=из\s))c\+(?!\+)")),
     ("GraphQL", "GraphQL", (r"граф[\s\-]?кью[\s\-]?эль", r"графкьюэл")),
     ("OpenAPI", "OpenAPI", (r"опен[\s\-]?апи", r"оупен[\s\-]?апи")),
@@ -3995,6 +4049,11 @@ class Transcriber:
             except OSError:
                 raw_backup_path = None
 
+            chunk_fallback = (
+                (lambda chunk_txt: apply_custom_glossary_terms(chunk_txt, custom_prompt))
+                if (custom_prompt and custom_prompt.strip())
+                else None
+            )
             polished_turns, llm_stats = polish_turns_with_local_llm(
                 turns=final_turns,
                 base_url=llm_base_url,
@@ -4003,6 +4062,7 @@ class Transcriber:
                 api_key=llm_api_key,
                 status_cb=status_cb,
                 cancel_token=cancel_token,
+                chunk_fallback_fn=chunk_fallback,
             )
             if llm_stats.get("applied"):
                 final_turns = polished_turns
