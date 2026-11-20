@@ -463,12 +463,13 @@ DEFAULT_DIARIZATION_SENSITIVITY = os.environ.get("DIARIZATION_SENSITIVITY", "nor
 if DEFAULT_DIARIZATION_SENSITIVITY not in DIARIZATION_SENSITIVITY_OPTIONS:
     DEFAULT_DIARIZATION_SENSITIVITY = "normal"
 
-# Fine-grained turn boundary threshold for initial pyannote segmentation pass
-DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.35"))
+# Fine-grained turn boundary threshold (cosine distance) for initial pyannote segmentation pass.
+# Tighter 0.25 prevents Pass 1 FastClustering from fusing back-to-back similar female voices.
+DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.25"))
 # Cosine similarity thresholds for Anchor-Linkage voiceprint clustering (CAM++).
-# Raised from 0.54 -> 0.60 so similar same-gender speakers are not over-merged into 2 clusters.
-DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.60"))
-DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.64"))
+# Tuned for same-gender / compressed Zoom-channel audio so similar speakers are not collapsed to 2.
+DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.64"))
+DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.68"))
 
 DIARIZATION_SENSITIVITY_PROFILES = {
     "normal": {
@@ -477,22 +478,28 @@ DIARIZATION_SENSITIVITY_PROFILES = {
         "sim_threshold": DIARIZATION_CENTROID_SIM_THRESHOLD,
         "multi_sim_threshold": DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
         "seg_threshold": DIARIZATION_SEGMENTATION_THRESHOLD,
-        "minor_min_sec": 4.5,
+        "svd_gap_threshold": 0.085,
+        "svd_max_cent_sim": 0.84,
+        "minor_min_sec": 4.0,
     },
     "high": {
         "id": "high",
         "label": "Высокая (похожие голоса / один пол)",
-        "sim_threshold": max(DIARIZATION_CENTROID_SIM_THRESHOLD + 0.06, 0.66),
-        "multi_sim_threshold": max(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD + 0.06, 0.70),
-        "seg_threshold": min(DIARIZATION_SEGMENTATION_THRESHOLD, 0.30),
-        "minor_min_sec": 3.0,
+        "sim_threshold": max(DIARIZATION_CENTROID_SIM_THRESHOLD + 0.05, 0.69),
+        "multi_sim_threshold": max(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD + 0.05, 0.73),
+        "seg_threshold": min(DIARIZATION_SEGMENTATION_THRESHOLD, 0.20),
+        "svd_gap_threshold": 0.065,
+        "svd_max_cent_sim": 0.87,
+        "minor_min_sec": 2.8,
     },
     "low": {
         "id": "low",
         "label": "Низкая (строже объединять)",
-        "sim_threshold": min(DIARIZATION_CENTROID_SIM_THRESHOLD - 0.06, 0.54),
-        "multi_sim_threshold": min(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD - 0.06, 0.58),
-        "seg_threshold": max(DIARIZATION_SEGMENTATION_THRESHOLD, 0.40),
+        "sim_threshold": min(DIARIZATION_CENTROID_SIM_THRESHOLD - 0.08, 0.56),
+        "multi_sim_threshold": min(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD - 0.08, 0.60),
+        "seg_threshold": max(DIARIZATION_SEGMENTATION_THRESHOLD, 0.34),
+        "svd_gap_threshold": 0.115,
+        "svd_max_cent_sim": 0.78,
         "minor_min_sec": 6.0,
     },
 }
@@ -515,9 +522,11 @@ ASR_PROMPT_PRESETS = {
         "id": "system_analyst",
         "label": "Системный аналитик",
         "prompt": (
-            "Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, "
-            "OAuth 2, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, "
-            "Camunda, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code"
+            "Собеседование системного аналитика: REST, gRPC, HTTP 2.0, HTTP/1.1, SOAP, JSON, "
+            "JWT, Bearer, OAuth 2, API-шлюз, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, "
+            "Activity, ERD, BPMN, Camunda, PlantUML, draw.io, UI-kit, use cases, Swagger, "
+            "Postman, Confluence, Jira, Git, Jenkins, Docs as Code, Spec-Driven Development, "
+            "CRM, SFA, OTLP, C++"
         ),
     },
     "backend_devops": {

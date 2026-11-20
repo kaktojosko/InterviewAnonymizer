@@ -500,6 +500,83 @@ def cluster_anchor_embeddings(
         blocked = np.delete(blocked, bj, axis=0)
         blocked = np.delete(blocked, bj, axis=1)
 
+    # Channel-invariant multimodal cluster splitter (auto mode):
+    # When multiple same-gender speakers share a single conference downlink (e.g. 3 female
+    # interviewers on Zoom/Telemost), their shared channel+gender vector inflates raw
+    # inter-speaker cosine similarity into 0.60-0.75. Subtracting the cluster mean (SVD top
+    # singular direction) cancels the shared channel offset: a true single speaker is
+    # isotropic (within-between gap <= 0.04, cent_sim >= 0.92), whereas 2+ merged speakers
+    # exhibit a sharp coherence gap (>= 0.085) and clearly separated sub-centroids.
+    if target_k is None and clusters:
+        svd_gap_thr = float(sens_prof.get("svd_gap_threshold", 0.085))
+        svd_max_cent_sim = float(sens_prof.get("svd_max_cent_sim", 0.84))
+        min_half_anchors = 4
+        min_half_dur = 10.0
+        splits_done = 0
+        split_changed = True
+        while split_changed and splits_done < 6:
+            split_changed = False
+            next_clusters: list[list[int]] = []
+            for grp in clusters:
+                grp_dur = sum(durations[i] for i in grp)
+                if len(grp) < 2 * min_half_anchors or grp_dur < 2.0 * min_half_dur:
+                    next_clusters.append(grp)
+                    continue
+                pos_arr = np.array([anchor_pos[i] for i in grp], dtype=np.int64)
+                sub_vecs = anchor_mat[pos_arr]
+                centered = sub_vecs - sub_vecs.mean(axis=0, keepdims=True)
+                try:
+                    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+                except np.linalg.LinAlgError:
+                    next_clusters.append(grp)
+                    continue
+                proj = centered @ vt[0]
+                c_lo = float(np.percentile(proj, 20))
+                c_hi = float(np.percentile(proj, 80))
+                mask_a = proj <= 0.5 * (c_lo + c_hi)
+                for _ in range(12):
+                    n_a = int(np.count_nonzero(mask_a))
+                    if n_a == 0 or n_a == len(grp):
+                        break
+                    c_lo = float(proj[mask_a].mean())
+                    c_hi = float(proj[~mask_a].mean())
+                    mask_a = proj <= 0.5 * (c_lo + c_hi)
+
+                grp_a = [grp[k] for k in range(len(grp)) if mask_a[k]]
+                grp_b = [grp[k] for k in range(len(grp)) if not mask_a[k]]
+                dur_a = sum(durations[i] for i in grp_a)
+                dur_b = sum(durations[i] for i in grp_b)
+                if (
+                    len(grp_a) < min_half_anchors
+                    or len(grp_b) < min_half_anchors
+                    or dur_a < min_half_dur
+                    or dur_b < min_half_dur
+                ):
+                    next_clusters.append(grp)
+                    continue
+
+                pa = pos_arr[mask_a]
+                pb = pos_arr[~mask_a]
+                sa = pair_sim[np.ix_(pa, pa)]
+                sb = pair_sim[np.ix_(pb, pb)]
+                sc = pair_sim[np.ix_(pa, pb)]
+                w_a = float((sa.sum() - len(pa)) / max(1, len(pa) * (len(pa) - 1)))
+                w_b = float((sb.sum() - len(pb)) / max(1, len(pb) * (len(pb) - 1)))
+                btwn = float(sc.mean())
+                coherence_gap = min(w_a, w_b) - btwn
+                cent_a = _compute_centroid(grp_a)
+                cent_b = _compute_centroid(grp_b)
+                sub_cent_sim = float(np.dot(cent_a, cent_b))
+
+                if coherence_gap >= svd_gap_thr and sub_cent_sim <= svd_max_cent_sim:
+                    next_clusters.append(grp_a)
+                    next_clusters.append(grp_b)
+                    splits_done += 1
+                    split_changed = True
+                else:
+                    next_clusters.append(grp)
+            clusters = next_clusters
+
     # Absorb isolated 1-segment overlap/laugh outlier anchors on longer recordings
     if target_k is None and len(clusters) > 1:
         cluster_durs = [sum(durations[i] for i in c) for c in clusters]
@@ -542,7 +619,9 @@ def cluster_anchor_embeddings(
     cent_mat = np.stack([_compute_centroid(c) for c in clusters], axis=0)
     assigned = _assign_to_centroids(cent_mat)
 
-    # Refinement pass: recompute centroids from >=1.5s assigned segments & check only high-confidence merges
+    # Refinement pass: recompute centroids from >=1.5s assigned segments & merge ONLY
+    # near-identical duplicate clusters (never collapse distinct same-gender voices whose
+    # averaged centroids naturally sit ~0.12-0.16 higher than raw utterance similarity).
     if len(clusters) > 1:
         refined_groups: list[list[int]] = []
         for k in range(len(clusters)):
@@ -559,23 +638,34 @@ def cluster_anchor_embeddings(
                 refined_groups.append(strong_members)
 
         if len(refined_groups) >= 2:
-            # Slightly higher bar (+0.04) on refined centroids because centroids have higher cosine
-            # similarity than raw pairwise embeddings, preventing post-hoc collapse of similar voices.
-            refine_merge_thr = min(0.88, eff_sim_thr + 0.04)
+            refine_merge_thr = min(0.92, max(eff_sim_thr + 0.14, 0.82))
+            ref_blocked: set[tuple[int, int]] = set()
             while target_k is None and len(refined_groups) > 1:
                 if mode == "4+" and len(refined_groups) <= 4:
                     break
                 r_mat = np.stack([_compute_centroid(g) for g in refined_groups], axis=0)
                 r_sim = r_mat @ r_mat.T
                 np.fill_diagonal(r_sim, -2.0)
+                for a_i, b_i in ref_blocked:
+                    if a_i < r_sim.shape[0] and b_i < r_sim.shape[1]:
+                        r_sim[a_i, b_i] = -2.0
+                        r_sim[b_i, a_i] = -2.0
                 flat_best = int(np.argmax(r_sim))
                 bi, bj = divmod(flat_best, r_sim.shape[1])
                 if float(r_sim[bi, bj]) < refine_merge_thr:
                     break
                 if bi > bj:
                     bi, bj = bj, bi
+                # Also verify raw utterance-level cross-group similarity >= eff_sim_thr
+                emb_bi = np.stack([norm_embs[m] for m in refined_groups[bi] if norm_embs[m] is not None], axis=0)
+                emb_bj = np.stack([norm_embs[m] for m in refined_groups[bj] if norm_embs[m] is not None], axis=0)
+                cross_mean = float(np.mean(emb_bi @ emb_bj.T))
+                if cross_mean < eff_sim_thr:
+                    ref_blocked.add((bi, bj))
+                    continue
                 refined_groups[bi].extend(refined_groups[bj])
                 refined_groups.pop(bj)
+                ref_blocked.clear()
 
             cent_mat = np.stack([_compute_centroid(g) for g in refined_groups], axis=0)
             assigned = _assign_to_centroids(cent_mat)
@@ -994,11 +1084,11 @@ def build_longform_asr_chunks(
             vad_chunks = get_speech_timestamps(
                 samples,
                 vad_options=VadOptions(
-                    threshold=0.35,
-                    min_speech_duration_ms=150,
+                    threshold=0.28,
+                    min_speech_duration_ms=140,
                     max_speech_duration_s=float("inf"),
-                    min_silence_duration_ms=200,
-                    speech_pad_ms=160,
+                    min_silence_duration_ms=220,
+                    speech_pad_ms=220,
                 ),
                 sampling_rate=sample_rate,
             )
@@ -1021,12 +1111,13 @@ def build_longform_asr_chunks(
         else:
             return []
 
-    # Merge overlapping spans first, then pack nearby islands up to max_len
-    base_spans = _merge_time_intervals(raw_spans, gap_tol=0.12)
+    # Merge overlapping spans first, then pack nearby islands up to max_len with +-220ms edge pad
+    outer_pad = 0.22
+    base_spans = _merge_time_intervals(raw_spans, gap_tol=0.14)
     packed: list[tuple[float, float]] = []
     for s, e in base_spans:
-        ps = max(0.0, s - 0.14)
-        pe = min(total_dur, e + 0.14)
+        ps = max(0.0, s - outer_pad)
+        pe = min(total_dur, e + outer_pad)
         if not packed:
             packed.append((ps, pe))
         else:
@@ -1038,12 +1129,20 @@ def build_longform_asr_chunks(
                 if pe > ps + 0.05:
                     packed.append((ps, pe))
 
+    pause_ctx_ov = min(0.50, ov * 0.5) if ov > 0.0 else 0.0
+
     def _find_true_pause_split(cur_s: float, hard_end_s: float) -> Optional[float]:
-        """Returns a genuine RMS pause valley inside [cur + max_len - 6, cur + max_len - 0.5] if present."""
-        win_n = max(1, int(0.05 * sample_rate))  # 50 ms frame
+        """
+        Returns a genuine >=150ms RMS silence valley inside
+        [cur + max_len - 6, cur + max_len - pause_ctx_ov - 0.15] if present.
+        Using a 150ms (3x50ms) window avoids mistaking single 50ms unvoiced stop
+        consonants ('п', 'т', 'к', 'с') for pauses.
+        """
+        win_n = max(1, int(0.05 * sample_rate))  # 50 ms step
+        valley_n = win_n * 3                     # 150 ms valley width
         span_lo = max(0, int(cur_s * sample_rate))
         span_hi = min(len(samples), int(min(hard_end_s, cur_s + max_len) * sample_rate))
-        if span_hi - span_lo < win_n * 8:
+        if span_hi - span_lo < win_n * 10:
             return None
 
         # Compute median speech energy in this window to distinguish real pauses from continuous speech
@@ -1058,7 +1157,7 @@ def build_longform_asr_chunks(
             return None
 
         search_lo = max(cur_s + max(5.0, max_len - 6.0), cur_s + max_len * 0.55)
-        search_hi = min(hard_end_s - 0.8, cur_s + max_len - 0.4)
+        search_hi = min(hard_end_s - 0.8, cur_s + max_len - pause_ctx_ov - 0.15)
         if search_hi <= search_lo:
             return None
 
@@ -1066,15 +1165,15 @@ def build_longform_asr_chunks(
         hi_i = min(len(samples), int(search_hi * sample_rate))
         best_pos: Optional[int] = None
         best_e = float("inf")
-        for pos in range(lo_i, hi_i - win_n + 1, win_n):
-            f = samples[pos : pos + win_n]
-            e_val = float(np.dot(f, f)) / win_n
+        for pos in range(lo_i, hi_i - valley_n + 1, win_n):
+            f = samples[pos : pos + valley_n]
+            e_val = float(np.dot(f, f)) / valley_n
             if e_val < best_e:
                 best_e = e_val
-                best_pos = pos + (win_n // 2)
+                best_pos = pos + (valley_n // 2)
 
-        # Accept as clean non-overlapping split only if energy clearly dips (<= 22% of median speech energy)
-        if best_pos is not None and best_e <= 0.22 * med_energy:
+        # Require a true silence valley (<= 10% of median speech energy over 150ms)
+        if best_pos is not None and best_e <= 0.10 * med_energy:
             return best_pos / float(sample_rate)
         return None
 
@@ -1093,8 +1192,11 @@ def build_longform_asr_chunks(
 
             pause_pt = _find_true_pause_split(cur, island_e)
             if pause_pt is not None and pause_pt > cur + 2.0 and (pause_pt - cur) <= max_len:
-                chunks_out.append((cur, pause_pt, keep_lo, pause_pt))
-                cur = pause_pt
+                # Always supply +-pause_ctx_ov (0.50s) acoustic context across the pause seam
+                # while keeping ownership cores [keep_lo, pause_pt] strictly non-overlapping.
+                c_end = min(island_e, cur + max_len, pause_pt + pause_ctx_ov)
+                chunks_out.append((cur, c_end, keep_lo, pause_pt))
+                cur = max(island_s, pause_pt - pause_ctx_ov)
                 keep_lo = pause_pt
             else:
                 # Breathless continuous speech: sliding window <= max_len with overlap_sec
@@ -1108,6 +1210,26 @@ def build_longform_asr_chunks(
                 chunks_out.append((cur, c_end, keep_lo, mid_bound))
                 cur = next_cur
                 keep_lo = mid_bound
+
+    # Add +-0.40s acoustic context across tightly adjacent packed-island boundaries (< 0.65s gap,
+    # e.g. where packing hit max_len) without ever exceeding max_len or overlapping keep cores.
+    seam_ov = min(0.40, ov * 0.4) if ov > 0.0 else 0.0
+    if seam_ov > 0.0 and len(chunks_out) >= 2:
+        patched = [list(c) for c in chunks_out]
+        for idx in range(len(patched) - 1):
+            c1_s, c1_e, k1_s, k1_e = patched[idx]
+            c2_s, c2_e, k2_s, k2_e = patched[idx + 1]
+            # Only patch non-overlapping packed seams that are closely adjacent
+            if c1_e <= c2_s + 1e-4 and (c2_s - c1_e) < 0.65:
+                mid = 0.5 * (c1_e + c2_s)
+                new_c1_e = min(total_dur, c1_s + max_len, max(c1_e, mid + seam_ov))
+                new_c2_s = max(0.0, c2_e - max_len, min(c2_s, mid - seam_ov))
+                if new_c1_e > c1_e + 0.02 or new_c2_s < c2_s - 0.02:
+                    patched[idx][1] = new_c1_e
+                    patched[idx][3] = max(k1_e, mid)
+                    patched[idx + 1][0] = new_c2_s
+                    patched[idx + 1][2] = min(k2_s, mid)
+        chunks_out = [(a, b, c, d) for a, b, c, d in patched]
 
     return chunks_out
 
@@ -1600,11 +1722,11 @@ def _build_speech_clauses(
 
     clauses: list[_SpeechClause] = []
     for grp in raw_groups:
-        last_txt = grp[-1].text.rstrip()
-        is_unpunctuated = not bool(_SENTENCE_END_PUNCT_RE.search(last_txt))
+        # Split ANY clause spanning >=2 substantial speakers (>=0.65s overlap each),
+        # even when GigaAM/Whisper placed a period at the very end of a glued 2-speaker turn.
         sub_groups = (
             _split_unpunctuated_multispeaker_units(grp, diar_segments, seg_ends)
-            if (is_unpunctuated and diar_segments)
+            if diar_segments
             else [grp]
         )
         for sub in sub_groups:
@@ -1636,9 +1758,9 @@ def align_units_to_speakers(
       2. Scores each clause against diarization segments with edge-bleed trimming.
       3. When speaker CAM++ voiceprint centroids and waveform samples are
          available, acoustically verifies Q&A turns, rapid replies ('Ну да.',
-         'Ну да, есть немного.'), and contested overlap clauses directly against
-         speaker centroids, separating ping-pong dialogue even if coarse
-         segmentation fused adjacent turns.
+         'Ну да, есть немного.'), contested overlap clauses, and turn-transition
+         boundaries directly against speaker centroids, preventing phrase bleed
+         across adjacent speakers.
     """
     non_empty_units = [u for u in units if u.text and u.text.strip()]
     if not non_empty_units:
@@ -1692,7 +1814,7 @@ def align_units_to_speakers(
         clause_contentions.append(contended)
         prev_spk = chosen_spk
 
-    # Acoustic clause verification via CAM++ voiceprints for Q&A and rapid back-and-forth
+    # Acoustic clause verification via CAM++ voiceprints for Q&A, overlaps, and turn boundaries
     can_verify_acoustically = (
         samples is not None
         and samples.size >= int(0.35 * sample_rate)
@@ -1704,6 +1826,7 @@ def align_units_to_speakers(
         spk_ids = sorted(speaker_centroids.keys())
         cent_mat = np.stack([speaker_centroids[k] for k in spk_ids], axis=0)
         spk_to_row = {k: i for i, k in enumerate(spk_ids)}
+        initial_spks = list(assigned_spks)
 
         for idx, cl in enumerate(clauses):
             cur_spk = assigned_spks[idx]
@@ -1725,8 +1848,12 @@ def align_units_to_speakers(
             contended = clause_contentions[idx]
             first_word = _clean_word_lower(cl.text.split()[0]) if cl.text.split() else ""
             is_short_reply = dur <= 2.8 and first_word in _RESPONSE_OPENER_WORDS
+            is_turn_boundary = dur >= 0.50 and (
+                (idx > 0 and initial_spks[idx - 1] != initial_spks[idx])
+                or (idx + 1 < len(clauses) and initial_spks[idx + 1] != initial_spks[idx])
+            )
 
-            if not (ends_q or prev_ends_q or next_ends_q or contended or is_short_reply):
+            if not (ends_q or prev_ends_q or next_ends_q or contended or is_short_reply or is_turn_boundary):
                 continue
 
             v_trim = min(0.05, 0.10 * dur) if dur >= 0.55 else 0.0
@@ -1778,6 +1905,9 @@ def align_units_to_speakers(
             elif contended:
                 req_margin = 0.065 if dur >= 0.90 else 0.090
                 min_abs_sim = 0.42
+            elif is_turn_boundary and not (ends_q or prev_ends_q or next_ends_q or is_short_reply):
+                req_margin = 0.095 if dur >= 0.90 else 0.115
+                min_abs_sim = 0.45
             else:
                 req_margin = 0.085 if dur >= 0.90 else 0.110
                 min_abs_sim = 0.44
@@ -2194,58 +2324,74 @@ def is_whisper_prompt_echo(
 
 # Strict opt-in phonetic-to-Latin glossary map: each entry activates ONLY when its
 # canonical Latin term is explicitly present in the user's custom_prompt.
-_GLOSSARY_PHONETIC_RULES: list[tuple[str, tuple[str, ...]]] = [
-    ("gRPC", (r"джи[\s\-]?эр[\s\-]?пи[\s\-]?си", r"гэрпэцэ", r"грпц", r"грпс", r"gpc")),
-    ("HTTP 2.0", (r"эйч[\s\-]?ти[\s\-]?ти[\s\-]?пи[\s\-]+(?:2\.0|два(?:\s+ноль)?)", r"хттп[\s\-]+(?:2\.0|два(?:\s+ноль)?)")),
-    ("OAuth 2", (r"о[\s\-]?ау[фтс](?:[\s\-]+(?:2(?:\.0)?|два))?", r"оаут(?:[\s\-]+(?:2(?:\.0)?|два))?", r"оауф(?:[\s\-]+(?:2(?:\.0)?|два))?")),
-    ("JWT", (r"джей[\s\-]?дабл[\s\-]?ю[\s\-]?ти", r"джей[\s\-]?ви[\s\-]?ти", r"джвт", r"живити")),
-    ("Bearer", (r"бирер", r"бэрер", r"берер")),
-    ("SOAP", (r"соап", r"соуп")),
-    ("REST API", (r"рест[\s\-]+апи", r"рест[\s\-]+эй[\s\-]?пи[\s\-]?ай")),
-    ("REST", (r"рест(?:а|у|ом|е)?",)),
-    ("PostgreSQL", (r"постгрес[\s\-]?кью[\s\-]?эль", r"постгресс?", r"постгри")),
-    ("Redis", (r"редис(?:а|е|ом)?", r"рэдис(?:а|е|ом)?")),
-    ("MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монга")),
-    ("Kafka", (r"кафк[аеуи]",)),
-    ("RabbitMQ", (r"рэббит[\s\-]?эм[\s\-]?кью", r"реббит[\s\-]?эм[\s\-]?кью", r"рэббит")),
-    ("Sequence", (r"сиквенс", r"секвенс", r"сиквэнс", r"sipens")),
-    ("Activity", (r"активити",)),
-    ("BPMN", (r"би[\s\-]?пи[\s\-]?эм[\s\-]?эн", r"бпмн")),
-    ("ERD", (r"и[\s\-]?ар[\s\-]?ди", r"ерд")),
-    ("Camunda", (r"камунд[аеуы]",)),
-    ("Swagger", (r"сваг+ер(?:а|е|ом)?",)),
-    ("Postman", (r"постман(?:а|е|ом)?", r"постмэн(?:а|е|ом)?")),
-    ("Confluence", (r"конфлю[еэ]нс(?:а|е|ом)?",)),
-    ("Jira", (r"джир[аеуы]", r"жир[аеуы]")),
-    ("Jenkins", (r"дженкинс(?:а|е|ом)?",)),
-    ("Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код")),
-    ("GraphQL", (r"граф[\s\-]?кью[\s\-]?эль", r"графкьюэл")),
-    ("OpenAPI", (r"опен[\s\-]?апи", r"оупен[\s\-]?апи")),
-    ("Kubernetes", (r"кубернетес(?:а|е|ом)?", r"кубернэтес(?:а|е|ом)?", r"кубер(?:а|е|ом)?")),
-    ("Docker", (r"докер(?:а|е|ом)?",)),
-    ("GitLab", (r"гит[\s\-]?лаб(?:а|е|ом)?",)),
-    ("Git", (r"гит(?:а|е|ом)?",)),
-    ("CI/CD", (r"си[\s\-]?ай[\s\-/]+си[\s\-]?ди",)),
-    ("Prometheus", (r"прометеус(?:а|е|ом)?",)),
-    ("Grafana", (r"графан[аеуы]",)),
-    ("Terraform", (r"терраформ(?:а|е|ом)?",)),
-    ("TypeScript", (r"тайп[\s\-]?скрипт(?:а|е|ом)?",)),
-    ("JavaScript", (r"джава[\s\-]?скрипт(?:а|е|ом)?",)),
-    ("React", (r"реакт(?:а|е|ом)?",)),
-    ("Playwright", (r"плейрайт(?:а|е|ом)?",)),
-    ("WebSocket", (r"веб[\s\-]?сокет(?:а|е|ом|ы|ов)?",)),
+_GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
+    ("gRPC", "по gRPC", (r"поджирописью", r"под[\s\-]?жирописью")),
+    ("gRPC", "gRPC", (r"джи[\s\-]?эр[\s\-]?пи[\s\-]?си", r"гэрпэцэ", r"грпц", r"грпс", r"gpc", r"джиэрпис[ию]?")),
+    ("HTTP 2.0", "HTTP 2.0", (r"эйч[\s\-]?ти[\s\-]?ти[\s\-]?пи[\s\-]+(?:2\.0|два(?:\s+ноль)?)", r"хттп[\s\-]+(?:2\.0|два(?:\s+ноль)?)")),
+    ("OAuth 2", "OAuth 2", (r"о[\s\-]?ау[фтс](?:[\s\-]+(?:2(?:\.0)?|два))?", r"оаут(?:[\s\-]+(?:2(?:\.0)?|два))?", r"оауф(?:[\s\-]+(?:2(?:\.0)?|два))?", r"ауф[\s\-]+(?:2(?:\.0)?|два)", r"аут[\s\-]+(?:2(?:\.0)?|два)")),
+    ("JWT", "JWT", (r"джей[\s\-]?дабл[\s\-]?ю[\s\-]?ти", r"джей[\s\-]?ви[\s\-]?ти", r"джвт", r"живити", r"гвт", r"gwt", r"gpt(?=[\s\-]+токен)", r"джпити(?=[\s\-]+токен)")),
+    ("Bearer", "Bearer-токены", (r"бирутокены", r"бир[\s\-]?токены")),
+    ("Bearer", "Bearer-токен", (r"бирутокен", r"бир[\s\-]?токен")),
+    ("Bearer", "Bearer-токенов", (r"бирутокенов", r"бир[\s\-]?токенов")),
+    ("Bearer", "Bearer-токена", (r"бирутокена", r"бир[\s\-]?токена")),
+    ("Bearer", "Bearer", (r"бирер", r"бэрер", r"берер")),
+    ("API-шлюз", "API-шлюз", (r"appi[\s\-]+plues", r"апи[\s\-]+шлюз")),
+    ("SOAP", "SOAP", (r"соап", r"соуп")),
+    ("JSON", "JSON", (r"джейсон(?:а|е|ом)?", r"джисон(?:а|е|ом)?", r"джесон(?:а|е|ом)?", r"жсон(?:а|е|ом)?", r"geson")),
+    ("REST API", "REST API", (r"рест[\s\-]+апи", r"рест[\s\-]+эй[\s\-]?пи[\s\-]?ай")),
+    ("REST", "REST", (r"рест(?:а|у|ом|е)?", r"рист(?:а|у|ы|ом|е)?", r"рыст(?:а|у|ом|е)?")),
+    ("PostgreSQL", "PostgreSQL", (r"постгрес[\s\-]?кью[\s\-]?эль", r"постгресс?", r"постгри")),
+    ("Redis", "Redis", (r"редис(?:а|е|ом)?", r"рэдис(?:а|е|ом)?")),
+    ("MongoDB", "MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монга")),
+    ("Kafka", "Kafka", (r"кафк[аеуи]",)),
+    ("RabbitMQ", "RabbitMQ", (r"рэббит[\s\-]?эм[\s\-]?кью", r"реббит[\s\-]?эм[\s\-]?кью", r"рэббит")),
+    ("Sequence", "Sequence", (r"сиквенс", r"секвенс", r"сиквэнс", r"sipens", r"siven")),
+    ("Activity", "Activity", (r"активити",)),
+    ("BPMN", "BPMN", (r"би[\s\-]?пи[\s\-]?эм[\s\-]?эн", r"бпмн", r"bpen", r"бпен", r"vipmencum")),
+    ("ERD", "ERD", (r"и[\s\-]?ар[\s\-]?ди", r"ерд")),
+    ("Camunda", "Camunda", (r"камунд[аеуы]", r"комунд[аеуы]")),
+    ("PlantUML", "PlantUML", (r"плант[\s\-]?юэмэль", r"плант[\s\-]?юмл", r"план[\s\-]+юля")),
+    ("draw.io", "draw.io", (r"дроу?[\s\-]+ио", r"дру[\s\-]+ио")),
+    ("UI-kit", "UI-kit", (r"юай[\s\-]?кит(?:а|е|ом)?", r"ui[\s\-]?гид(?:а|е|ом)?")),
+    ("use cases", "use cases", (r"юз[\s\-]?кейс(?:ы|ов|ами)?", r"user[\s\-]+kase")),
+    ("Spec-Driven Development", "Spec-Driven Development", (r"specdrive[\s\-]+and[\s\-]+development", r"спек[\s\-]+дривен[\s\-]+девелопмент")),
+    ("Swagger", "Swagger", (r"сваг+ер(?:а|е|ом)?",)),
+    ("Postman", "Postman", (r"постман(?:а|е|ом)?", r"постмэн(?:а|е|ом)?")),
+    ("Confluence", "Confluence", (r"конфлю[еэ]нс(?:а|е|ом)?",)),
+    ("Jira", "в Jira", (r"в\s+джерри",)),
+    ("Jira", "Jira", (r"джир[аеуы]", r"жир[аеуы]")),
+    ("Jenkins", "Jenkins", (r"дженкинс(?:а|е|ом)?",)),
+    ("Docs as Code", "Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код", r"докс[\s\-]+ас[\s\-]+код")),
+    ("SFA", "SFA", (r"цфа(?=\-систем)",)),
+    ("OTLP", "OTLP", (r"от[\s\-]+лп", r"о[\s\-]?ти[\s\-]?эл[\s\-]?пи")),
+    ("C++", "C++", (r"си[\s\-]+плюс[\s\-]+плюс", r"c\+(?!\+)")),
+    ("GraphQL", "GraphQL", (r"граф[\s\-]?кью[\s\-]?эль", r"графкьюэл")),
+    ("OpenAPI", "OpenAPI", (r"опен[\s\-]?апи", r"оупен[\s\-]?апи")),
+    ("Kubernetes", "Kubernetes", (r"кубернетес(?:а|е|ом)?", r"кубернэтес(?:а|е|ом)?", r"кубер(?:а|е|ом)?")),
+    ("Docker", "Docker", (r"докер(?:а|е|ом)?",)),
+    ("GitLab", "GitLab", (r"гит[\s\-]?лаб(?:а|е|ом)?",)),
+    ("Git", "Git", (r"гит(?:а|е|ом)?",)),
+    ("CI/CD", "CI/CD", (r"си[\s\-]?ай[\s\-/]+си[\s\-]?ди",)),
+    ("Prometheus", "Prometheus", (r"прометеус(?:а|е|ом)?",)),
+    ("Grafana", "Grafana", (r"графан[аеуы]",)),
+    ("Terraform", "Terraform", (r"терраформ(?:а|е|ом)?",)),
+    ("TypeScript", "TypeScript", (r"тайп[\s\-]?скрипт(?:а|е|ом)?",)),
+    ("JavaScript", "JavaScript", (r"джава[\s\-]?скрипт(?:а|е|ом)?",)),
+    ("React", "React", (r"реакт(?:а|е|ом)?",)),
+    ("Playwright", "Playwright", (r"плейрайт(?:а|е|ом)?",)),
+    ("WebSocket", "WebSocket", (r"веб[\s\-]?сокет(?:а|е|ом|ы|ов)?",)),
 ]
 
 _COMPILED_GLOSSARY_RULES: list[tuple[str, str, re.Pattern]] = [
     (
-        canonical,
-        canonical.lower(),
+        replacement,
+        trigger.lower(),
         re.compile(
             r"(?<![A-Za-zА-Яа-яЁё0-9])(?:" + "|".join(variants) + r")(?![A-Za-zА-Яа-яЁё0-9])",
             re.IGNORECASE,
         ),
     )
-    for canonical, variants in _GLOSSARY_PHONETIC_RULES
+    for trigger, replacement, variants in _GLOSSARY_PHONETIC_RULES
 ]
 
 
@@ -2743,7 +2889,7 @@ class Transcriber:
             requested_language=language,
             profile_id=profile_id,
         )
-        cleaned_custom_prompt = " ".join((custom_prompt or "").split())[:320]
+        cleaned_custom_prompt = " ".join((custom_prompt or "").split())[:420]
         # Extract clean comma-separated terms for CTranslate2 beam-boosting hotwords
         # (strips descriptive lead-ins like 'Собеседование системного аналитика:')
         hotwords_str: Optional[str] = None
@@ -2754,7 +2900,7 @@ class Transcriber:
                 else cleaned_custom_prompt
             )
             if hw_src:
-                hotwords_str = hw_src[:220]
+                hotwords_str = hw_src[:320]
 
         if status_cb:
             mode_desc = "мультиязычный авто" if use_multilingual else f"фиксированный ({resolved_lang})"
@@ -3573,12 +3719,22 @@ class Transcriber:
 
                     has_left_ov = k_start > c_start + 1e-4
                     has_right_ov = k_end < c_end - 1e-4
+                    first_kept_on_seam = has_left_ov
                     for u in chunk_units:
                         if has_left_ov or has_right_ov:
                             mid = 0.5 * (u.start + u.end)
                             if has_left_ov and mid < k_start:
                                 continue
                             if has_right_ov and mid >= k_end:
+                                continue
+                        if first_kept_on_seam and out_units:
+                            first_kept_on_seam = False
+                            prev_u = out_units[-1]
+                            if (
+                                abs(u.start - prev_u.start) <= 0.35
+                                and _clean_word_lower(u.text)
+                                and _clean_word_lower(u.text) == _clean_word_lower(prev_u.text)
+                            ):
                                 continue
                         out_units.append(u)
 

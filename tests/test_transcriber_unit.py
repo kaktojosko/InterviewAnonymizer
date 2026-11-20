@@ -1273,8 +1273,9 @@ def test_build_longform_asr_chunks_enforces_20s_cap_with_overlap_and_dedup(monke
         use_silero_vad=False,
     )
     assert len(pause_chunks) == 2
-    assert 16.0 <= pause_chunks[0][1] <= 17.0
-    assert pause_chunks[1][0] == pytest.approx(pause_chunks[0][1], abs=1e-4)
+    assert 16.0 <= pause_chunks[0][3] <= 17.0
+    assert pause_chunks[1][2] == pytest.approx(pause_chunks[0][3], abs=1e-4)
+    assert pause_chunks[0][1] - pause_chunks[1][0] == pytest.approx(1.0, abs=0.05)
 
     # 4. Silero VAD rescues quiet speech missed completely by diarization!
     samples_rescue = rng.normal(0.0, 0.10, sr * 25).astype(np.float32)
@@ -2439,6 +2440,141 @@ def test_per_model_tuned_decoding_params_hotwords_ctc_batch_and_llm_json_fallbac
     assert llm_bodies[0]["top_p"] == pytest.approx(0.9)
     assert llm_bodies[0]["response_format"] == {"type": "json_object"}
     assert "response_format" not in llm_bodies[1]
+
+
+def test_v501_zoom_4_female_svd_split_punctuated_boundary_overlap_and_glossary(monkeypatch):
+    from src.config import ASR_PROMPT_PRESETS
+    from src.transcriber import apply_custom_glossary_terms, build_longform_asr_chunks
+
+    # 1. Realistic 4-female Zoom interview: 1 local mic (Alina) + 3 remote Zoom women sharing
+    #    a heavy channel+gender axis (raw inter-speaker cosine = 0.70, unbalanced 24/12/10/8).
+    #    MUST separate into ALL 4 speakers even in DEFAULT speaker_count='auto', sensitivity='normal'!
+    rng = np.random.RandomState(501)
+    dim = 192
+    qr, _ = np.linalg.qr(rng.randn(dim, 6))
+    local_mic_vec = qr[:, 0].astype(np.float32)
+    zoom_axis = qr[:, 1].astype(np.float32)
+    sh, ind = float(np.sqrt(0.70)), float(np.sqrt(0.30))
+    zoom_women = [
+        (sh * zoom_axis + ind * qr[:, 2 + k].astype(np.float32)) for k in range(3)
+    ]
+    zoom_women = [v / np.linalg.norm(v) for v in zoom_women]
+    centers = [local_mic_vec] + zoom_women
+    counts = [24, 12, 10, 8]
+
+    segs: list[DiarizationSegment] = []
+    embs: list[np.ndarray] = []
+    truth: list[int] = []
+    t_cur = 0.0
+    max_turns = max(counts)
+    for round_i in range(max_turns):
+        for spk_i, cnt in enumerate(counts):
+            if round_i >= cnt:
+                continue
+            dur = 3.5
+            v = centers[spk_i] + 0.032 * rng.randn(dim).astype(np.float32)
+            v /= np.linalg.norm(v)
+            segs.append(DiarizationSegment(t_cur, t_cur + dur, speaker=len(segs)))
+            embs.append(v)
+            truth.append(spk_i)
+            t_cur += dur + 1.0
+
+    clustered_default = cluster_anchor_embeddings(
+        segs, embs, speaker_count="auto", sensitivity="normal"
+    )
+    assert len({s.speaker for s in clustered_default}) == 4
+    by_truth: dict[int, set[int]] = {i: set() for i in range(4)}
+    for idx, t_spk in enumerate(truth):
+        by_truth[t_spk].add(clustered_default[idx].speaker)
+    for spk_i in range(4):
+        assert len(by_truth[spk_i]) == 1
+
+    # Single speaker with mild volume/mood drift (cos=0.88) MUST NOT falsely split!
+    drift_b = np.sqrt(0.88) * local_mic_vec + np.sqrt(0.12) * qr[:, 5].astype(np.float32)
+    drift_segs = [DiarizationSegment(i * 4.5, i * 4.5 + 3.5, speaker=i) for i in range(36)]
+    drift_embs = []
+    for i in range(36):
+        base = local_mic_vec if i < 18 else drift_b
+        v = base + 0.04 * rng.randn(dim).astype(np.float32)
+        drift_embs.append(v / np.linalg.norm(v))
+    clustered_drift = cluster_anchor_embeddings(
+        drift_segs, drift_embs, speaker_count="auto", sensitivity="normal"
+    )
+    assert len({s.speaker for s in clustered_drift}) == 1
+
+    # 2. Punctuated glued 2-speaker GigaAM clause MUST split across speaker boundary
+    diar_glued = [
+        DiarizationSegment(0.0, 2.2, speaker=1),   # Interviewer finishes without period
+        DiarizationSegment(2.2, 4.4, speaker=0),   # Alina starts answering and ends with '.'
+    ]
+    glued_units = [
+        TimedUnit(0.0, 0.45, " Твоей"),
+        TimedUnit(0.45, 0.95, " готовности"),
+        TimedUnit(0.95, 1.35, " в дальнейшем"),
+        TimedUnit(1.35, 1.75, " сильно"),
+        TimedUnit(1.75, 2.18, " погрузиться,"),
+        TimedUnit(2.22, 2.60, " да,"),
+        TimedUnit(2.60, 3.15, " конечно,"),
+        TimedUnit(3.15, 3.65, " я"),
+        TimedUnit(3.65, 4.35, " готова."),
+    ]
+    turns_glued, n_spks_glued = align_units_to_speakers(glued_units, diar_glued)
+    assert n_spks_glued == 2
+    assert len(turns_glued) == 2
+    assert "погрузиться" in turns_glued[0].text
+    assert "готова" in turns_glued[1].text
+
+    # 3. build_longform_asr_chunks supplies overlap context even at true pause splits (no cold cut!)
+    sr = 16000
+    speech_sig = rng.normal(0.0, 0.14, sr * 34).astype(np.float32)
+    # Create a genuine 300ms silence valley at 16.0s..16.3s inside a 34s speech island
+    speech_sig[int(16.0 * sr) : int(16.3 * sr)] = 0.0
+    monkeypatch.setattr(
+        "src.transcriber.get_speech_timestamps",
+        lambda wav, vad_options, sampling_rate: [{"start": 0, "end": len(wav)}],
+    )
+    chunks = build_longform_asr_chunks(
+        speech_sig, sample_rate=sr, max_chunk_sec=20.0, overlap_sec=1.6, use_silero_vad=True
+    )
+    assert len(chunks) == 2
+    (c1_s, c1_e, k1_s, k1_e), (c2_s, c2_e, k2_s, k2_e) = chunks
+    assert (c1_e - c1_s) <= 20.0 + 1e-6
+    assert (c2_e - c2_s) <= 20.0 + 1e-6
+    # Must overlap acoustically across the pause seam while keeping ownership non-overlapping!
+    assert c1_e > k1_e + 0.30
+    assert c2_s < k2_s - 0.30
+    assert k1_e == pytest.approx(k2_s, abs=1e-4)
+
+    # 4. Expanded opt-in System Analyst phonetic normalizer fixes real GigaAM v3 FP32 distortions
+    sa_prompt = ASR_PROMPT_PRESETS["system_analyst"]["prompt"]
+    raw_gigaam = (
+        "Работаем на C+ и от ЛП, интеграция ЦФА-система поджирописью, BPen в Комунде, "
+        "передаём Geson, GPT-токены, бирутокены и ауф два, рисуем в План Юля и дру Ио, "
+        "задачи в Джерри, UI-гид, user Kase и SpecDrive and development."
+    )
+    fixed = apply_custom_glossary_terms(raw_gigaam, sa_prompt)
+    for expected_term in (
+        "C++",
+        "OTLP",
+        "SFA-система",
+        "по gRPC",
+        "BPMN",
+        "Camunda",
+        "JSON",
+        "JWT-токены",
+        "Bearer-токены",
+        "OAuth 2",
+        "PlantUML",
+        "draw.io",
+        "в Jira",
+        "UI-kit",
+        "use cases",
+        "Spec-Driven Development",
+    ):
+        assert expected_term in fixed, f"Missing '{expected_term}' in: {fixed}"
+    # Strict opt-in invariant: empty custom_prompt leaves text 100% untouched
+    assert apply_custom_glossary_terms(raw_gigaam, "") == raw_gigaam
+
 
 
 
