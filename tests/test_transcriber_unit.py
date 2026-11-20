@@ -2939,3 +2939,355 @@ def test_v510_diarization_50min_4speaker_anti_explosion_and_direct_onnx_pyannote
     assert fallback_used["window_shift_ratio"] == pytest.approx(0.25)
     assert len(fb_segs) == 2
 
+
+def test_v511_overlap_pack_batched_pyannote_cloud_llm_concurrency_retry_and_deepgram_resilience(tmp_path, monkeypatch):
+    import json as json_mod
+    import threading
+    import time as time_mod
+    from types import SimpleNamespace
+    import httpx
+    import src.deepgram_asr as dg_mod
+    import src.llm_postprocessor as llm_mod
+    from src.config import ASR_PROMPT_PRESETS
+    from src.deepgram_asr import transcribe_with_deepgram_nova3
+    from src.llm_postprocessor import polish_turns_with_local_llm
+    from src.transcriber import _DiarizationCache, build_longform_asr_chunks
+
+    sr = 16000
+    rng = np.random.RandomState(5112026)
+
+    # 1. Chunk packing MUST merge nearby spans (<=0.55s) into one continuous island BEFORE max_len splitting,
+    #    never hard-cutting at 19.6s with 0s overlap when two adjacent spans exceed 20s!
+    speech_34 = rng.normal(0.0, 0.14, sr * 34).astype(np.float32)
+    diar_adj = [
+        DiarizationSegment(0.0, 19.6, speaker=0),
+        DiarizationSegment(19.8, 33.8, speaker=0),
+    ]
+    chunks = build_longform_asr_chunks(
+        speech_34,
+        sample_rate=sr,
+        diar_segments=diar_adj,
+        max_chunk_sec=20.0,
+        overlap_sec=1.6,
+        use_silero_vad=False,
+    )
+    assert len(chunks) == 2
+    (c1_s, c1_e, k1_s, k1_e), (c2_s, c2_e, k2_s, k2_e) = chunks
+    assert (c1_e - c1_s) <= 20.01 and (c2_e - c2_s) <= 20.01
+    # Full sliding overlap (~1.6s), NOT a 0s hard cut!
+    assert (c1_e - c2_s) >= 1.4
+    assert k1_e == pytest.approx(k2_s, abs=1e-4)
+
+    # 2. Batched dynamic-dim ONNX pyannote + CUDA->CPU direct ONNX retry + overlapping <1.2s CAM++ bounds
+    fake_seg = tmp_path / "pyannote_dyn.onnx"
+    fake_seg.write_bytes(b"fake_dyn_onnx")
+    fake_emb = tmp_path / "campp_dyn.onnx"
+    fake_emb.write_bytes(b"fake_campp")
+
+    wav_20 = rng.normal(0.0, 0.12, sr * 19).astype(np.float32)
+    seen_batch_dims = []
+    seen_providers = []
+
+    class _DynamicBatchSegSession:
+        def __init__(self, fail_cuda: bool):
+            self.fail_cuda = fail_cuda
+
+        def get_modelmeta(self):
+            return SimpleNamespace(
+                custom_metadata_map={
+                    "window_size": "160000",
+                    "receptive_field_size": "991",
+                    "receptive_field_shift": "270",
+                }
+            )
+
+        def get_inputs(self):
+            return [SimpleNamespace(name="x", shape=["batch_size", 1, 160000])]
+
+        def get_outputs(self):
+            return [SimpleNamespace(name="y")]
+
+        def run(self, out_names, feed):
+            arr = feed["x"]
+            bs = int(arr.shape[0])
+            seen_batch_dims.append(bs)
+            if self.fail_cuda:
+                raise RuntimeError("CUDA OOM on pyannote")
+            out = np.full((bs, 589, 7), -5.0, dtype=np.float32)
+            out[:, :, 0] = 5.0
+            # Long speaker 0 turn (frames 30..350) with a short 0.6s overlapping interjection
+            # by speaker 1 (powerset class 4 = s0+s1) on frames 120..156 (~2.0s..2.6s),
+            # plus a regular ~2.36s speaker 1 anchor turn on frames 380..520 (16.4s..18.8s in win 2)!
+            out[:, 30:120, 0] = -5.0
+            out[:, 30:120, 1] = 5.0
+            out[:, 120:156, 0] = -5.0
+            out[:, 120:156, 4] = 5.0
+            out[:, 156:350, 0] = -5.0
+            out[:, 156:350, 1] = 5.0
+            out[:, 380:520, 0] = -5.0
+            out[:, 380:520, 2] = 5.0
+            return [out]
+
+    qr, _ = np.linalg.qr(rng.randn(192, 3))
+    v0, v1 = qr[:, 0].astype(np.float32), qr[:, 1].astype(np.float32)
+    extracted_durs = []
+
+    class _RecEmbStream:
+        def __init__(self):
+            self.dur = 0.0
+
+        def accept_waveform(self, s_rate, wav):
+            self.dur = len(wav) / float(s_rate)
+            extracted_durs.append(self.dur)
+
+        def input_finished(self):
+            pass
+
+    class _RecEmbExtractor:
+        def __init__(self, cfg):
+            pass
+
+        def create_stream(self):
+            return _RecEmbStream()
+
+        def is_ready(self, stream):
+            return True
+
+        def compute(self, stream):
+            # Speaker 1 owns both the 0.6s overlapping interjection and the ~2.36s anchor turn;
+            # Speaker 0 owns the >3.2s long turns.
+            return v1 if stream.dur < 2.8 else v0
+
+    def _fake_ort_sess(path, sess_options=None, providers=None):
+        seen_providers.append(list(providers or []))
+        is_cuda = "CUDAExecutionProvider" in (providers or [])
+        return _DynamicBatchSegSession(fail_cuda=is_cuda)
+
+    monkeypatch.setattr(
+        tr_mod,
+        "resolve_onnx_provider",
+        lambda req, status_cb=None: ("cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
+    )
+    monkeypatch.setattr(tr_mod.ort, "InferenceSession", _fake_ort_sess)
+    monkeypatch.setattr(tr_mod.sherpa_onnx, "SpeakerEmbeddingExtractor", _RecEmbExtractor)
+    monkeypatch.setattr(tr_mod.sherpa_onnx, "SpeakerEmbeddingExtractorConfig", lambda **kw: SimpleNamespace(**kw))
+    monkeypatch.setattr(
+        tr_mod.sherpa_onnx,
+        "OfflineSpeakerDiarization",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("sherpa SD must NOT run when CPU direct ONNX succeeds")),
+    )
+    _DiarizationCache.active_key = None
+    _DiarizationCache.active_pair = None
+
+    diar_out = Transcriber._run_diarization(
+        samples=wav_20,
+        seg_model_path=str(fake_seg),
+        emb_model_path=str(fake_emb),
+        speaker_count="auto",
+        threads=4,
+        compute_device="cuda",
+    )
+    # Tried CUDA first, retried direct 1-pass ONNX on CPU cleanly (never touched sherpa SD!)
+    assert seen_providers == [["CUDAExecutionProvider", "CPUExecutionProvider"], ["CPUExecutionProvider"]]
+    # Batched ONNX execution was actually used (3 windows on 20s audio -> batch_size=3)
+    assert any(b > 1 for b in seen_batch_dims)
+    # Overlapping <1.2s interjections were NOT inverted to empty slices — both speakers extracted & clustered!
+    assert any(0.3 <= d <= 1.1 for d in extracted_durs)
+    assert len({s.speaker for s in diar_out}) == 2
+
+    # 3. Cloud LLM bounded concurrency + 429 retry + step-wise 400 fallback + partial-batch regex rescue
+    monkeypatch.setattr(llm_mod, "_sleep_with_cancel", lambda *a, **kw: None)
+    turns_8 = [
+        SpeakerTurn(float(i * 4), float(i * 4 + 3), "Спикер 1", f"Реплика {i}: работаем поджирописью и передаём Geson.")
+        for i in range(8)
+    ]
+
+    lock = threading.Lock()
+    active_cnt = {"cur": 0, "peak": 0}
+    seen_bodies = []
+    batch0_400_fired = {"done": False}
+    rate_limit_fired = {"done": False}
+
+    class _ConcurrentCloudClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):
+            body = dict(json or {})
+            payload = json_mod.loads(body["messages"][1]["content"])
+            batch_ids = [item["id"] for item in payload["turns"]]
+            with lock:
+                seen_bodies.append((batch_ids, dict(body)))
+                # Batch 0 rejects response_format with HTTP 400 -> must strip ONLY response_format, keeping thinking=disabled!
+                if batch_ids[0] == 0 and "response_format" in body and not batch0_400_fired["done"]:
+                    batch0_400_fired["done"] = True
+                    req = httpx.Request("POST", url)
+                    raise httpx.HTTPStatusError("400", request=req, response=httpx.Response(400, request=req))
+                # Batch 1 hits transient HTTP 429 once -> must retry and succeed!
+                if batch_ids[0] == 2 and not rate_limit_fired["done"]:
+                    rate_limit_fired["done"] = True
+                    req = httpx.Request("POST", url)
+                    raise httpx.HTTPStatusError(
+                        "429", request=req, response=httpx.Response(429, headers={"Retry-After": "1"}, request=req)
+                    )
+                active_cnt["cur"] += 1
+                active_cnt["peak"] = max(active_cnt["peak"], active_cnt["cur"])
+
+            try:
+                if batch_ids[0] >= 2:
+                    time_mod.sleep(0.05)
+                # Simulate batch 3 (ids 6,7) returning invalid JSON so partial-batch regex rescue is tested!
+                if batch_ids[0] == 6:
+                    content = "not valid json"
+                else:
+                    content = json_mod.dumps(
+                        {
+                            "turns": [
+                                {"id": tid, "text": f"Реплика {tid}: работаем по gRPC (LLM) и передаём Geson."}
+                                for tid in batch_ids
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                return SimpleNamespace(
+                    raise_for_status=lambda: None,
+                    json=lambda c=content: {"choices": [{"finish_reason": "stop", "message": {"content": c}}]},
+                )
+            finally:
+                with lock:
+                    active_cnt["cur"] -= 1
+
+    monkeypatch.setattr(llm_mod, "_create_httpx_client", lambda endpoint, timeout_sec: _ConcurrentCloudClient())
+
+    sa_prompt = ASR_PROMPT_PRESETS["system_analyst"]["prompt"]
+    out_txt = str(tmp_path / "partial_llm.txt")
+    fin_partial = Transcriber._finalize_and_write_transcript(
+        turns=turns_8,
+        duration_sec=32.0,
+        model_name="GigaAM v3",
+        num_speakers=1,
+        output_txt_path=out_txt,
+        custom_prompt=sa_prompt,
+        llm_polish=True,
+        llm_base_url="https://api.deepseek.com/v1",
+        llm_model="deepseek-flash",
+        llm_api_key="sk-test-conc",
+    )
+    # 1) Probed batch 0 stripped ONLY response_format while keeping thinking={"type": "disabled"}!
+    b0_second = [b for ids, b in seen_bodies if ids[0] == 0][1]
+    assert "response_format" not in b0_second
+    assert b0_second["thinking"] == {"type": "disabled"}
+    assert fin_partial["llm_applied"] is True
+    assert fin_partial["raw_transcript_path"] is not None
+    assert os.path.isfile(fin_partial["raw_transcript_path"])
+
+    # 2) Explicit multi-batch concurrency + partial failed_indices check with batch_size=2 (4 batches)
+    active_cnt["cur"] = 0
+    active_cnt["peak"] = 0
+    batch0_400_fired["done"] = False
+    rate_limit_fired["done"] = False
+    seen_bodies.clear()
+    polished_4b, stats_4b = polish_turns_with_local_llm(
+        turns=turns_8,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-flash",
+        api_key="sk-test-conc",
+        custom_prompt=sa_prompt,
+        batch_size=2,
+    )
+    assert active_cnt["peak"] >= 2
+    assert stats_4b["applied"] is True
+    assert stats_4b["batches_ok"] == 3
+    assert stats_4b["batches_total"] == 4
+    assert stats_4b["failed_indices"] == [6, 7]
+    assert "по gRPC (LLM)" in polished_4b[0].text
+    assert "по gRPC (LLM)" in polished_4b[2].text  # Batch 1 recovered after 429 retry!
+    assert polished_4b[6].text == turns_8[6].text  # Batch 3 raw preserved by LLM layer
+
+    # Verify _finalize_and_write_transcript rescues ONLY failed_indices [6, 7] with regex glossary
+    monkeypatch.setattr(
+        tr_mod,
+        "polish_turns_with_local_llm",
+        lambda turns, **kw: (polished_4b, stats_4b),
+    )
+    fin_rescue = Transcriber._finalize_and_write_transcript(
+        turns=turns_8,
+        duration_sec=32.0,
+        model_name="GigaAM v3",
+        num_speakers=1,
+        output_txt_path=out_txt,
+        custom_prompt=sa_prompt,
+        llm_polish=True,
+        llm_base_url="https://api.deepseek.com/v1",
+        llm_model="deepseek-flash",
+    )
+    # Turn 0 (LLM succeeded): regex did NOT touch 'Geson'
+    assert "Geson" in fin_rescue["turns"][0].text and "(LLM)" in fin_rescue["turns"][0].text
+    # Turn 6 (LLM batch failed): regex rescued 'поджирописью' -> 'по gRPC' and 'Geson' -> 'JSON'!
+    assert "по gRPC" in fin_rescue["turns"][6].text and "JSON" in fin_rescue["turns"][6].text
+
+    # Re-running with llm_polish=False MUST remove stale _raw.txt backup
+    raw_backup_file = fin_rescue["raw_transcript_path"]
+    assert raw_backup_file and os.path.isfile(raw_backup_file)
+    Transcriber._finalize_and_write_transcript(
+        turns=turns_8,
+        duration_sec=32.0,
+        model_name="GigaAM v3",
+        num_speakers=1,
+        output_txt_path=out_txt,
+        custom_prompt=sa_prompt,
+        llm_polish=False,
+    )
+    assert not os.path.exists(raw_backup_file)
+
+    # 4. Deepgram Nova-3 transient HTTP 503 retry recovers cleanly
+    monkeypatch.setattr(dg_mod, "_sleep_with_cancel", lambda *a, **kw: None)
+    dg_wav = str(tmp_path / "dg_503.wav")
+    Transcriber._write_wav_16k_mono(dg_wav, rng.normal(0.0, 0.1, sr * 2).astype(np.float32), sample_rate=sr)
+    dg_attempts = {"n": 0}
+
+    class _Transient503Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, params=None, headers=None, content=None):
+            dg_attempts["n"] += 1
+            if dg_attempts["n"] == 1:
+                req = httpx.Request("POST", url)
+                return SimpleNamespace(
+                    raise_for_status=lambda: (_ for _ in ()).throw(
+                        httpx.HTTPStatusError("503", request=req, response=httpx.Response(503, request=req))
+                    )
+                )
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "results": {
+                        "channels": [
+                            {
+                                "alternatives": [
+                                    {
+                                        "words": [
+                                            {"word": "ok", "punctuated_word": "Ок.", "start": 0.2, "end": 0.6, "speaker": 0}
+                                        ]
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+
+    monkeypatch.setattr(dg_mod, "_create_deepgram_httpx_client", lambda timeout_sec: _Transient503Client())
+    dg_units, dg_diar = transcribe_with_deepgram_nova3(wav_path=dg_wav, api_key="dg-test-key", language="ru")
+    assert dg_attempts["n"] == 2
+    assert len(dg_units) == 1 and dg_units[0].text.strip() == "Ок."
+    assert len(dg_diar) == 1
+
+

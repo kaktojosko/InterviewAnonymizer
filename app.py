@@ -123,6 +123,10 @@ def _audio_cache_track2_path(task_id: str) -> str:
     return os.path.join(AUDIO_CACHE_DIR, f"{task_id}.track2.wav")
 
 
+def _raw_transcript_path(task_id: str) -> str:
+    return os.path.join("output", f"{task_id}_transcript_raw.txt")
+
+
 def _prune_audio_cache(keep_task_id: str | None = None) -> None:
     if not os.path.isdir(AUDIO_CACHE_DIR):
         return
@@ -413,6 +417,7 @@ def background_process(
         audio_cached = bool(result.get("audio_cached"))
         tasks[task_id]["video_ready"] = video_ready
         tasks[task_id]["transcript_ready"] = bool(result.get("transcript_ready"))
+        tasks[task_id]["raw_transcript_ready"] = os.path.isfile(_raw_transcript_path(task_id))
         tasks[task_id]["has_original_audio"] = audio_cached
         tasks[task_id]["can_transcribe"] = audio_cached or video_ready
         tasks[task_id]["status"] = "completed"
@@ -427,6 +432,7 @@ def background_process(
             entry["message"] = "Обработка прервана."
             entry["video_ready"] = False
             entry["transcript_ready"] = False
+            entry["raw_transcript_ready"] = False
             entry["has_original_audio"] = False
             entry["can_transcribe"] = False
             cancel_note = "Обработка прервана пользователем."
@@ -440,6 +446,7 @@ def background_process(
                 entry["message"] = "Обработка прервана."
                 entry["video_ready"] = False
                 entry["transcript_ready"] = False
+                entry["raw_transcript_ready"] = False
                 entry["has_original_audio"] = False
                 entry["can_transcribe"] = False
         else:
@@ -454,6 +461,7 @@ def background_process(
         if cancel_token.is_cancelled() or tasks.get(task_id, {}).get("status") == "cancelled":
             _safe_remove(output_path)
             _safe_remove(transcript_path)
+            _safe_remove(_raw_transcript_path(task_id))
             _safe_remove(cached_audio_path)
             _safe_remove(cached_track2_path)
 
@@ -592,6 +600,7 @@ def background_transcribe_only(
         has_orig_audio = os.path.isfile(cached_audio_path)
         tasks[task_id]["video_ready"] = prev_video_ready
         tasks[task_id]["transcript_ready"] = bool(result.get("transcript_ready"))
+        tasks[task_id]["raw_transcript_ready"] = os.path.isfile(_raw_transcript_path(task_id))
         tasks[task_id]["has_original_audio"] = has_orig_audio
         tasks[task_id]["can_transcribe"] = has_orig_audio or prev_video_ready
         tasks[task_id]["status"] = "completed"
@@ -606,6 +615,7 @@ def background_transcribe_only(
             entry["message"] = "Транскрибация прервана."
             entry["video_ready"] = prev_video_ready
             entry["transcript_ready"] = prev_transcript_ready and os.path.isfile(transcript_path)
+            entry["raw_transcript_ready"] = prev_transcript_ready and os.path.isfile(_raw_transcript_path(task_id))
             entry["has_original_audio"] = os.path.isfile(cached_audio_path)
             entry["can_transcribe"] = entry["has_original_audio"] or prev_video_ready
             cancel_note = "Обработка прервана пользователем."
@@ -619,6 +629,7 @@ def background_transcribe_only(
                 entry["message"] = "Транскрибация прервана."
                 entry["video_ready"] = prev_video_ready
                 entry["transcript_ready"] = prev_transcript_ready and os.path.isfile(transcript_path)
+                entry["raw_transcript_ready"] = prev_transcript_ready and os.path.isfile(_raw_transcript_path(task_id))
                 entry["has_original_audio"] = os.path.isfile(cached_audio_path)
                 entry["can_transcribe"] = entry["has_original_audio"] or prev_video_ready
         else:
@@ -628,6 +639,7 @@ def background_transcribe_only(
             tasks[task_id]["logs"].append(str(e))
             tasks[task_id]["video_ready"] = prev_video_ready
             tasks[task_id]["transcript_ready"] = prev_transcript_ready and os.path.isfile(transcript_path)
+            tasks[task_id]["raw_transcript_ready"] = prev_transcript_ready and os.path.isfile(_raw_transcript_path(task_id))
             tasks[task_id]["has_original_audio"] = os.path.isfile(cached_audio_path)
             tasks[task_id]["can_transcribe"] = tasks[task_id]["has_original_audio"] or prev_video_ready
     finally:
@@ -639,6 +651,7 @@ def background_transcribe_only(
             cancel_token.is_cancelled() or tasks.get(task_id, {}).get("status") == "cancelled"
         ):
             _safe_remove(transcript_path)
+            _safe_remove(_raw_transcript_path(task_id))
             _safe_remove(cached_audio_path)
             _safe_remove(cached_track2_path)
 
@@ -1136,6 +1149,7 @@ async def list_recordings():
         if task_info.get("status") in ("queued", "processing"):
             continue
         has_orig = os.path.isfile(_audio_cache_path(tid))
+        has_raw = os.path.isfile(_raw_transcript_path(tid))
         can_transcribe = has_orig or rec["video_ready"]
         created_iso = datetime.fromtimestamp(rec["mtime"], tz=timezone.utc).isoformat()
         items.append(
@@ -1147,6 +1161,7 @@ async def list_recordings():
                 "video_ready": rec["video_ready"],
                 "video_size_bytes": rec["video_size_bytes"],
                 "transcript_ready": rec["transcript_ready"],
+                "raw_transcript_ready": has_raw,
                 "transcript_size_bytes": rec["transcript_size_bytes"],
                 "has_original_audio": has_orig,
                 "can_transcribe": can_transcribe,
@@ -1228,6 +1243,7 @@ async def get_status(task_id: str):
         transcript_path = os.path.join("output", f"{task_id}_transcript.txt")
         has_video = os.path.isfile(video_path)
         has_transcript = os.path.isfile(transcript_path)
+        has_raw_transcript = os.path.isfile(_raw_transcript_path(task_id))
         has_orig = os.path.isfile(_audio_cache_path(task_id))
         if has_video or has_transcript:
             return {
@@ -1238,6 +1254,7 @@ async def get_status(task_id: str):
                 "logs": [],
                 "video_ready": has_video,
                 "transcript_ready": has_transcript,
+                "raw_transcript_ready": has_raw_transcript,
                 "transcribe_enabled": has_transcript,
                 "has_original_audio": has_orig,
                 "can_transcribe": has_orig or has_video,
@@ -1273,7 +1290,7 @@ async def download_video(task_id: str):
 
 
 @app.get("/api/download-transcript/{task_id}")
-async def download_transcript(task_id: str):
+async def download_transcript(task_id: str, raw: bool = False):
     _validate_task_id(task_id)
     if task_id in tasks:
         entry = tasks[task_id]
@@ -1283,6 +1300,16 @@ async def download_transcript(task_id: str):
             raise HTTPException(status_code=400, detail="Transcript not ready or task failed")
         if not entry.get("transcript_ready"):
             raise HTTPException(status_code=404, detail="Transcript was disabled or not generated for this task")
+
+    if raw:
+        raw_path = _raw_transcript_path(task_id)
+        if not os.path.exists(raw_path):
+            raise HTTPException(status_code=404, detail="Raw ASR backup transcript not found")
+        return FileResponse(
+            raw_path,
+            media_type="text/plain; charset=utf-8",
+            filename=f"transcript_{task_id}_raw.txt",
+        )
 
     transcript_path = os.path.join("output", f"{task_id}_transcript.txt")
     if not os.path.exists(transcript_path):

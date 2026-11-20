@@ -1154,9 +1154,12 @@ def build_longform_asr_chunks(
         else:
             return []
 
-    # Merge overlapping spans first, then pack nearby islands up to max_len with +-220ms edge pad
+    # Merge nearby speech spans (<=0.55s micro-pauses) into continuous islands BEFORE
+    # splitting at max_len, so adjacent phrases never get hard-cut with 0s overlap when
+    # their combined length exceeds max_len; the splitter below will find a verified
+    # >=150ms silence valley (+-0.5s overlap) or use a full sliding overlap window.
     outer_pad = 0.22
-    base_spans = _merge_time_intervals(raw_spans, gap_tol=0.14)
+    base_spans = _merge_time_intervals(raw_spans, gap_tol=0.55)
     packed: list[tuple[float, float]] = []
     for s, e in base_spans:
         ps = max(0.0, s - outer_pad)
@@ -1165,12 +1168,10 @@ def build_longform_asr_chunks(
             packed.append((ps, pe))
         else:
             prev_s, prev_e = packed[-1]
-            if ps <= prev_e + 0.55 and (pe - prev_s) <= max_len:
+            if ps <= prev_e + 0.12:
                 packed[-1] = (prev_s, max(prev_e, pe))
             else:
-                ps = max(ps, prev_e)
-                if pe > ps + 0.05:
-                    packed.append((ps, pe))
+                packed.append((ps, pe))
 
     pause_ctx_ov = min(0.50, ov * 0.5) if ov > 0.0 else 0.0
 
@@ -2715,6 +2716,7 @@ def _run_direct_pyannote_segmentation(
     sample_rate: int = 16000,
     status_cb: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancellationToken] = None,
+    batch_size: int = 1,
 ) -> list[DiarizationSegment]:
     meta = {}
     try:
@@ -2730,8 +2732,14 @@ def _run_direct_pyannote_segmentation(
 
     inp_info = seg_session.get_inputs()[0]
     inp_name = inp_info.name
-    inp_rank = len(inp_info.shape or [1, 1, window_size])
+    inp_shape = list(inp_info.shape or [1, 1, window_size])
+    inp_rank = len(inp_shape)
     out_name = seg_session.get_outputs()[0].name
+
+    # Enable batched window inference only when ONNX input dim 0 is dynamic (str / None / <=0)
+    dim0 = inp_shape[0] if inp_shape else 1
+    supports_dynamic_batch = not (isinstance(dim0, int) and dim0 == 1)
+    eff_batch = max(1, int(batch_size)) if supports_dynamic_batch else 1
 
     total_samples = int(samples.size)
     total_dur_s = total_samples / float(sample_rate)
@@ -2745,29 +2753,45 @@ def _run_direct_pyannote_segmentation(
     window_outputs: list[tuple[int, np.ndarray]] = []
     last_pct = 0
     last_log_t = 0.0
-    buf = np.zeros(window_size, dtype=np.float32)
 
-    for idx, win_s in enumerate(starts):
+    def _fill_batch(batch_starts: list[int]) -> np.ndarray:
+        n = len(batch_starts)
+        arr = np.zeros((n, window_size), dtype=np.float32)
+        for bi, ws in enumerate(batch_starts):
+            chunk = samples[ws : min(total_samples, ws + window_size)]
+            arr[bi, : chunk.size] = chunk
+        return arr.reshape(n, 1, window_size) if inp_rank == 3 else arr
+
+    idx = 0
+    while idx < total_windows:
         if cancel_token:
             cancel_token.check()
 
-        chunk = samples[win_s : min(total_samples, win_s + window_size)]
-        if chunk.size == window_size:
-            win_arr = np.ascontiguousarray(chunk, dtype=np.float32)
-        else:
-            buf.fill(0.0)
-            buf[: chunk.size] = chunk
-            win_arr = buf
+        cur_bs = min(eff_batch, total_windows - idx)
+        batch_starts = starts[idx : idx + cur_bs]
+        feed = _fill_batch(batch_starts)
 
-        feed = win_arr.reshape(1, 1, window_size) if inp_rank == 3 else win_arr.reshape(1, window_size)
-        out = seg_session.run([out_name], {inp_name: feed})[0]
-        logits = np.asarray(out, dtype=np.float32)
-        if logits.ndim == 3:
-            logits = logits[0]
-        window_outputs.append((win_s, logits))
+        try:
+            out = seg_session.run([out_name], {inp_name: feed})[0]
+            logits_batch = np.asarray(out, dtype=np.float32)
+            if logits_batch.ndim == 2:
+                logits_batch = logits_batch[None, :, :]
+            if logits_batch.shape[0] != cur_bs:
+                raise ValueError(f"Batch size mismatch: expected {cur_bs}, got {logits_batch.shape[0]}")
+            for bi, ws in enumerate(batch_starts):
+                window_outputs.append((ws, logits_batch[bi]))
+            idx += cur_bs
+        except Exception:
+            if cancel_token and cancel_token.is_cancelled():
+                raise
+            if cur_bs > 1:
+                # Transparently downgrade to batch_size=1 if ONNX graph rejects batched dim
+                eff_batch = 1
+                continue
+            raise
 
         if status_cb and total_windows > 0:
-            pct = int(((idx + 1) * 80) / total_windows)
+            pct = int((idx * 80) / total_windows)
             now = time.time()
             if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
                 last_pct = pct
@@ -2891,52 +2915,58 @@ class Transcriber:
         extractor = None
 
         # Fast single-pass path: run pyannote-segmentation-3-0/model.onnx directly via
-        # onnxruntime (5s hop, optional GPU CUDA, zero redundant Pass-1 CAM++ extraction).
-        # Falls back transparently to sherpa-onnx OfflineSpeakerDiarization on any error
-        # or when seg_model_path is a mocked path.
+        # onnxruntime (5s hop, batched windows, optional GPU CUDA with CPU direct retry,
+        # zero redundant Pass-1 CAM++ extraction). Falls back to sherpa-onnx on error.
         if seg_model_path and os.path.isfile(seg_model_path):
             eff_seg_dev, seg_providers = resolve_onnx_provider(req_dev)
-            direct_key = (
-                "onnx_pyannote_v1",
-                seg_model_path,
-                emb_model_path,
-                eff_seg_dev,
-                diar_threads,
-                emb_intra_threads,
-            )
+            attempts: list[tuple[str, list[str]]] = [(eff_seg_dev, seg_providers)]
+            if eff_seg_dev == "cuda":
+                attempts.append(("cpu", ["CPUExecutionProvider"]))
 
-            def _create_direct_engines():
-                opts = ort.SessionOptions()
-                opts.intra_op_num_threads = diar_threads
-                opts.inter_op_num_threads = 1
-                seg_sess = ort.InferenceSession(
-                    seg_model_path, sess_options=opts, providers=seg_providers
+            for dev_try, prov_try in attempts:
+                direct_key = (
+                    "onnx_pyannote_v1",
+                    seg_model_path,
+                    emb_model_path,
+                    dev_try,
+                    diar_threads,
+                    emb_intra_threads,
                 )
-                ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
-                    sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                        model=emb_model_path,
-                        num_threads=emb_intra_threads,
-                        provider="cpu",
+
+                def _create_direct_engines(_provs=prov_try):
+                    opts = ort.SessionOptions()
+                    opts.intra_op_num_threads = diar_threads
+                    opts.inter_op_num_threads = 1
+                    seg_sess = ort.InferenceSession(
+                        seg_model_path, sess_options=opts, providers=_provs
                     )
-                )
-                return seg_sess, ext_inst
+                    ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
+                        sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                            model=emb_model_path,
+                            num_threads=emb_intra_threads,
+                            provider="cpu",
+                        )
+                    )
+                    return seg_sess, ext_inst
 
-            try:
-                seg_session, extractor = _DiarizationCache.get_or_create(
-                    direct_key, _create_direct_engines
-                )
-                raw_objs = _run_direct_pyannote_segmentation(
-                    seg_session=seg_session,
-                    samples=samples,
-                    sample_rate=16000,
-                    status_cb=status_cb,
-                    cancel_token=cancel_token,
-                )
-            except Exception:
-                if cancel_token and cancel_token.is_cancelled():
-                    raise
-                raw_objs = None
-                extractor = None
+                try:
+                    seg_session, extractor = _DiarizationCache.get_or_create(
+                        direct_key, _create_direct_engines
+                    )
+                    raw_objs = _run_direct_pyannote_segmentation(
+                        seg_session=seg_session,
+                        samples=samples,
+                        sample_rate=16000,
+                        status_cb=status_cb,
+                        cancel_token=cancel_token,
+                        batch_size=16 if dev_try == "cuda" else 4,
+                    )
+                    break
+                except Exception:
+                    if cancel_token and cancel_token.is_cancelled():
+                        raise
+                    raw_objs = None
+                    extractor = None
 
         if raw_objs is None:
             # Safe fallback: sherpa-onnx OfflineSpeakerDiarization with 0.25 window shift ratio
@@ -3050,8 +3080,13 @@ class Transcriber:
         total_dur_s = len(samples) / 16000.0
 
         def _neighbor_bounds(idx: int) -> tuple[float, float]:
-            lo = pre_merged[idx - 1].end if idx > 0 else 0.0
-            hi = pre_merged[idx + 1].start if idx + 1 < len(pre_merged) else total_dur_s
+            seg = pre_merged[idx]
+            raw_lo = pre_merged[idx - 1].end if idx > 0 else 0.0
+            raw_hi = pre_merged[idx + 1].start if idx + 1 < len(pre_merged) else total_dur_s
+            # When two speaker segments overlap (powerset classes 4/5/6), raw_lo can exceed
+            # seg.start or raw_hi can precede seg.end — clamp so short turns never invert to empty slices.
+            lo = min(seg.start, raw_lo)
+            hi = max(seg.end, raw_hi)
             return lo, hi
 
         if emb_workers <= 1 or len(pre_merged) < 8:
@@ -3814,7 +3849,7 @@ class Transcriber:
 
                     has_left_ov = k_start > c_start + 1e-4
                     has_right_ov = k_end < c_end - 1e-4
-                    first_kept_on_seam = has_left_ov
+                    seam_checks_left = 2 if has_left_ov else 0
                     for u in chunk_units:
                         if has_left_ov or has_right_ov:
                             mid = 0.5 * (u.start + u.end)
@@ -3822,13 +3857,13 @@ class Transcriber:
                                 continue
                             if has_right_ov and mid >= k_end:
                                 continue
-                        if first_kept_on_seam and out_units:
-                            first_kept_on_seam = False
-                            prev_u = out_units[-1]
-                            if (
-                                abs(u.start - prev_u.start) <= 0.35
-                                and _clean_word_lower(u.text)
-                                and _clean_word_lower(u.text) == _clean_word_lower(prev_u.text)
+                        if seam_checks_left > 0 and out_units:
+                            seam_checks_left -= 1
+                            cur_w = _clean_word_lower(u.text)
+                            if cur_w and any(
+                                abs(u.start - prev_u.start) <= 0.45
+                                and cur_w == _clean_word_lower(prev_u.text)
+                                for prev_u in out_units[-2:]
                             ):
                                 continue
                         out_units.append(u)
@@ -3939,7 +3974,10 @@ class Transcriber:
             notes.append(base_note)
 
         llm_applied = False
+        llm_failed_indices: set[int] = set()
         raw_backup_path: Optional[str] = None
+        stem, ext = os.path.splitext(output_txt_path)
+        candidate_raw_path = f"{stem}_raw{ext or '.txt'}"
 
         if llm_polish and final_turns:
             # Pass raw ASR turns directly to the LLM (avoid blind regex corruption before context-aware editing)
@@ -3950,8 +3988,7 @@ class Transcriber:
                 num_speakers=num_speakers,
                 note="\n".join(notes) if notes else None,
             )
-            stem, ext = os.path.splitext(output_txt_path)
-            raw_backup_path = f"{stem}_raw{ext or '.txt'}"
+            raw_backup_path = candidate_raw_path
             try:
                 with open(raw_backup_path, "w", encoding="utf-8") as rf:
                     rf.write(raw_text)
@@ -3970,21 +4007,43 @@ class Transcriber:
             if llm_stats.get("applied"):
                 final_turns = polished_turns
                 llm_applied = True
+                llm_failed_indices = set(llm_stats.get("failed_indices") or [])
                 notes.append(
                     f"# Постобработка: LLM-корректура ({llm_model}, исправлено реплик: {llm_stats.get('changed_turns', 0)})"
                 )
+        else:
+            # Remove any stale _raw.txt backup from a previous LLM-polished run on this recording
+            if os.path.isfile(candidate_raw_path):
+                try:
+                    os.remove(candidate_raw_path)
+                except OSError:
+                    pass
 
-        # Opt-in phonetic regex glossary runs ONLY when LLM polish is off or did not apply
-        if not llm_applied and custom_prompt and custom_prompt.strip():
-            final_turns = [
-                SpeakerTurn(
-                    t.start,
-                    t.end,
-                    t.speaker_label,
-                    apply_custom_glossary_terms(t.text, custom_prompt),
-                )
-                for t in final_turns
-            ]
+        # Opt-in phonetic regex glossary runs ONLY when LLM polish is off/unapplied,
+        # OR selectively on turns whose LLM batch failed so no batch is left completely unpolished.
+        if custom_prompt and custom_prompt.strip():
+            if not llm_applied:
+                final_turns = [
+                    SpeakerTurn(
+                        t.start,
+                        t.end,
+                        t.speaker_label,
+                        apply_custom_glossary_terms(t.text, custom_prompt),
+                    )
+                    for t in final_turns
+                ]
+            elif llm_failed_indices:
+                final_turns = [
+                    SpeakerTurn(
+                        t.start,
+                        t.end,
+                        t.speaker_label,
+                        apply_custom_glossary_terms(t.text, custom_prompt),
+                    )
+                    if idx in llm_failed_indices
+                    else t
+                    for idx, t in enumerate(final_turns)
+                ]
 
         transcript_text = format_transcript_txt(
             turns=final_turns,

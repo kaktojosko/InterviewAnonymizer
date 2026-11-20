@@ -45,6 +45,7 @@ const cancelIcon = document.getElementById('cancelIcon');
 const cancelBtn = document.getElementById('cancelBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 const downloadTranscriptBtn = document.getElementById('downloadTranscriptBtn');
+const downloadRawTranscriptBtn = document.getElementById('downloadRawTranscriptBtn');
 const resetBtn = document.getElementById('resetBtn');
 const debugLog = document.getElementById('debugLog');
 
@@ -2041,9 +2042,13 @@ function bindDownloadButtons(data = {}) {
         ? Boolean(data.video_ready)
         : data.mode !== 'transcribe_only';
     const hasTranscript = Boolean(data.transcript_ready);
+    const hasRawTranscript = hasTranscript && Boolean(data.raw_transcript_ready);
 
     downloadBtn.classList.toggle('hidden', !hasVideo);
     downloadTranscriptBtn.classList.toggle('hidden', !hasTranscript);
+    if (downloadRawTranscriptBtn) {
+        downloadRawTranscriptBtn.classList.toggle('hidden', !hasRawTranscript);
+    }
 
     if (hasVideo) {
         downloadBtn.onclick = () => {
@@ -2055,7 +2060,12 @@ function bindDownloadButtons(data = {}) {
             window.location.href = `/api/download-transcript/${currentTaskId}`;
         };
     }
-    return { hasVideo, hasTranscript };
+    if (downloadRawTranscriptBtn && hasRawTranscript) {
+        downloadRawTranscriptBtn.onclick = () => {
+            window.location.href = `/api/download-transcript/${currentTaskId}?raw=true`;
+        };
+    }
+    return { hasVideo, hasTranscript, hasRawTranscript };
 }
 
 function showSuccess(data = {}) {
@@ -2102,6 +2112,7 @@ function showCancelled(msg, data = null) {
     } else {
         downloadBtn.classList.add('hidden');
         downloadTranscriptBtn.classList.add('hidden');
+        if (downloadRawTranscriptBtn) downloadRawTranscriptBtn.classList.add('hidden');
         if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
     }
 
@@ -2195,6 +2206,7 @@ resetBtn.onclick = () => {
     }
     downloadBtn.classList.add('hidden');
     downloadTranscriptBtn.classList.add('hidden');
+    if (downloadRawTranscriptBtn) downloadRawTranscriptBtn.classList.add('hidden');
     if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
     if (postTranscribeForm) postTranscribeForm.classList.add('hidden');
     if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');

@@ -4113,3 +4113,53 @@ function runScenario({ initialLocalStorage = {} } = {}) {
     )
     assert proc.returncode == 0, f"Node v5.1 frontend test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert "FRONTEND_V51_ALL_OK" in proc.stdout
+
+
+def test_api_raw_transcript_backup_download_and_status():
+    import uuid
+    from app import _raw_transcript_path
+
+    client = TestClient(app)
+    tid = str(uuid.uuid4())
+    txt_path = os.path.join("output", f"{tid}_transcript.txt")
+    raw_path = _raw_transcript_path(tid)
+    os.makedirs("output", exist_ok=True)
+
+    try:
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("[00:00:01 - 00:00:04] Спикер 1: Работаем по gRPC.\n")
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write("[00:00:01 - 00:00:04] Спикер 1: Работаем поджирописью.\n")
+
+        # 1. Disk fallback status reports raw_transcript_ready=True
+        st_resp = client.get(f"/api/status/{tid}")
+        assert st_resp.status_code == 200
+        st_data = st_resp.json()
+        assert st_data["transcript_ready"] is True
+        assert st_data["raw_transcript_ready"] is True
+
+        # 2. /api/recordings reports raw_transcript_ready=True
+        rec_resp = client.get("/api/recordings")
+        assert rec_resp.status_code == 200
+        rec = next((r for r in rec_resp.json()["recordings"] if r["task_id"] == tid), None)
+        assert rec is not None and rec["raw_transcript_ready"] is True
+
+        # 3. Default download returns polished transcript; ?raw=true returns raw ASR backup
+        dl_main = client.get(f"/api/download-transcript/{tid}")
+        assert dl_main.status_code == 200
+        assert "по gRPC" in dl_main.text
+
+        dl_raw = client.get(f"/api/download-transcript/{tid}?raw=true")
+        assert dl_raw.status_code == 200
+        assert "поджирописью" in dl_raw.text
+        assert f"transcript_{tid}_raw.txt" in dl_raw.headers.get("content-disposition", "")
+
+        # 4. Once _raw.txt is removed, raw_transcript_ready becomes False and ?raw=true returns 404
+        os.remove(raw_path)
+        assert client.get(f"/api/status/{tid}").json()["raw_transcript_ready"] is False
+        assert client.get(f"/api/download-transcript/{tid}?raw=true").status_code == 404
+    finally:
+        for p in (txt_path, raw_path):
+            if os.path.exists(p):
+                os.remove(p)
+

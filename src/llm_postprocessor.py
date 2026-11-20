@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
 from urllib.parse import urlparse
 
@@ -277,6 +279,23 @@ def _parse_and_validate_batch_response(
     return result_map
 
 
+def _sleep_with_cancel(
+    delay_sec: float,
+    cancel_token: Optional[CancellationToken] = None,
+    abort_event: Optional[threading.Event] = None,
+) -> None:
+    end_t = time.time() + max(0.0, float(delay_sec))
+    while True:
+        if cancel_token:
+            cancel_token.check()
+        if abort_event is not None and abort_event.is_set():
+            return
+        rem = end_t - time.time()
+        if rem <= 0.0:
+            return
+        time.sleep(min(0.25, rem))
+
+
 def polish_turns_with_local_llm(
     turns: list,
     base_url: str,
@@ -296,14 +315,26 @@ def polish_turns_with_local_llm(
     labels, and turn structure. Any error safely preserves original turns.
     """
     if not turns:
-        return turns, {"applied": False, "batches_ok": 0, "batches_total": 0, "changed_turns": 0}
+        return turns, {
+            "applied": False,
+            "batches_ok": 0,
+            "batches_total": 0,
+            "changed_turns": 0,
+            "failed_indices": [],
+        }
 
     endpoint = _normalize_chat_endpoint(base_url)
     model_name = (model or "").strip()
     if not endpoint or not model_name:
         if status_cb:
             status_cb("LLM-корректура пропущена: не указан URL или имя модели.")
-        return turns, {"applied": False, "batches_ok": 0, "batches_total": 0, "changed_turns": 0}
+        return turns, {
+            "applied": False,
+            "batches_ok": 0,
+            "batches_total": 0,
+            "changed_turns": 0,
+            "failed_indices": list(range(len(turns))),
+        }
 
     is_local = _is_local_endpoint(endpoint)
     is_deepseek = _is_deepseek_endpoint(endpoint)
@@ -313,41 +344,92 @@ def polish_turns_with_local_llm(
     if api_key and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
 
+    orig_turns = list(turns)
     polished_turns = list(turns)
     batches = _build_turn_batches(
-        polished_turns,
+        orig_turns,
         batch_size=batch_size,
         max_batch_chars=max_batch_chars,
     )
     total_batches = len(batches)
     batches_ok = 0
     changed_turns = 0
+    done_batches = 0
+    failed_indices: set[int] = set()
     use_json_response_format = True
     use_deepseek_thinking_disable = is_deepseek
+    state_lock = threading.Lock()
+    abort_event = threading.Event()
+    cloud_workers = 1 if (is_local or total_batches <= 2) else min(3, total_batches - 1)
 
     if status_cb:
         mode_extra = ", non-thinking" if use_deepseek_thinking_disable else ""
+        conc_extra = f", потоков: {cloud_workers}" if cloud_workers > 1 else ""
         status_cb(
-            f"Шаг 4: LLM-корректура ({mode_tag}: {model_name}{mode_extra} @ {endpoint}, батчей: {total_batches})..."
+            f"Шаг 4: LLM-корректура ({mode_tag}: {model_name}{mode_extra} @ {endpoint}, "
+            f"батчей: {total_batches}{conc_extra})..."
         )
+
+    _TRANSIENT_HTTP_CODES = (429, 500, 502, 503, 504)
+
+    def _post_with_retry(client: httpx.Client, cur_body: dict) -> httpx.Response:
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            if cancel_token:
+                cancel_token.check()
+            try:
+                resp = client.post(endpoint, headers=headers, json=cur_body)
+                resp.raise_for_status()
+                return resp
+            except httpx.HTTPStatusError as exc:
+                sc = exc.response.status_code if exc.response is not None else 0
+                if sc in _TRANSIENT_HTTP_CODES and attempt < max_retries and not abort_event.is_set():
+                    retry_after = 0.0
+                    if exc.response is not None:
+                        ra_hdr = exc.response.headers.get("Retry-After", "")
+                        try:
+                            retry_after = float(ra_hdr)
+                        except (TypeError, ValueError):
+                            retry_after = 0.0
+                    delay = min(8.0, max(0.5, retry_after)) if retry_after > 0.0 else min(4.0, 1.0 * (2 ** attempt))
+                    _sleep_with_cancel(delay, cancel_token=cancel_token, abort_event=abort_event)
+                    continue
+                raise
+            except httpx.ReadTimeout:
+                if attempt < max_retries and not abort_event.is_set():
+                    _sleep_with_cancel(min(4.0, 1.0 * (2 ** attempt)), cancel_token=cancel_token, abort_event=abort_event)
+                    continue
+                raise
 
     def _send_completion(client: httpx.Client, req_body: dict) -> tuple[str, str, bool]:
         nonlocal use_json_response_format, use_deepseek_thinking_disable
         cur_body = dict(req_body)
         try:
-            resp = client.post(endpoint, headers=headers, json=cur_body)
-            resp.raise_for_status()
+            resp = _post_with_retry(client, cur_body)
         except httpx.HTTPStatusError as rf_exc:
             sc = rf_exc.response.status_code if rf_exc.response is not None else 0
             if sc in (400, 422) and ("response_format" in cur_body or "thinking" in cur_body):
+                # Step 1: strip response_format FIRST while keeping thinking={"type": "disabled"} intact!
                 if "response_format" in cur_body:
-                    use_json_response_format = False
+                    with state_lock:
+                        use_json_response_format = False
                     cur_body.pop("response_format", None)
-                if "thinking" in cur_body:
-                    use_deepseek_thinking_disable = False
+                    try:
+                        resp = _post_with_retry(client, cur_body)
+                    except httpx.HTTPStatusError as rf_exc2:
+                        sc2 = rf_exc2.response.status_code if rf_exc2.response is not None else 0
+                        if sc2 in (400, 422) and "thinking" in cur_body:
+                            with state_lock:
+                                use_deepseek_thinking_disable = False
+                            cur_body.pop("thinking", None)
+                            resp = _post_with_retry(client, cur_body)
+                        else:
+                            raise
+                else:
+                    with state_lock:
+                        use_deepseek_thinking_disable = False
                     cur_body.pop("thinking", None)
-                resp = client.post(endpoint, headers=headers, json=cur_body)
-                resp.raise_for_status()
+                    resp = _post_with_retry(client, cur_body)
             else:
                 raise
 
@@ -359,120 +441,184 @@ def polish_turns_with_local_llm(
         has_reasoning = bool(msg0.get("reasoning_content"))
         return raw_content, finish_reason, has_reasoning
 
-    t0 = time.time()
-    with _create_httpx_client(endpoint, timeout_sec) as client:
-        for b_idx, (start_i, end_i) in enumerate(batches):
-            if cancel_token:
-                cancel_token.check()
+    def _run_batch(client: httpx.Client, b_idx: int, start_i: int, end_i: int) -> None:
+        nonlocal batches_ok, changed_turns, done_batches
+        if cancel_token:
+            cancel_token.check()
+        if abort_event.is_set():
+            with state_lock:
+                failed_indices.update(range(start_i, end_i))
+            return
 
-            batch_spec = [
-                (i, polished_turns[i].speaker_label, polished_turns[i].text)
-                for i in range(start_i, end_i)
-            ]
-            ctx_start = max(0, start_i - 2)
-            prev_ctx = [
-                (polished_turns[i].speaker_label, polished_turns[i].text)
-                for i in range(ctx_start, start_i)
-            ]
+        ctx_source = polished_turns if is_local else orig_turns
+        batch_spec = [
+            (i, orig_turns[i].speaker_label, orig_turns[i].text)
+            for i in range(start_i, end_i)
+        ]
+        ctx_start = max(0, start_i - 2)
+        prev_ctx = [
+            (ctx_source[i].speaker_label, ctx_source[i].text)
+            for i in range(ctx_start, start_i)
+        ]
 
-            messages = _build_polish_messages(batch_spec, prev_ctx, custom_prompt=custom_prompt)
-            batch_chars = sum(len(txt) for _, _, txt in batch_spec)
-            base_max_tokens = min(16384, max(2048, batch_chars * 3))
-            body: dict = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.05,
-                "max_tokens": base_max_tokens,
-                "stream": False,
-            }
-            if use_deepseek_thinking_disable:
-                # DeepSeek deepseek-flash / deepseek-v4-pro default to thinking=enabled (high),
-                # which spends max_tokens inside reasoning_content and leaves content empty/truncated.
-                body["thinking"] = {"type": "disabled"}
-            else:
-                body["top_p"] = 0.9
-            if use_json_response_format:
-                body["response_format"] = {"type": "json_object"}
+        messages = _build_polish_messages(batch_spec, prev_ctx, custom_prompt=custom_prompt)
+        batch_chars = sum(len(txt) for _, _, txt in batch_spec)
+        base_max_tokens = min(16384, max(2048, batch_chars * 3))
+        with state_lock:
+            want_thinking_disable = use_deepseek_thinking_disable
+            want_json_fmt = use_json_response_format
 
-            try:
-                raw_content, finish_reason, has_reasoning = _send_completion(client, body)
-                validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
-                    raw_content,
-                    batch_spec,
-                    finish_reason=finish_reason,
-                    has_reasoning=has_reasoning,
-                )
+        body: dict = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": 0.05,
+            "max_tokens": base_max_tokens,
+            "stream": False,
+        }
+        if want_thinking_disable:
+            # DeepSeek deepseek-flash / deepseek-v4-pro default to thinking=enabled (high),
+            # which spends max_tokens inside reasoning_content and leaves content empty/truncated.
+            body["thinking"] = {"type": "disabled"}
+        else:
+            body["top_p"] = 0.9
+        if want_json_fmt:
+            body["response_format"] = {"type": "json_object"}
 
-                # One-shot smart recovery for DeepSeek JSON-mode blank spaces OR max_tokens truncation
-                if validated is None:
-                    retry_body: Optional[dict] = None
-                    if not str(raw_content).strip() and "response_format" in body:
-                        retry_body = dict(body)
-                        retry_body.pop("response_format", None)
-                        if finish_reason == "length":
-                            retry_body["max_tokens"] = min(32768, int(body["max_tokens"]) * 2)
-                    elif finish_reason == "length":
-                        retry_body = dict(body)
+        batch_applied = False
+        try:
+            raw_content, finish_reason, has_reasoning = _send_completion(client, body)
+            validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
+                raw_content,
+                batch_spec,
+                finish_reason=finish_reason,
+                has_reasoning=has_reasoning,
+            )
+
+            # One-shot smart recovery for DeepSeek JSON-mode blank spaces OR max_tokens truncation
+            if validated is None:
+                retry_body: Optional[dict] = None
+                if not str(raw_content).strip() and "response_format" in body:
+                    retry_body = dict(body)
+                    retry_body.pop("response_format", None)
+                    if finish_reason == "length":
                         retry_body["max_tokens"] = min(32768, int(body["max_tokens"]) * 2)
+                elif finish_reason == "length":
+                    retry_body = dict(body)
+                    retry_body["max_tokens"] = min(32768, int(body["max_tokens"]) * 2)
 
-                    if retry_body is not None:
-                        if cancel_token:
-                            cancel_token.check()
-                        raw_content, finish_reason, has_reasoning = _send_completion(client, retry_body)
-                        validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
-                            raw_content,
-                            batch_spec,
-                            finish_reason=finish_reason,
-                            has_reasoning=has_reasoning,
-                        )
+                if retry_body is not None:
+                    if cancel_token:
+                        cancel_token.check()
+                    raw_content, finish_reason, has_reasoning = _send_completion(client, retry_body)
+                    validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
+                        raw_content,
+                        batch_spec,
+                        finish_reason=finish_reason,
+                        has_reasoning=has_reasoning,
+                    )
 
-                if validated is not None:
-                    turn_cls = type(polished_turns[start_i])
-                    for idx, new_text in validated.items():
-                        orig = polished_turns[idx]
-                        if new_text != orig.text:
-                            changed_turns += 1
-                        polished_turns[idx] = turn_cls(
-                            start=orig.start,
-                            end=orig.end,
-                            speaker_label=orig.speaker_label,
-                            text=new_text,
+            if validated is not None:
+                turn_cls = type(orig_turns[start_i])
+                local_changed = 0
+                new_objs: list[tuple[int, object]] = []
+                for idx, new_text in validated.items():
+                    orig = orig_turns[idx]
+                    if new_text != orig.text:
+                        local_changed += 1
+                    new_objs.append(
+                        (
+                            idx,
+                            turn_cls(
+                                start=orig.start,
+                                end=orig.end,
+                                speaker_label=orig.speaker_label,
+                                text=new_text,
+                            ),
                         )
+                    )
+                with state_lock:
+                    for idx, obj in new_objs:
+                        polished_turns[idx] = obj
                     batches_ok += 1
-                    if fallback_cnt > 0 and status_cb:
-                        status_cb(
-                            f"LLM-корректура: батч {b_idx + 1}/{total_batches} применён "
-                            f"(оставлено без правок по guard: {fallback_cnt}/{len(batch_spec)})."
-                        )
-                else:
-                    if status_cb:
-                        status_cb(
-                            f"LLM-корректура: батч {b_idx + 1}/{total_batches} не прошёл валидацию "
-                            f"({fail_reason}) — оставлен исходный ASR."
-                        )
-            except httpx.HTTPStatusError as http_exc:
-                status_code = http_exc.response.status_code if http_exc.response is not None else 0
-                if status_code in (401, 403):
-                    if status_cb:
-                        status_cb(
-                            f"LLM-корректура: ошибка авторизации (HTTP {status_code}) — проверьте API-ключ; оставлен исходный ASR."
-                        )
-                    break
+                    changed_turns += local_changed
+                batch_applied = True
+                if fallback_cnt > 0 and status_cb:
+                    status_cb(
+                        f"LLM-корректура: батч {b_idx + 1}/{total_batches} применён "
+                        f"(оставлено без правок по guard: {fallback_cnt}/{len(batch_spec)})."
+                    )
+            else:
+                if status_cb:
+                    status_cb(
+                        f"LLM-корректура: батч {b_idx + 1}/{total_batches} не прошёл валидацию "
+                        f"({fail_reason}) — оставлен исходный ASR."
+                    )
+        except httpx.HTTPStatusError as http_exc:
+            status_code = http_exc.response.status_code if http_exc.response is not None else 0
+            if status_code in (401, 403):
+                first_abort = not abort_event.is_set()
+                abort_event.set()
+                if first_abort and status_cb:
+                    status_cb(
+                        f"LLM-корректура: ошибка авторизации (HTTP {status_code}) — проверьте API-ключ; оставлен исходный ASR."
+                    )
+            else:
                 if status_cb:
                     status_cb(
                         f"LLM-корректура: ошибка HTTP {status_code} на батче {b_idx + 1}/{total_batches} — оставлен исходный ASR."
                     )
-            except Exception as exc:
-                if status_cb:
-                    status_cb(
-                        f"LLM-корректура: ошибка на батче {b_idx + 1}/{total_batches} ({exc}) — оставлен исходный ASR."
-                    )
-                # Abort remaining batches immediately if the LLM server is unreachable
-                if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
-                    break
+        except Exception as exc:
+            if cancel_token and cancel_token.is_cancelled():
+                raise
+            is_conn_fail = isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+            first_abort = True
+            if is_conn_fail:
+                first_abort = not abort_event.is_set()
+                abort_event.set()
+            if first_abort and status_cb:
+                status_cb(
+                    f"LLM-корректура: ошибка на батче {b_idx + 1}/{total_batches} ({exc}) — оставлен исходный ASR."
+                )
 
-            if status_cb and total_batches > 1:
-                status_cb(f"LLM-корректура: обработано {b_idx + 1}/{total_batches} батчей...")
+        with state_lock:
+            if not batch_applied:
+                failed_indices.update(range(start_i, end_i))
+            done_batches += 1
+            cur_done = done_batches
+
+        if status_cb and total_batches > 1 and not abort_event.is_set():
+            status_cb(f"LLM-корректура: обработано {cur_done}/{total_batches} батчей...")
+
+    t0 = time.time()
+    with _create_httpx_client(endpoint, timeout_sec) as client:
+        # Always probe batch 0 synchronously first: validates auth/connectivity in 1 request
+        # and negotiates response_format / thinking flags cleanly before any fan-out.
+        _run_batch(client, 0, batches[0][0], batches[0][1])
+
+        if total_batches > 1 and not abort_event.is_set():
+            if cloud_workers <= 1:
+                for b_idx in range(1, total_batches):
+                    if abort_event.is_set():
+                        failed_indices.update(range(batches[b_idx][0], batches[b_idx][1]))
+                        break
+                    _run_batch(client, b_idx, batches[b_idx][0], batches[b_idx][1])
+            else:
+                pool = ThreadPoolExecutor(max_workers=cloud_workers)
+                try:
+                    futs = [
+                        pool.submit(_run_batch, client, b_idx, batches[b_idx][0], batches[b_idx][1])
+                        for b_idx in range(1, total_batches)
+                    ]
+                    for fut in as_completed(futs):
+                        fut.result()
+                except BaseException:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    pool.shutdown(wait=True)
+        elif total_batches > 1 and abort_event.is_set():
+            for b_idx in range(1, total_batches):
+                failed_indices.update(range(batches[b_idx][0], batches[b_idx][1]))
 
     elapsed = time.time() - t0
     if status_cb:
@@ -485,6 +631,7 @@ def polish_turns_with_local_llm(
         "batches_ok": batches_ok,
         "batches_total": total_batches,
         "changed_turns": changed_turns,
+        "failed_indices": sorted(failed_indices),
         "elapsed": elapsed,
         "is_cloud": not is_local,
     }

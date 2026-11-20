@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from typing import Callable, Optional
 
 import httpx
@@ -68,14 +69,21 @@ def _create_deepgram_httpx_client(timeout_sec: float) -> httpx.Client:
 
 def _prepare_upload_audio(wav_path: str) -> tuple[bytes, str, Optional[str]]:
     """
-    Reads WAV bytes directly for clips <= 45 MB (~23 min at 16 kHz mono WAV).
-    For longer recordings, compresses via ffmpeg to 64 kbps mono MP3 to cut
-    upload time by ~4x, falling back safely to raw WAV if ffmpeg fails.
+    Prepares audio bytes for Deepgram Nova-3 upload:
+      - <= 12 MB (~6 min WAV): sends raw 16 kHz mono WAV directly (zero ffmpeg overhead).
+      - 12..45 MB (~6-23 min WAV): compresses via ffmpeg to lossless FLAC (~3x smaller, 0 quality loss).
+      - > 45 MB (>23 min WAV): compresses via ffmpeg to 64 kbps mono MP3 (~4x smaller).
+    Falls back safely to raw WAV if ffmpeg fails.
     Returns (payload_bytes, content_type, optional_temp_path_to_remove).
     """
     file_size = os.path.getsize(wav_path)
-    if file_size > 45 * 1024 * 1024:
-        fd, tmp_mp3 = tempfile.mkstemp(prefix="dg_nova3_", suffix=".mp3")
+    if file_size > 12 * 1024 * 1024:
+        use_mp3 = file_size > 45 * 1024 * 1024
+        suffix = ".mp3" if use_mp3 else ".flac"
+        mime = "audio/mpeg" if use_mp3 else "audio/flac"
+        codec_args = ["-b:a", "64k"] if use_mp3 else ["-c:a", "flac", "-compression_level", "5"]
+
+        fd, tmp_out = tempfile.mkstemp(prefix="dg_nova3_", suffix=suffix)
         os.close(fd)
         try:
             proc = subprocess.run(
@@ -91,27 +99,40 @@ def _prepare_upload_audio(wav_path: str) -> tuple[bytes, str, Optional[str]]:
                     "1",
                     "-ar",
                     "16000",
-                    "-b:a",
-                    "64k",
-                    tmp_mp3,
+                    *codec_args,
+                    tmp_out,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=120,
                 check=False,
             )
-            if proc.returncode == 0 and os.path.isfile(tmp_mp3) and os.path.getsize(tmp_mp3) > 1024:
-                with open(tmp_mp3, "rb") as f:
-                    return f.read(), "audio/mpeg", tmp_mp3
+            if proc.returncode == 0 and os.path.isfile(tmp_out) and os.path.getsize(tmp_out) > 1024:
+                with open(tmp_out, "rb") as f:
+                    return f.read(), mime, tmp_out
         except Exception:
             pass
         try:
-            os.remove(tmp_mp3)
+            os.remove(tmp_out)
         except OSError:
             pass
 
     with open(wav_path, "rb") as f:
         return f.read(), "audio/wav", None
+
+
+def _sleep_with_cancel(
+    delay_sec: float,
+    cancel_token: Optional[CancellationToken] = None,
+) -> None:
+    end_t = time.time() + max(0.0, float(delay_sec))
+    while True:
+        if cancel_token:
+            cancel_token.check()
+        rem = end_t - time.time()
+        if rem <= 0.0:
+            return
+        time.sleep(min(0.25, rem))
 
 
 def transcribe_with_deepgram_nova3(
@@ -187,24 +208,44 @@ def transcribe_with_deepgram_nova3(
             "Content-Type": content_type,
         }
 
+        _TRANSIENT_CODES = (429, 500, 502, 503, 504)
+
+        def _post_with_retry(client: httpx.Client, req_params: list[tuple[str, str]]) -> httpx.Response:
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                if cancel_token:
+                    cancel_token.check()
+                try:
+                    r = client.post(endpoint, params=req_params, headers=headers, content=audio_bytes)
+                    r.raise_for_status()
+                    return r
+                except httpx.HTTPStatusError as exc:
+                    sc = exc.response.status_code if exc.response is not None else 0
+                    if sc in _TRANSIENT_CODES and attempt < max_retries:
+                        if status_cb:
+                            status_cb(f"Deepgram Nova-3: временная ошибка HTTP {sc}, повтор ({attempt + 1}/{max_retries})...")
+                        _sleep_with_cancel(min(4.0, 1.5 * (attempt + 1)), cancel_token=cancel_token)
+                        continue
+                    raise
+                except (httpx.ReadTimeout, httpx.RemoteProtocolError):
+                    if attempt < max_retries:
+                        if status_cb:
+                            status_cb(f"Deepgram Nova-3: таймаут ответа, повтор ({attempt + 1}/{max_retries})...")
+                        _sleep_with_cancel(min(4.0, 1.5 * (attempt + 1)), cancel_token=cancel_token)
+                        continue
+                    raise
+
         with _create_deepgram_httpx_client(timeout_sec) as client:
             params = _build_params(include_keyterms=bool(keyterms))
             try:
-                resp = client.post(endpoint, params=params, headers=headers, content=audio_bytes)
-                resp.raise_for_status()
+                resp = _post_with_retry(client, params)
             except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
                 if status_code == 400 and keyterms:
                     # Transparent one-shot fallback when a language mode rejects keyterm
                     if status_cb:
                         status_cb("Deepgram Nova-3: повтор запроса без keyterms (HTTP 400 для выбранного языка)...")
-                    resp = client.post(
-                        endpoint,
-                        params=_build_params(include_keyterms=False),
-                        headers=headers,
-                        content=audio_bytes,
-                    )
-                    resp.raise_for_status()
+                    resp = _post_with_retry(client, _build_params(include_keyterms=False))
                 elif status_code in (401, 403):
                     raise RuntimeError(
                         f"Deepgram API отклонил авторизацию (HTTP {status_code}). "
