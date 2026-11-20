@@ -1735,7 +1735,7 @@ def _split_unpunctuated_multispeaker_units(
         left_purity = left_ov.get(left_spk, 0.0) / left_total_ov
         right_purity = right_ov.get(right_spk, 0.0) / right_total_ov
 
-        min_purity = 0.78 if is_short_tail else 0.58
+        min_purity = 0.85 if is_short_tail else 0.58
         if left_purity < min_purity or right_purity < min_purity:
             continue
 
@@ -1759,7 +1759,7 @@ def _split_unpunctuated_multispeaker_units(
             best_k = k
             best_is_short_tail = is_short_tail
 
-    min_accept_score = 1.65 if best_is_short_tail else 1.35
+    min_accept_score = 1.95 if best_is_short_tail else 1.35
     if best_k is None or best_score < min_accept_score:
         return [clause_units]
 
@@ -1934,7 +1934,7 @@ def align_units_to_speakers(
             first_word = _clean_word_lower(cl.text.split()[0]) if cl.text.split() else ""
             is_short_reply = dur <= 2.8 and first_word in _RESPONSE_OPENER_WORDS
             is_edge_clause = idx == 0 or idx == len(clauses) - 1
-            is_turn_boundary = dur >= 0.30 and (
+            is_turn_boundary = dur >= 0.50 and (
                 (idx > 0 and initial_spks[idx - 1] != initial_spks[idx])
                 or (idx + 1 < len(clauses) and initial_spks[idx + 1] != initial_spks[idx])
             )
@@ -1996,6 +1996,9 @@ def align_units_to_speakers(
             if dialogic_turn_prior:
                 req_margin = 0.045 if dur >= 0.75 else 0.065
                 min_abs_sim = 0.38
+            elif dur < 0.50:
+                req_margin = 0.145
+                min_abs_sim = 0.48
             elif contended:
                 req_margin = 0.065 if dur >= 0.90 else 0.090
                 min_abs_sim = 0.42
@@ -2456,9 +2459,10 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("Redis", "Redis", (r"рэдис(?:а|е|ом)?", r"reдис(?:а|е|ом)?")),
     ("MongoDB", "MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монг(?:а|ой|у|е|и)")),
     ("S3", "S3", (r"st3", r"эс[\s\-]+три")),
-    ("DBeaver", "DBeaver", (r"дебив[еэ]р(?:а|е|ом|у)?", r"дибив[еэ]р(?:а|е|ом|у)?", r"debeaver", r"d[\s\-]?beaver")),
+    ("DBeaver", "DBeaver", (r"дебив[еэ]р(?:а|е|ом|у)?", r"дибив[еэ]р(?:а|е|ом|у)?", r"debeaver", r"debiver", r"d[\s\-]?beaver")),
     ("Kafka", "Kafka", (r"кафк[аеуи]",)),
     ("RabbitMQ", "RabbitMQ", (r"рэббит[\s\-]?эм[\s\-]?кью", r"реббит[\s\-]?эм[\s\-]?кью", r"рэббит")),
+    ("C4", "C4", (r"си[\s\-]+четыре", r"цэ[\s\-]+четыре")),
     ("Sequence", "Sequence", (r"сиквенс", r"секвенс", r"сиквэнс", r"сикнс(?:ы|ов|а|е)?", r"sipens", r"siven")),
     ("Activity", "Activity", (r"активити",)),
     ("BPMN", "BPMN", (r"би[\s\-]?пи[\s\-]?эм[\s\-]?эн", r"бпмн", r"bpen", r"бпен", r"vipmencum")),
@@ -2479,6 +2483,9 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("Docs as Code", "Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код", r"докс[\s\-]+ас[\s\-]+код", r"соsкод\w*", r"со[\s\-]+скод(?:ом|а|е|у)?")),
     ("SFA", "SFA", (r"цфа(?=\-систем)", r"цф(?=\-систем)", r"сф(?=\-систем)", r"sф(?=\-систем)")),
     ("OTLP", "OTLP", (r"от[\s\-]+лп", r"от[\s\-]+тлп", r"о[\s\-]?ти[\s\-]?эл[\s\-]?пи")),
+    ("R&D", "R&D-шников", (r"энтишников", r"арэндишников")),
+    ("ML", "ML-контур", (r"эмель[\s\-]+контур", r"эмэл[\s\-]+контур")),
+    ("PO", "PO", (r"пио",)),
     ("C++", "C++", (r"си[\s\-]+плюс[\s\-]+плюс", r"(?:(?<=на\s)|(?<=с\s)|(?<=из\s))c\+(?!\+)")),
     ("GraphQL", "GraphQL", (r"граф[\s\-]?кью[\s\-]?эль", r"графкьюэл")),
     ("OpenAPI", "OpenAPI", (r"опен[\s\-]?апи", r"оупен[\s\-]?апи")),

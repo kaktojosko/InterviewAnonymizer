@@ -142,7 +142,7 @@ let serverOnnxCudaAvailable = null;
 let serverAsrModelsMeta = new Map();
 let promptPresetMap = {
     system_analyst:
-        'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, HTTP/1.1, SOAP, JSON, JWT, Bearer, OAuth 2, API-шлюз, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, Camunda, PlantUML, draw.io, UI-kit, use cases, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code, Spec-Driven Development, CRM, SFA, OTLP, C++',
+        'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, HTTP/1.1, SOAP, JSON, JWT, Bearer, OAuth 2, API-шлюз, PostgreSQL, Redis, MongoDB, S3, Kafka, DBeaver, C4, Sequence, Activity, ERD, BPMN, Camunda, PlantUML, draw.io, UI-kit, use cases, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code, Spec-Driven Development, CRM, SFA, OTLP, R&D, PO, ML, АБС, ЕБС, C++',
     backend_devops:
         'Техническое собеседование: Python, Go, Java, Docker, Kubernetes, CI/CD, GitLab, PostgreSQL, Redis, Kafka, RabbitMQ, gRPC, REST API, GraphQL, OpenAPI, Prometheus, Grafana, Terraform, Linux',
     frontend_qa:

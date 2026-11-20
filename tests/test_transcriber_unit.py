@@ -262,7 +262,7 @@ def test_format_transcript_txt():
         model_name="Whisper Large v3 Turbo (INT8)",
         num_speakers=2,
     )
-    assert "# Транскрибация интервью (Interview Anonymizer v5.2.0)" in txt
+    assert "# Транскрибация интервью (Interview Anonymizer v5.2.1)" in txt
 
     assert "Длительность: 00:02:05 | Модель: Whisper Large v3 Turbo (INT8) | Обнаружено спикеров: 2" in txt
     assert "[00:00:01 - 00:00:09] Спикер 1: Привет! Как прошёл code review?" in txt
@@ -3628,6 +3628,168 @@ def test_v520_long_monologue_split_global_glossary_anti_hallucination_and_diar_e
     assert len(tail_turns) == 2
     assert "спасибо" in tail_turns[0].text
     assert "хорошо" in tail_turns[1].text and "дальше" in tail_turns[1].text
+
+
+def test_v521_phonetic_stop_brake_pass0_antipoison_vocative_casing_and_diar_guard():
+    import json as json_mod
+    from src.config import ASR_PROMPT_PRESETS
+    from src.llm_postprocessor import (
+        _build_polish_messages,
+        _enforce_glossary_canonical_casing,
+        _guard_phonetic_substitutions,
+        _parse_glossary_terms,
+        _phonetic_pair_score,
+        _validate_batch_response_detailed,
+    )
+    from src.transcriber import apply_custom_glossary_terms
+
+    sa_prompt = ASR_PROMPT_PRESETS["system_analyst"]["prompt"]
+    for req_term in ("SOAP", "АБС", "ЕБС", "DBeaver", "OTLP", "Docs as Code", "Camunda", "ERD", "C4", "S3", "R&D", "PO", "ML"):
+        assert req_term in sa_prompt
+
+    # 1. Pass-0 anti-poisoning drops bare 2-3 letter ALL-CAPS Cyrillic acronyms (ПИО, ЕБС, ОСТ)
+    #    while keeping real product names, Latin acronyms, and participant names intact.
+    parsed_terms = _parse_glossary_terms(
+        json_mod.dumps(
+            {"terms": ["SmartBio", "ПИО", "ЕБС", "ОСТ", "DBeaver", "Docs as Code", "PO", "R&D", "OTLP", "Алина"]},
+            ensure_ascii=False,
+        )
+    )
+    assert parsed_terms == ["SmartBio", "DBeaver", "Docs as Code", "PO", "R&D", "OTLP", "Алина"]
+
+    # 2. Phonetic stop-brake blocks EVERY cross-technology / acronym hallucination reported in v5.2.0
+    #    while keeping EVERY valid phonetic IT fix in the exact same turn!
+    mixed_orig = (
+        "Алин, мы смотрели пазгр через Debiver, контур АБС и доработки по свапу, "
+        "логирование от ТЛП, параллельно ещё соSкодо, стараемся кosct тоже загнать и понимать, как пило работает."
+    )
+    mixed_bad_llm = (
+        "Алина, мы смотрели PostgreSQL через Kibana, контур ЕБС и доработки по Swagger, "
+        "логирование от ПИО, параллельно ещё Confluence, стараемся к REST тоже загнать и понимать, как ПИО работает."
+    )
+    guarded, rev_cnt = _guard_phonetic_substitutions(
+        mixed_orig,
+        mixed_bad_llm,
+        glossary_text=sa_prompt,
+        user_custom_prompt=sa_prompt,
+    )
+    assert rev_cnt >= 7
+    # Legitimate fix PRESERVED in the same sentence!
+    assert "PostgreSQL" in guarded
+    # Colloquial vocative 'Алин,' PRESERVED!
+    assert guarded.startswith("Алин,")
+    assert "Алина," not in guarded
+    # ALL dangerous hallucinations REVERTED back to raw ASR!
+    for forbidden_halluc in ("Kibana", "ЕБС", "Swagger", "ПИО", "Confluence", "REST"):
+        assert forbidden_halluc not in guarded, f"Hallucination '{forbidden_halluc}' leaked into: {guarded}"
+    for preserved_raw in ("Debiver", "АБС", "свапу", "ТЛП", "соSкодо", "кosct", "пило"):
+        assert preserved_raw in guarded, f"Raw token '{preserved_raw}' missing from: {guarded}"
+
+    # 3. ALL genuine phonetic fixes & RNN-T Russian-word disguises PASS the stop-brake cleanly!
+    valid_pairs = [
+        ("мы дёргали через Debiver.", "мы дёргали через DBeaver."),
+        ("доработки по свапу.", "доработки по SOAP."),
+        ("логирование от ТЛП.", "логирование по OTLP."),
+        ("параллельно соSкодо.", "параллельно Docs as Code."),
+        ("стараемся кosct загнать.", "стараемся Docs as Code загнать."),
+        ("работаем поджирописью.", "работаем по gRPC."),
+        ("общаемся по листам.", "общаемся по RESTам."),
+        ("рисовали в команде.", "рисовали в Camunda."),
+        ("все четыре диаграммы.", "C4 диаграммы."),
+        ("пользоваться китом и ГИД.", "пользоваться Git и Git."),
+        ("протокол А 2.0.", "протокол HTTP 2.0."),
+        ("настроили ауф два.", "настроили OAuth 2."),
+        ("через нашего-специалиста.", "через нашего HR-специалиста."),
+        ("штат энтишников.", "штат R&D-шников."),
+        ("используем GPT и Bearer-токены.", "используем JWT и Bearer-токены."),
+    ]
+    for orig_s, good_s in valid_pairs:
+        out_s, reverted = _guard_phonetic_substitutions(
+            orig_s,
+            good_s,
+            glossary_text=sa_prompt,
+            user_custom_prompt=sa_prompt,
+        )
+        assert reverted == 0 and out_s == good_s, f"False revert on '{orig_s}' -> '{good_s}': got '{out_s}'"
+
+    # 4. Canonical glossary casing enforcement fixes GRPC -> gRPC, DBEAVER -> DBeaver, DRAW.IO -> draw.io
+    drifted = "После 21-й минуты общаемся по GRPC, база POSTGRESQL в DBEAVER, диаграммы в DRAW.IO."
+    cased = _enforce_glossary_canonical_casing(drifted, sa_prompt)
+    assert cased == "После 21-й минуты общаемся по gRPC, база PostgreSQL в DBeaver, диаграммы в draw.io."
+
+    # Also verify full _validate_batch_response_detailed applies BOTH phonetic guard AND canonical casing
+    batch_spec = [(0, "Спикер 1", "Общаемся поджирописью, базу смотрим через Debiver и контур АБС.")]
+    raw_llm = json_mod.dumps(
+        {"turns": [{"id": 0, "text": "Общаемся по GRPC, базу смотрим через Kibana и контур ЕБС."}]},
+        ensure_ascii=False,
+    )
+    val_map, err, _ = _validate_batch_response_detailed(
+        raw_llm,
+        batch_spec,
+        glossary_text=sa_prompt,
+        user_custom_prompt=sa_prompt,
+    )
+    assert val_map is not None and err == ""
+    assert val_map[0] == "Общаемся по gRPC, базу смотрим через Debiver и контур АБС."
+
+    # Prompt includes explicit phonetic stop-brake examples while staying free of forbidden v5.10 SA strings
+    sys_msg = _build_polish_messages([(0, "Спикер 1", "Привет.")], [], custom_prompt="")[0]["content"]
+    assert "ФОНЕТИЧЕСКИЙ СТОП-КРАН" in sys_msg
+    assert "Алин" in sys_msg
+    for forbidden in ("Комунде", "План Юля", "в Джерри", "CRM-систему", "HR-специалиста"):
+        assert forbidden not in sys_msg
+
+    # 5. Zero-homonym fallback regex fixes new v5.2.1 tokens without breaking homonyms
+    fb_txt = apply_custom_glossary_terms(
+        "Штат энтишников, Эмель-контур, Debiver, диаграмма си четыре и роль пио.",
+        sa_prompt,
+    )
+    for exp in ("R&D-шников", "ML-контур", "DBeaver", "C4", "PO"):
+        assert exp in fb_txt, f"Missing '{exp}' in: {fb_txt}"
+
+    # 6. Diarization stability (08:06 micro-glitch fix): a brief 0.40s mid-call backchannel
+    #    ('Да, да.') adjacent to a turn boundary with a noisy borderline CAM++ margin (~0.12)
+    #    MUST stay on its original speaker (not flip on noisy <0.50s embeddings!).
+    rng = np.random.RandomState(5212026)
+    qr, _ = np.linalg.qr(rng.randn(64, 3))
+    v_a, v_b = qr[:, 0].astype(np.float32), qr[:, 1].astype(np.float32)
+    # Borderline noisy vector: dot(v_b)=0.60, dot(v_a)=0.47 -> margin=0.13 (would flip at 0.115 if checked!)
+    v_noisy_b = 0.47 * v_a + 0.60 * v_b + np.sqrt(max(0.0, 1.0 - 0.47**2 - 0.60**2)) * qr[:, 2].astype(np.float32)
+    v_noisy_b /= np.linalg.norm(v_noisy_b)
+
+    sr = 16000
+    wav_14s = rng.normal(0.0, 0.12, sr * 14).astype(np.float32)
+    diar_mid = [
+        DiarizationSegment(0.0, 6.2, speaker=0),
+        DiarizationSegment(6.3, 10.5, speaker=1),
+        DiarizationSegment(10.6, 13.8, speaker=0),
+    ]
+    mid_units = [
+        TimedUnit(0.5, 5.40, " Рассказываю про архитектуру."),
+        TimedUnit(5.75, 6.15, " Да, да."),           # 0.40s mid-call clause adjacent to turn switch at 6.3s!
+        TimedUnit(6.40, 10.20, " Отлично, спасибо за детали."),
+        TimedUnit(10.80, 13.50, " Да, и ещё про тесты."),
+    ]
+
+    def _mid_embed(_wav, _sr, t_s, t_e):
+        mid = 0.5 * (t_s + t_e)
+        if 5.6 <= mid <= 6.25:
+            return v_noisy_b
+        return v_b if (6.3 <= mid <= 10.5) else v_a
+
+    mid_turns, mid_n = align_units_to_speakers(
+        mid_units,
+        diar_mid,
+        samples=wav_14s,
+        sample_rate=sr,
+        speaker_centroids={0: v_a, 1: v_b},
+        clause_embed_fn=_mid_embed,
+    )
+    assert mid_n == 2
+    # 'Да, да.' stayed cleanly with Speaker 1's opening turn (did NOT fly off to Speaker 2!)
+    assert "Да, да." in mid_turns[0].text
+    assert "Отлично" in mid_turns[1].text and "Да, да." not in mid_turns[1].text
+
 
 
 

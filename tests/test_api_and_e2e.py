@@ -196,7 +196,7 @@ def test_api_root_and_config():
     assert "asrApiKeyInput" in root_resp.text
     assert "postAsrApiKeyInput" in root_resp.text
     assert "appVersionFooter" in root_resp.text
-    assert "v5.2.0" in root_resp.text
+    assert "v5.2.1" in root_resp.text
     assert "no-store" in root_resp.headers.get("cache-control", "").lower()
 
     static_resp = client.get("/static/script.js")
@@ -207,8 +207,8 @@ def test_api_root_and_config():
     assert cfg_resp.status_code == 200
     assert "no-store" in cfg_resp.headers.get("cache-control", "").lower()
     data = cfg_resp.json()
-    assert data["version"] == "5.2.0"
-    assert isinstance(data.get("build_id"), str) and data["build_id"].startswith("5.2.0-")
+    assert data["version"] == "5.2.1"
+    assert isinstance(data.get("build_id"), str) and data["build_id"].startswith("5.2.1-")
     assert f"/static/script.js?v={data['build_id']}" in root_resp.text
     assert f"/static/style.css?v={data['build_id']}" in root_resp.text
 

@@ -266,11 +266,16 @@ def _build_glossary_extraction_messages(
         "Включи в список (до 45 пунктов):\n"
         "1. Названия продуктов, проектов и компаний (если ASR искажала одно название по-разному "
         "в разных местах записи, выбери ОДНО наиболее вероятное каноническое написание).\n"
-        "2. Специфические профессиональные термины, инструменты, протоколы, методологии и аббревиатуры, "
-        "которые реально обсуждаются в этой записи.\n"
+        "2. Специфические профессиональные термины, инструменты, протоколы, методологии и "
+        "англоязычные аббревиатуры, которые РЕАЛЬНО звучат в этой записи. "
+        "Англоязычные термины, протоколы и роли пиши СТРОГО канонической латиницей и в точном регистре "
+        "(например: «PO», «R&D», «ML», «gRPC», «DBeaver», «SOAP», «OTLP», «Docs as Code», «S3», «C4», «ERD»), "
+        "НИКОГДА не записывай их кириллической транслитерацией вроде «ПИО», «АПИ», «ГИТ», «ЭМЕЛЬ».\n"
         "3. Имена участников, если они отчётливо и однозначно встречаются в тексте.\n"
-        "СТРОГО ЗАПРЕЩЕНО включать обычные общеупотребительные русские слова или выдумывать термины, "
-        "которых нет в расшифровке.\n"
+        "СТРОГО ЗАПРЕЩЕНО:\n"
+        "- Выдумывать или добавлять технологии/инструменты, которых НЕТ в этой расшифровке.\n"
+        "- Сливать разные предметные аббревиатуры в одну (например, АБС и ЕБС — это разные системы).\n"
+        "- Включать обычные общеупотребительные русские слова или короткие 2–3-буквенные русские аббревиатуры-омофоны.\n"
         "Верни ТОЛЬКО валидный JSON вида {\"terms\": [\"Термин 1\", \"Термин 2\", ...]}."
         f"{ref_block}"
     )
@@ -314,6 +319,374 @@ def _parse_json_lenient(cleaned: str):
     return None
 
 
+_BARE_SHORT_CYR_ACRO_RE = re.compile(r"^[А-ЯЁ]{2,3}$")
+_CYR_ACRO_TOKEN_RE = re.compile(r"^[А-ЯЁ]{2,5}$")
+_INLINE_LAT_ACRO_RE = re.compile(r"[A-Za-z][A-Za-z0-9&/]{1,6}")
+_DIGIT_WORD_RE = re.compile(r"(?<![A-Za-z0-9])([0-5])(?![A-Za-z0-9])")
+
+_CYR_PHON_MAP = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "j", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sh",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+_LAT_LETTER_EN = {
+    "a": "ei", "b": "bi", "c": "si", "d": "di", "e": "i", "f": "ef",
+    "g": "ji", "h": "eich", "i": "ai", "j": "jei", "k": "kei", "l": "el",
+    "m": "em", "n": "en", "o": "o", "p": "pi", "q": "kyu", "r": "ar",
+    "s": "es", "t": "ti", "u": "yu", "v": "vi", "w": "dablyu", "x": "eks",
+    "y": "uai", "z": "zi",
+    "0": "nol", "1": "odin", "2": "dva", "3": "tri", "4": "chetyre", "5": "pyat",
+}
+_LAT_LETTER_RU = dict(
+    _LAT_LETTER_EN,
+    c="tse", g="ge", j="je", h="ash", r="er", d="de", p="pe", t="te", s="es", f="ef",
+)
+_FINE_CONS_TABLE = {
+    "p": "P", "b": "P", "f": "F", "v": "W", "w": "W",
+    "t": "T", "d": "T", "k": "K", "g": "K", "c": "K", "q": "K", "h": "K",
+    "s": "S", "z": "S", "x": "KS", "j": "J", "l": "L", "r": "R", "m": "M", "n": "N",
+}
+_STRIP_PUNCT_CHARS = ".,!?;:()[]\"'«»—–-…"
+
+
+def _to_phonetic_latin(text: str) -> str:
+    return "".join(_CYR_PHON_MAP.get(ch, ch) for ch in (text or "").lower())
+
+
+def _fine_consonants(lat: str) -> str:
+    s = re.sub(r"[^a-z0-9]", "", (lat or "").lower())
+    s = (
+        s.replace("sh", "J")
+        .replace("zh", "J")
+        .replace("ch", "J")
+        .replace("dzh", "J")
+        .replace("ts", "S")
+        .replace("ck", "K")
+        .replace("ph", "F")
+        .replace("qu", "K")
+        .replace("th", "T")
+    )
+    res: list[str] = []
+    for ch in s:
+        if ch.isdigit():
+            res.append(ch)
+        elif ch in _FINE_CONS_TABLE:
+            code = _FINE_CONS_TABLE[ch]
+            if not res or res[-1] != code:
+                res.append(code)
+    return "".join(res)
+
+
+def _coarse_consonants(lat: str) -> str:
+    fc = _fine_consonants(lat)
+    c = fc.replace("F", "P").replace("L", "R").replace("J", "S")
+    res: list[str] = []
+    for ch in c:
+        if not res or res[-1] != ch:
+            res.append(ch)
+    return "".join(res)
+
+
+def _expand_inline_acronyms(text: str, letter_map: dict[str, str]) -> str:
+    def _rep(m: re.Match) -> str:
+        tok = m.group(0)
+        al = re.sub(r"[^A-Za-z0-9]", "", tok)
+        if 2 <= len(al) <= 6 and sum(ch.isupper() or ch.isdigit() for ch in al) >= 2:
+            return "".join(letter_map.get(ch.lower(), ch.lower()) for ch in al)
+        return tok
+
+    expanded = _INLINE_LAT_ACRO_RE.sub(_rep, text)
+    expanded = _DIGIT_WORD_RE.sub(lambda m: letter_map.get(m.group(1), m.group(1)), expanded)
+    return _to_phonetic_latin(expanded)
+
+
+def _spoken_variants(term: str) -> list[str]:
+    lat = _to_phonetic_latin(term)
+    variants: list[str] = [lat]
+    eng = re.sub(r"c(?=[eiy])", "s", lat)
+    eng = (
+        eng.replace("ee", "i")
+        .replace("ea", "i")
+        .replace("oo", "u")
+        .replace("oa", "o")
+        .replace("ou", "u")
+        .replace("j", "dzh")
+    )
+    if eng != lat:
+        variants.append(eng)
+    if "th" in lat:
+        variants.append(lat.replace("th", "f"))
+        variants.append(eng.replace("th", "f"))
+    # Spoken digit expansion for mixed-case terms like 'OAuth 2' -> 'oauf dva'
+    if _DIGIT_WORD_RE.search(lat):
+        variants.append(_DIGIT_WORD_RE.sub(lambda m: _LAT_LETTER_EN.get(m.group(1), m.group(1)), lat))
+        variants.append(_DIGIT_WORD_RE.sub(lambda m: _LAT_LETTER_EN.get(m.group(1), m.group(1)), eng))
+        if "th" in lat:
+            variants.append(
+                _DIGIT_WORD_RE.sub(lambda m: _LAT_LETTER_EN.get(m.group(1), m.group(1)), lat.replace("th", "f"))
+            )
+    en_exp = _expand_inline_acronyms(term, _LAT_LETTER_EN)
+    ru_exp = _expand_inline_acronyms(term, _LAT_LETTER_RU)
+    if en_exp != lat:
+        variants.append(en_exp)
+    if ru_exp != lat:
+        variants.append(ru_exp)
+    parts = [p for p in re.split(r"[\s\-_/]+", term) if len(p) >= 2]
+    if len(parts) >= 2:
+        variants.append(_to_phonetic_latin(" ".join(parts[1:])))
+    return list(dict.fromkeys(variants))
+
+
+def _phonetic_pair_score(orig: str, new: str) -> float:
+    """
+    Computes phonetic compatibility in [0.0, 1.0] between an ASR span and its
+    LLM replacement across direct pronunciation, English spelling heuristics,
+    and letter-by-letter acronym readings.
+    Blocks cross-technology substitutions like Debiver->Kibana (0.29),
+    свапу->Swagger (0.57), соSкодо->Confluence (0.22), кosct->REST (0.57),
+    while accepting genuine phonetic fixes like Debiver->DBeaver (1.00),
+    свапу->SOAP (0.80), соSкодо->Docs as Code (1.00), поджирописью->по gRPC (0.91).
+    """
+    best = 0.0
+    orig_vars = _spoken_variants(orig)
+    new_vars = _spoken_variants(new)
+    for ov in orig_vars:
+        o_fc = _fine_consonants(ov)
+        o_cc = _coarse_consonants(ov)
+        o_al = re.sub(r"[^a-z0-9]", "", ov)
+        for nv in new_vars:
+            n_fc = _fine_consonants(nv)
+            n_cc = _coarse_consonants(nv)
+            n_al = re.sub(r"[^a-z0-9]", "", nv)
+            r_lat = difflib.SequenceMatcher(None, o_al, n_al).ratio() if (o_al and n_al) else 0.0
+            r_fc = difflib.SequenceMatcher(None, o_fc, n_fc).ratio() if (o_fc and n_fc) else 0.0
+            r_cc = difflib.SequenceMatcher(None, o_cc, n_cc).ratio() if (o_cc and n_cc) else 0.0
+            sh, lg = (o_cc, n_cc) if len(o_cc) <= len(n_cc) else (n_cc, o_cc)
+            it = iter(lg)
+            sub_ok = len(sh) >= 3 and all(ch in it for ch in sh)
+            sub_bonus = 0.72 if sub_ok else 0.0
+            best = max(best, r_lat, r_fc, 0.90 * r_cc, sub_bonus)
+    return best
+
+
+def _is_vocative_expansion(
+    orig_tok: str,
+    new_tok: str,
+    prev_orig_tok: str = "",
+) -> bool:
+    """
+    Detects stylistic over-editing of colloquial Russian vocative names
+    (e.g. 'Алин,' -> 'Алина,', 'Юль,' -> 'Юля,', 'Свет,' -> 'Света,').
+    """
+    o_core = orig_tok.strip(_STRIP_PUNCT_CHARS)
+    n_core = new_tok.strip(_STRIP_PUNCT_CHARS)
+    if not (3 <= len(o_core) <= 8) or not re.match(r"^[А-ЯЁ][а-яё]+$", o_core):
+        return False
+    is_voc_pair = (n_core == o_core + "а") or (
+        o_core.endswith("ь") and n_core == o_core[:-1] + "я"
+    )
+    if not is_voc_pair:
+        return False
+    has_address_punct = (
+        orig_tok.rstrip().endswith((",", "!", "?"))
+        or new_tok.rstrip().endswith((",", "!", "?"))
+        or prev_orig_tok.rstrip().endswith(",")
+    )
+    return has_address_punct
+
+
+def _reattach_trailing_punct(reverted_tokens: list[str], new_tokens: list[str]) -> list[str]:
+    if not reverted_tokens or not new_tokens:
+        return reverted_tokens
+    out = list(reverted_tokens)
+    last_new = new_tokens[-1]
+    last_rev = out[-1]
+    m_punct = re.search(r"([.,!?;:…]+)$", last_new)
+    if m_punct and not re.search(r"[.,!?;:…]+$", last_rev):
+        out[-1] = last_rev + m_punct.group(1)
+    return out
+
+
+def _guard_phonetic_substitutions(
+    orig_txt: str,
+    new_txt: str,
+    glossary_text: str = "",
+    user_custom_prompt: str = "",
+) -> tuple[str, int]:
+    """
+    Surgical word-diff phonetic stop-brake: reverts ONLY phonetically impossible
+    hallucinated substitutions (e.g. Debiver->Kibana, свапу->Swagger, АБС->ЕБС,
+    ТЛП->ПИО, пило->ПИО, соSкодо->Confluence, кosct->REST) and colloquial vocative
+    name stripping ('Алин,'->'Алина,'), while preserving all valid fixes in the same turn.
+    """
+    orig_tokens = (orig_txt or "").split()
+    new_tokens = (new_txt or "").split()
+    if not orig_tokens or not new_tokens:
+        return new_txt, 0
+
+    def _norm_key(tok: str) -> str:
+        return tok.strip(_STRIP_PUNCT_CHARS).lower()
+
+    orig_keys = [_norm_key(t) for t in orig_tokens]
+    new_keys = [_norm_key(t) for t in new_tokens]
+    matcher = difflib.SequenceMatcher(None, orig_keys, new_keys, autojunk=False)
+
+    out_tokens: list[str] = []
+    reverted_spans = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            out_tokens.extend(new_tokens[j1:j2])
+            continue
+        if tag in ("insert", "delete"):
+            if tag == "insert":
+                out_tokens.extend(new_tokens[j1:j2])
+            continue
+
+        # tag == "replace"
+        o_slice = orig_tokens[i1:i2]
+        n_slice = new_tokens[j1:j2]
+        o_span = " ".join(o_slice)
+        n_span = " ".join(n_slice)
+        o_core = o_span.strip(_STRIP_PUNCT_CHARS)
+        n_core = n_span.strip(_STRIP_PUNCT_CHARS)
+
+        should_revert = False
+
+        # Guard 1: Preserve colloquial Russian vocative name addresses ('Алин,' / 'Юль,' / 'Свет,')
+        if len(o_slice) == 1 and len(n_slice) == 1:
+            prev_tok = orig_tokens[i1 - 1] if i1 > 0 else ""
+            if _is_vocative_expansion(o_slice[0], n_slice[0], prev_orig_tok=prev_tok):
+                should_revert = True
+
+        # Guard 2: Cyrillic ALL-CAPS acronym guard (blocks АБС->ЕБС, ТЛП->ПИО, пило->ПИО, В.од->к ОСТ)
+        if not should_revert:
+            o_cyr_acros = {
+                t.strip(_STRIP_PUNCT_CHARS)
+                for t in o_slice
+                if _CYR_ACRO_TOKEN_RE.match(t.strip(_STRIP_PUNCT_CHARS))
+            }
+            n_cyr_acros = {
+                t.strip(_STRIP_PUNCT_CHARS)
+                for t in n_slice
+                if _CYR_ACRO_TOKEN_RE.match(t.strip(_STRIP_PUNCT_CHARS))
+            }
+            added_cyr_acros = n_cyr_acros - o_cyr_acros
+            if added_cyr_acros:
+                if o_cyr_acros:
+                    # Never silently rewrite one valid Cyrillic acronym into a different Cyrillic acronym!
+                    should_revert = True
+                else:
+                    # Introducing a brand-new Cyrillic ALL-CAPS acronym from lowercase ASR requires
+                    # explicit user glossary presence AND strong phonetic similarity.
+                    all_user_grounded = bool(user_custom_prompt) and all(
+                        bool(
+                            re.search(
+                                r"(?<![A-Za-zА-Яа-яЁё0-9])" + re.escape(ac) + r"(?![A-Za-zА-Яа-яЁё0-9])",
+                                user_custom_prompt,
+                            )
+                        )
+                        for ac in added_cyr_acros
+                    )
+                    if not all_user_grounded or _phonetic_pair_score(o_core, n_core) < 0.72:
+                        should_revert = True
+
+        # Guard 3: Latin / IT-term phonetic stop-brake (blocks Debiver->Kibana, свапу->Swagger,
+        #          соSкодо->Confluence, кosct->REST, триссон->REST, VipMencum->UI-прототипы)
+        if (
+            not should_revert
+            and re.search(r"[A-Za-z]{2,}", n_core)
+            and o_core.lower() != n_core.lower()
+        ):
+            # Whitelist A: dropped short acronym restored right before a preserved hyphenated stem
+            # (e.g., 'нашего-специалиста' -> 'нашего HR-специалиста', '-системе' -> 'SFA-системе')
+            is_hyphen_restore = False
+            if "-" in o_core and "-" in n_core:
+                o_tail = o_core.rsplit("-", 1)[1].lower()
+                n_tail = n_core.rsplit("-", 1)[1].lower()
+                if len(o_tail) >= 3 and o_tail == n_tail:
+                    is_hyphen_restore = True
+
+            # Whitelist B: version/number anchor right after replaced token (e.g. 'А 2.0' -> 'HTTP 2.0')
+            is_version_anchor = False
+            if not is_hyphen_restore and j2 < len(new_tokens):
+                next_core = new_tokens[j2].strip(_STRIP_PUNCT_CHARS)
+                if re.match(r"^\d+(?:\.\d+)?$", next_core):
+                    combo = f"{n_core} {next_core}"
+                    if combo.lower() in ("http 2.0", "http 1.1", "oauth 2", "oauth 2.0") or (
+                        glossary_text and combo.lower() in glossary_text.lower()
+                    ):
+                        is_version_anchor = True
+
+            if not is_hyphen_restore and not is_version_anchor:
+                full_score = _phonetic_pair_score(o_core, n_core)
+                if full_score < 0.62:
+                    should_revert = True
+                elif len(n_slice) >= 2 and n_slice[0].strip(_STRIP_PUNCT_CHARS).lower() in (
+                    "к", "в", "с", "о", "у", "по", "на", "от", "из", "до", "за", "при", "для", "через",
+                ):
+                    # Don't let a matching Russian preposition ('к' in 'кosct' -> 'к REST')
+                    # artificially inflate an unrelated Latin term past the phonetic stop-brake.
+                    n_without_prep = " ".join(n_slice[1:]).strip(_STRIP_PUNCT_CHARS)
+                    if re.search(r"[A-Za-z]{2,}", n_without_prep):
+                        if _phonetic_pair_score(o_core, n_without_prep) < 0.62:
+                            should_revert = True
+
+        if should_revert:
+            out_tokens.extend(_reattach_trailing_punct(o_slice, n_slice))
+            reverted_spans += 1
+        else:
+            out_tokens.extend(n_slice)
+
+    return " ".join(out_tokens), reverted_spans
+
+
+def _enforce_glossary_canonical_casing(text: str, glossary_text: str) -> str:
+    """
+    Deterministically enforces canonical mixed-case spelling from the glossary
+    for exact whole-word case-insensitive matches (e.g., 'GRPC' -> 'gRPC',
+    'DBEAVER' -> 'DBeaver', 'POSTGRESQL' -> 'PostgreSQL', 'DRAW.IO' -> 'draw.io').
+    Never substitutes different words — strictly fixes letter casing drift.
+    """
+    if not text or not glossary_text:
+        return text
+    # Extract distinct tokens with internal uppercase (e.g. gRPC, DBeaver, PostgreSQL, OAuth, SmartBio)
+    # or dotted Latin identifiers (draw.io).
+    candidates: list[str] = []
+    seen_low: set[str] = set()
+    for m in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9.\-]{1,30})(?![A-Za-z0-9])", glossary_text):
+        tok = m.group(1).strip(".-")
+        if len(tok) < 3:
+            continue
+        has_special_mixed_case = (
+            any(c.islower() for c in tok)
+            and any(c.isupper() for c in tok)
+            and tok != tok.capitalize()
+        )
+        has_dot_ident = "." in tok and any(c.isalpha() for c in tok)
+        if not (has_special_mixed_case or has_dot_ident):
+            continue
+        low = tok.lower()
+        if low in seen_low:
+            continue
+        seen_low.add(low)
+        candidates.append(tok)
+
+    if not candidates:
+        return text
+
+    out = text
+    for canonical in candidates:
+        pat = re.compile(
+            r"(?<![A-Za-zА-Яа-яЁё0-9])" + re.escape(canonical) + r"(?![A-Za-zА-Яа-яЁё0-9])",
+            re.IGNORECASE,
+        )
+        out = pat.sub(canonical, out)
+    return out
+
+
 def _parse_glossary_terms(raw_content: str, max_terms: int = 50) -> list[str]:
     cleaned = _strip_json_wrappers(raw_content)
     parsed = _parse_json_lenient(cleaned)
@@ -345,6 +718,11 @@ def _parse_glossary_terms(raw_content: str, max_terms: int = 50) -> list[str]:
         if len(cleaned_term) < 2 or len(cleaned_term) > 60:
             continue
         if len(cleaned_term.split()) > 5:
+            continue
+        # Anti-poisoning filter: never auto-inject bare 2-3 letter ALL-CAPS Cyrillic acronyms
+        # (like 'ПИО', 'ЕБС', 'ОСТ') from Pass-0, as they frequently hijack other acronyms/words
+        # across batches (e.g. АБС->ЕБС, ТЛП->ПИО, пило->ПИО). User's explicit custom_prompt is unaffected.
+        if _BARE_SHORT_CYR_ACRO_RE.match(cleaned_term):
             continue
         norm_key = re.sub(r"[^a-zа-яё0-9]+", "", cleaned_term.lower())
         if len(norm_key) < 2 or norm_key in seen_keys:
@@ -395,7 +773,7 @@ def _merge_glossaries(custom_prompt: str, auto_terms: list[str]) -> str:
 
     auto_block = (
         "Ключевые сущности, продукты, имена и термины из этой записи "
-        "(используй ЕДИНОЕ написание во всём тексте): " + ", ".join(new_terms)
+        "(используй ЕДИНОЕ написание во всём тексте, только при совпадении по звучанию): " + ", ".join(new_terms)
     )
     if base:
         return f"{base}\n{auto_block}"
@@ -462,32 +840,39 @@ def _build_polish_messages(
     glossary_block = ""
     if custom_prompt and custom_prompt.strip():
         glossary_block = (
-            f"\nПрофильный словарь и глоссарий записи (используй именно их каноническое написание, "
-            f"если по звучанию и контексту имелся в виду соответствующий термин): {custom_prompt.strip()}\n"
+            f"\nПрофильный словарь и глоссарий записи (справочник канонического написания — "
+            f"подставляй термин ТОЛЬКО если его согласные и слоги реально совпадают со звучанием ASR): "
+            f"{custom_prompt.strip()}\n"
         )
 
     system_msg = (
         "Ты — профессиональный редактор расшифровок (ASR) интервью.\n"
         "Твоя задача — внимательно вычитать КАЖДУЮ реплику от первого до последнего слова и исправить "
-        "ошибки распознавания речи, не искажая смысл и не додумывая от себя.\n"
+        "ошибки распознавания речи, не искажая факты и не подменяя одни технологии на другие.\n"
         "Правила редактирования:\n"
-        "1. Фонетические искажения и «русские обманки» (ВАЖНО): распознаватель речи часто превращает "
-        "незнакомые термины, инструменты, протоколы и названия продуктов либо в искажённую латиницу/кириллицу, "
-        "либо в грамматически правильные обычные русские слова, нелепые в данном контексте "
+        "1. Фонетические искажения и «русские обманки»: распознаватель речи часто превращает "
+        "незнакомые термины, инструменты и протоколы либо в искажённую латиницу/кириллицу, "
+        "либо в обычные русские слова, нелепые в данном контексте "
         "(например: «поджирописью» → «по gRPC», «из революционных баз» → «из реляционных баз», "
         "«по листам» в контексте API → «по RESTам», «оауф 2» → «OAuth 2»). "
-        "Активно проверяй КАЖДОЕ подозрительное слово в контексте фразы и переданного словаря.\n"
-        "2. СТРОГОЕ ПРАВИЛО ФОНЕТИЧЕСКОГО СХОДСТВА (анти-галлюцинации): замена допустима ТОЛЬКО если "
-        "исправленное слово или термин реально близко ПО ЗВУЧАНИЮ к исходным слогам ASR И логично по контексту. "
-        "ЗАПРЕЩЕНО выдумывать фонетически непохожие длинные слова, угадывать другой «близкий по теме» термин "
-        "или менять осмысленные нормальные слова (например, не превращай «GPT» в «JWT», если речь об ИИ/LLM, "
+        "Проверяй подозрительные слова в контексте фразы и словаря.\n"
+        "2. СТРОГИЙ ФОНЕТИЧЕСКИЙ СТОП-КРАН (правило ФОНЕТИЧЕСКОГО СХОДСТВА согласных и слогов — антияд против галлюцинаций): "
+        "ЗАПРЕЩЕНО подтягивать термин из словаря или соседних реплик, если его согласные и звучание "
+        "не совпадают с исходным словом ASR! Например: «Debiver» → «DBeaver» допустимо, а «Debiver» → «Kibana» — "
+        "ЗАПРЕЩЕНО; «свапу» → «SOAP» допустимо, а «свапу» → «Swagger» — ЗАПРЕЩЕНО; «соSкодо» → «Docs as Code» "
+        "допустимо, а «соSкодо» → «Confluence» — ЗАПРЕЩЕНО. "
+        "ЗАПРЕЩЕНО подменять одну валидную русскую аббревиатуру на другую («АБС» ≠ «ЕБС», «ТЛП» ≠ «ПИО») "
+        "и менять осмысленные нормальные слова (не превращай «GPT» в «JWT», если речь об ИИ/LLM, "
         "но исправь «GPT» → «JWT», если в этой фразе речь явно об авторизации/Bearer/OAuth-токенах). "
-        "Если фрагмент ASR сильно оборван или искажён и не восстанавливается однозначно по звучанию — "
-        "ОСТАВЬ исходный фрагмент без выдумывания.\n"
-        "3. Выпавшие аббревиатуры и склейки: если ASR «проглотила» короткую аббревиатуру перед дефисом "
-        "или склеила/разорвала слово, восстанови её только когда она однозначно следует из контекста или словаря.\n"
-        "4. Единообразие названий: используй ОДНО И ТО ЖЕ каноническое написание продуктов, компаний, "
-        "инструментов и имён из переданного словаря на протяжении всех реплик.\n"
+        "Если фрагмент ASR сильно искажён и не имеет однозначного фонетического совпадения — "
+        "ОСТАВЬ его как есть без выдумывания.\n"
+        "3. Выпавшие аббревиатуры и регистр: если ASR «проглотила» короткую аббревиатуру перед дефисом "
+        "или склеила слово, восстанови её только когда она однозначно следует из контекста или словаря. "
+        "Англоязычные аббревиатуры и роли пиши канонической латиницей в точном регистре "
+        "(«gRPC», а не «GRPC»; «PO», «R&D», «ML», «OTLP», а не кириллическое «ПИО»).\n"
+        "4. Единообразие названий и живая речь: используй ОДНО И ТО ЖЕ каноническое написание одного и того же "
+        "продукта/инструмента из словаря, но НЕ сливай разные системы в одну. "
+        "НЕ исправляй разговорную звательную форму имён («Алин», «Юль», «Свет», «Саш» — оставляй как сказал спикер).\n"
         "5. Сохраняй исходный язык каждой реплики (не переводи EN↔RU), разговорный стиль и полноту текста. "
         "Поправляй очевидную пунктуацию. СТРОГО ЗАПРЕЩЕНО переписывать реплики своими словами, сжимать/сокращать "
         "смысл, добавлять пояснения, объединять или удалять элементы массива.\n"
@@ -526,10 +911,13 @@ def _validate_batch_response_detailed(
     batch_turns: list[tuple[int, str, str]],
     finish_reason: str = "",
     has_reasoning: bool = False,
+    glossary_text: str = "",
+    user_custom_prompt: str = "",
 ) -> tuple[Optional[dict[int, str]], str, int]:
     """
-    Validates an LLM JSON batch response with per-turn guardrails so one
-    suspect turn never discards valid fixes for the rest of the batch.
+    Validates an LLM JSON batch response with per-turn and word-level phonetic
+    guardrails so one suspect turn or cross-technology substitution never
+    corrupts facts or discards valid fixes for the rest of the batch.
     Returns (validated_map_or_None, error_reason, fallback_turn_count).
     """
     if not raw_content or not str(raw_content).strip():
@@ -599,6 +987,17 @@ def _validate_batch_response_detailed(
             if best_sim < 0.42:
                 rejected_reasons.append(f"rewrite_drift={best_sim:.2f}")
                 continue
+
+        # Surgical word-level phonetic stop-brake + Cyrillic acronym & vocative guards
+        new_txt, _ = _guard_phonetic_substitutions(
+            orig_txt,
+            new_txt,
+            glossary_text=glossary_text,
+            user_custom_prompt=user_custom_prompt,
+        )
+        # Canonical mixed-case enforcement (e.g. GRPC -> gRPC, DBEAVER -> DBeaver)
+        if glossary_text:
+            new_txt = _enforce_glossary_canonical_casing(new_txt, glossary_text)
 
         accepted_map[tid] = new_txt
 
@@ -893,6 +1292,8 @@ def polish_turns_with_local_llm(
                 batch_spec,
                 finish_reason=finish_reason,
                 has_reasoning=has_reasoning,
+                glossary_text=effective_prompt,
+                user_custom_prompt=custom_prompt,
             )
 
             # One-shot smart recovery for DeepSeek JSON-mode blank spaces OR max_tokens truncation
@@ -916,6 +1317,8 @@ def polish_turns_with_local_llm(
                         batch_spec,
                         finish_reason=finish_reason,
                         has_reasoning=has_reasoning,
+                        glossary_text=effective_prompt,
+                        user_custom_prompt=custom_prompt,
                     )
 
             if validated is not None:

@@ -3,7 +3,7 @@ import os
 import multiprocessing
 
 # Base paths
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.2.1"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -395,7 +395,7 @@ ASR_PROMPT_PRESETS = {
             "JWT, Bearer, OAuth 2, API-шлюз, PostgreSQL, Redis, MongoDB, S3, Kafka, DBeaver, "
             "C4, Sequence, Activity, ERD, BPMN, Camunda, PlantUML, draw.io, UI-kit, use cases, "
             "Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code, "
-            "Spec-Driven Development, CRM, SFA, OTLP, C++"
+            "Spec-Driven Development, CRM, SFA, OTLP, R&D, PO, ML, АБС, ЕБС, C++"
         ),
     },
     "backend_devops": {
