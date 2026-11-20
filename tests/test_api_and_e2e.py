@@ -166,9 +166,16 @@ def test_api_root_and_config():
     assert "llmPrivacyHint" in root_resp.text
     assert "gigaam-v3-ctc" in root_resp.text
     assert "breeze-asr-25" in root_resp.text
-    assert "canary-1b-v2" not in root_resp.text
-    assert "canary-qwen-2.5b" not in root_resp.text
-    assert "parakeet" not in root_resp.text
+    for removed_model in (
+        "canary-qwen-2.5b",
+        "canary-1b-v2",
+        "large-v3-ru",
+        'value="large-v3"',
+        'value="small"',
+        "gigaam-v3-int8",
+        "parakeet",
+    ):
+        assert removed_model not in root_resp.text, f"Removed model '{removed_model}' still in HTML"
     assert "postCustomPromptInput" in root_resp.text
     assert "postDenoiseToggle" in root_resp.text
     assert "postLlmPolishToggle" in root_resp.text
@@ -891,9 +898,9 @@ def test_planar_yuv420p_video_processor_and_single_pass_concat_mux(tmp_path):
 def test_frontend_reset_btn_allows_gpu_selection():
     """
     Executes static/script.js in Node.js against a DOM harness to verify that:
-      1. After processing a CPU job (including with CPU-only 'parakeet') and clicking
+      1. After processing a CPU job (including with cloud 'deepgram-nova-3') and clicking
          'Загрузить ещё' (#resetBtn), 'GPU (CUDA)' in #computeDeviceSelect is enabled,
-         clickable, auto-switches ASR model from 'parakeet' to 'turbo', and submits
+         clickable, auto-switches ASR model from 'deepgram-nova-3' to 'turbo', and submits
          compute_device='cuda' on the next upload.
       2. Clicking <label for="computeDeviceSelect"> opens the dropdown without immediately
          closing via document click bubbling.
@@ -1693,7 +1700,7 @@ def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, m
 def test_frontend_v45_modes_russian_models_and_post_transcribe():
     """
     Executes static/script.js in Node.js to verify v4.5.0 frontend flows:
-      1. Default model is GigaAM v3; switching GPU (CUDA) auto-switches GigaAM v3 -> Whisper Large v3 RU.
+      1. Default model is GigaAM v3; switching GPU (CUDA) when ONNX CUDA is off auto-switches GigaAM v3 -> Breeze-ASR-25.
       2. Switching to 'Только транскрибация' updates dropzone, accepts .wav/.mp3, sends mode='transcribe_only',
          hides video download button, and shows transcript download button.
       3. Anonymization with transcribe=false displays the 'Создать транскрипт отдельно' panel on completion
@@ -2613,7 +2620,7 @@ const transcribeHintText = uploadPanel.appendChild(new FakeElement('p', { id: 't
 
 const modelOpts = [
     ['gigaam-v3', 'GigaAM v3', true],
-    ['large-v3-ru', 'Whisper Large v3 RU'],
+    ['breeze-asr-25', 'Breeze-ASR-25'],
     ['turbo', 'Whisper Turbo'],
 ];
 const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто'], ['en', 'English (EN)']];
@@ -2699,8 +2706,8 @@ const fakeFetch = async (url, opts = {}) => {
                 default_diarization_sensitivity: 'normal',
                 default_audio_track_mode: 'auto',
                 asr_models: [
-                    { id: 'gigaam-v3', label: 'GigaAM v3', supports_cuda: false },
-                    { id: 'large-v3-ru', label: 'Whisper Large v3 RU', supports_cuda: true },
+                    { id: 'gigaam-v3', label: 'GigaAM v3', supports_cuda: true },
+                    { id: 'breeze-asr-25', label: 'Breeze-ASR-25', supports_cuda: true },
                     { id: 'turbo', label: 'Whisper Turbo', supports_cuda: true },
                 ],
                 languages: [{ id: 'ru', label: 'Русский (RU)' }, { id: 'auto', label: 'Авто' }],
@@ -3010,9 +3017,9 @@ def test_orchestrator_parallel_gpu_mode_for_onnx_asr_gigaam_v3(tmp_path, monkeyp
 
 def test_frontend_v50_gpu_gigaam_denoise_and_llm_polish_controls():
     """
-    Executes static/script.js in Node.js to verify v5.0.0 frontend features:
-      1. When onnx_cuda_available=true, selecting GPU (CUDA) keeps gigaam-v3 (FP32) and canary-1b-v2 selected.
-      2. Selecting CPU-only gigaam-v3-int8 and switching to GPU (CUDA) auto-upgrades to gigaam-v3.
+    Executes static/script.js in Node.js to verify v5.0+ frontend features:
+      1. When onnx_cuda_available=true, selecting GPU (CUDA) keeps gigaam-v3 (FP32) and gigaam-v3-ctc selected.
+      2. Selecting cloud deepgram-nova-3 and switching to GPU (CUDA) switches to a CUDA-capable local model.
       3. When onnx_cuda_available=false and ct2_cuda_available=true, GPU (CUDA) switches gigaam-v3 -> breeze-asr-25.
       4. denoiseToggle & llmPolishToggle default OFF; enabling llmPolishToggle reveals #llmConfigWrap,
          clicking DeepSeek API / Qwen Cloud preset chips fills URL + model & flips #llmPrivacyHint to .is-cloud,

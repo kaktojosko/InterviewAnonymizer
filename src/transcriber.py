@@ -3637,13 +3637,10 @@ class Transcriber:
         language: str = DEFAULT_ASR_LANGUAGE,
     ) -> list[TimedUnit]:
         """
-        Runs full-precision FP32 / INT8 ONNX ASR models via onnx-asr
-        (GigaAM v3 E2E RNN-T/CTC FP32, GigaAM v3 INT8, NVIDIA Canary 1B v2)
-        on NVIDIA GPU (CUDAExecutionProvider) or CPU (CPUExecutionProvider).
-        Models with word timestamps use <=20s Silero VAD + 1.5s sliding overlap
-        chunking; AED models without word timestamps (Canary 1B v2) use
-        speaker-turn / breath-valley non-overlapping windows with explicit
-        language + punctuation flags.
+        Runs full-precision FP32 ONNX ASR models via onnx-asr
+        (GigaAM v3 E2E RNN-T FP32 and GigaAM v3 E2E CTC FP32)
+        on NVIDIA GPU (CUDAExecutionProvider) or CPU (CPUExecutionProvider)
+        using <=20s Silero VAD + sliding overlap chunking with token timestamps.
         """
         if cancel_token:
             cancel_token.check()
@@ -3655,8 +3652,6 @@ class Transcriber:
         quantization = profile.get("quantization", None)
         max_chunk_sec = float(profile.get("max_chunk_sec", 20.0))
         overlap_sec = float(profile.get("overlap_sec", 1.5))
-        has_word_timestamps = bool(profile.get("has_word_timestamps", True))
-        passes_language = bool(profile.get("passes_language", False))
         progress_tag = profile.get("short_name", profile_id)
 
         req_dev = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
@@ -3665,55 +3660,14 @@ class Transcriber:
         else:
             eff_dev, providers = resolve_onnx_provider(req_dev, status_cb=status_cb)
 
-        recognize_kwargs: dict = {}
-        if passes_language:
-            lang_clean = (language or DEFAULT_ASR_LANGUAGE).strip().lower()
-            # Canary AED requires a concrete ISO language token (no <|auto|> token)
-            eff_lang = "en" if lang_clean == "en" else "ru"
-            recognize_kwargs = {
-                "language": eff_lang,
-                "target_language": eff_lang,
-                "pnc": True,
-            }
-
-        if has_word_timestamps:
-            chunks = build_longform_asr_chunks(
-                samples=samples,
-                sample_rate=sample_rate,
-                diar_segments=diar_segments,
-                max_chunk_sec=max_chunk_sec,
-                overlap_sec=overlap_sec,
-                use_silero_vad=True,
-            )
-        else:
-            # AED models without frame-level token timestamps (e.g. Canary 1B v2) MUST
-            # split cleanly along speaker turns / pause valleys with zero overlap so
-            # speakers don't merge inside one chunk and boundary words never duplicate.
-            if diar_segments:
-                ordered_diar = sorted(diar_segments, key=lambda s: (s.start, s.end))
-                wins = build_speaker_asr_windows(
-                    ordered_diar,
-                    total_dur=len(samples) / float(sample_rate) if sample_rate > 0 else 0.0,
-                    max_same_speaker_sec=max_chunk_sec,
-                    merge_gap_sec=1.2,
-                    pad_sec=0.14,
-                    split_speaker_turns=True,
-                )
-                wins = _augment_windows_with_vad(
-                    wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
-                )
-                wins = subdivide_long_asr_windows(
-                    wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
-                )
-            else:
-                wins = build_vad_asr_windows(
-                    samples,
-                    sample_rate=sample_rate,
-                    max_window_sec=max_chunk_sec,
-                    merge_gap_sec=0.9,
-                    pad_sec=0.14,
-                )
-            chunks = [(ws, we, ws, we) for ws, we in wins]
+        chunks = build_longform_asr_chunks(
+            samples=samples,
+            sample_rate=sample_rate,
+            diar_segments=diar_segments,
+            max_chunk_sec=max_chunk_sec,
+            overlap_sec=overlap_sec,
+            use_silero_vad=True,
+        )
 
         if not chunks:
             return []
@@ -3744,7 +3698,7 @@ class Transcriber:
                     sess_options=sess_opts,
                     providers=prov_list,
                 )
-                return loaded.with_timestamps() if has_word_timestamps else loaded
+                return loaded.with_timestamps()
 
             return _ModelCache.get_or_create(cache_key, _factory)
 
@@ -3786,11 +3740,9 @@ class Transcriber:
         def _decode_with_device(dev_name: str, prov_list: list[str]) -> list[TimedUnit]:
             model = _load_engine(dev_name, prov_list)
             if dev_name == "cuda":
-                default_bs = 8 if has_word_timestamps else 4
-                batch_size = max(1, int(profile.get("batch_size_cuda", default_bs)))
+                batch_size = max(1, int(profile.get("batch_size_cuda", 8)))
             else:
-                default_bs = 4 if has_word_timestamps else 1
-                batch_size = max(1, int(profile.get("batch_size_cpu", default_bs)))
+                batch_size = max(1, int(profile.get("batch_size_cpu", 4)))
             total_chunks = len(valid_chunks)
             out_units: list[TimedUnit] = []
             last_pct = -20
@@ -3812,7 +3764,7 @@ class Transcriber:
                         continue
                     try:
                         sub_wav = normalize_chunk_level(samples[sub_si:sub_ei])
-                        sub_res = model.recognize(sub_wav, sample_rate=sample_rate, **recognize_kwargs)
+                        sub_res = model.recognize(sub_wav, sample_rate=sample_rate)
                         rescued.extend(_extract_result_units(sub_res, sub_s, sub_e))
                     except Exception:
                         continue
@@ -3829,10 +3781,10 @@ class Transcriber:
                 try:
                     if len(chunk_wavs) == 1:
                         batch_results = [
-                            model.recognize(chunk_wavs[0], sample_rate=sample_rate, **recognize_kwargs)
+                            model.recognize(chunk_wavs[0], sample_rate=sample_rate)
                         ]
                     else:
-                        raw_res = model.recognize(chunk_wavs, sample_rate=sample_rate, **recognize_kwargs)
+                        raw_res = model.recognize(chunk_wavs, sample_rate=sample_rate)
                         batch_results = list(raw_res) if isinstance(raw_res, (list, tuple)) else [raw_res]
                 except Exception as batch_exc:
                     if dev_name == "cuda" and b_start == 0:
@@ -3843,7 +3795,7 @@ class Transcriber:
                             cancel_token.check()
                         try:
                             batch_results.append(
-                                model.recognize(wav_arr, sample_rate=sample_rate, **recognize_kwargs)
+                                model.recognize(wav_arr, sample_rate=sample_rate)
                             )
                         except Exception:
                             batch_results.append(None)
