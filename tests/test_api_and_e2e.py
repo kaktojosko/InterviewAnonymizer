@@ -183,6 +183,11 @@ def test_api_root_and_config():
     assert "postLlmApiKeyInput" in root_resp.text
     assert "postLlmPrivacyHint" in root_resp.text
     assert "downloadTranscriptBtn" in root_resp.text
+    assert "downloadRawTranscriptBtn" in root_resp.text
+    assert "selectedFileBar" in root_resp.text
+    assert "startProcessingBtn" in root_resp.text
+    assert "replaceSelectedFileBtn" in root_resp.text
+    assert "clearSelectedFileBtn" in root_resp.text
     assert "postTranscribeBtn" in root_resp.text
     assert "recordingsSection" in root_resp.text
     assert "cancelBtn" in root_resp.text
@@ -4162,4 +4167,341 @@ def test_api_raw_transcript_backup_download_and_status():
         for p in (txt_path, raw_path):
             if os.path.exists(p):
                 os.remove(p)
+
+
+def test_frontend_stage_file_configure_and_start_button():
+    """
+    Executes static/script.js in Node.js to verify the 2-step staged upload flow:
+      1. Selecting/dropping a recording stages it WITHOUT immediately calling /api/upload,
+         reveals #selectedFileBar with filename/size, and enables #startProcessingBtn ('Начать').
+      2. Changing mode/model/speakers/sensitivity/LLM AFTER picking the file submits the updated
+         settings only when the user clicks 'Начать'.
+      3. Dropping an audio file (.mp3) while in 'Анонимизация' mode auto-switches to 'Только транскрибация'
+         without starting; switching back to 'Анонимизация' disables 'Начать' with a warning until fixed;
+         clicking 'Убрать' or 'Загрузить ещё' clears the staged file.
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+class FakeEvent {
+    constructor(type) { this.type = type; }
+    preventDefault() {}
+    stopPropagation() {}
+}
+
+const byId = new Map();
+class FakeElement {
+    constructor(tag, opts = {}) {
+        this.tagName = tag.toUpperCase();
+        this.id = opts.id || '';
+        this.children = [];
+        this.parentNode = null;
+        this.listeners = {};
+        this.attributes = {};
+        this.dataset = opts.dataset ? { ...opts.dataset } : {};
+        this.style = {};
+        this.disabled = Boolean(opts.disabled);
+        this.checked = Boolean(opts.checked);
+        this.value = opts.value || '';
+        this.textContent = opts.text || '';
+        this.innerHTML = '';
+        this.title = '';
+        this.files = [];
+        this.onclick = null;
+        this._classes = new Set(opts.classes || []);
+        this.classList = {
+            add: (...c) => c.forEach((x) => this._classes.add(x)),
+            remove: (...c) => c.forEach((x) => this._classes.delete(x)),
+            toggle: (c, force) => {
+                if (force === undefined) {
+                    if (this._classes.has(c)) this._classes.delete(c);
+                    else this._classes.add(c);
+                } else if (force) {
+                    this._classes.add(c);
+                } else {
+                    this._classes.delete(c);
+                }
+            },
+            contains: (c) => this._classes.has(c),
+        };
+        if (this.id) byId.set(this.id, this);
+    }
+    get options() { return this.children.filter((c) => c.tagName === 'OPTION'); }
+    appendChild(child) {
+        child.parentNode = this;
+        this.children.push(child);
+        if (this.tagName === 'SELECT' && child.tagName === 'OPTION') {
+            if (child.selected || this.value === '') this.value = child.value;
+        }
+        return child;
+    }
+    insertBefore(child) { return this.appendChild(child); }
+    setAttribute(k, v) { this.attributes[k] = String(v); }
+    getAttribute(k) { return this.attributes[k] ?? null; }
+    addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+    dispatchEvent(evt) { (this.listeners[evt.type] || []).forEach((fn) => fn.call(this, evt)); }
+    click() {
+        if (this.disabled) return;
+        if (typeof this.onclick === 'function') this.onclick();
+        this.dispatchEvent(new FakeEvent('click'));
+    }
+    focus() {}
+    querySelectorAll() { return []; }
+    querySelector() { return null; }
+}
+
+const root = new FakeElement('div', { id: 'root' });
+const makeSelect = (id, opts) => {
+    const sel = new FakeElement('select', { id });
+    opts.forEach(([val, text, selected]) => {
+        const opt = new FakeElement('option', { value: val, text });
+        opt.selected = Boolean(selected);
+        sel.appendChild(opt);
+    });
+    root.appendChild(sel);
+    return sel;
+};
+
+const themeBtn = root.appendChild(new FakeElement('button', { id: 'themeToggle' }));
+const sunIcon = themeBtn.appendChild(new FakeElement('svg', { classes: ['sun-icon', 'hidden'] }));
+const moonIcon = themeBtn.appendChild(new FakeElement('svg', { classes: ['moon-icon', 'hidden'] }));
+
+const uploadPanel = root.appendChild(new FakeElement('div', { id: 'uploadPanel' }));
+const modeAnonymizeBtn = uploadPanel.appendChild(new FakeElement('button', { id: 'modeAnonymizeBtn', classes: ['is-active'] }));
+const modeTranscribeOnlyBtn = uploadPanel.appendChild(new FakeElement('button', { id: 'modeTranscribeOnlyBtn' }));
+const dropZone = uploadPanel.appendChild(new FakeElement('div', { id: 'dropZone' }));
+uploadPanel.appendChild(new FakeElement('h2', { id: 'dropZoneTitle' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'dropZoneHint' }));
+const fileInput = uploadPanel.appendChild(new FakeElement('input', { id: 'fileInput' }));
+const selectedFileBar = uploadPanel.appendChild(new FakeElement('div', { id: 'selectedFileBar', classes: ['hidden'] }));
+const selectedFileName = selectedFileBar.appendChild(new FakeElement('span', { id: 'selectedFileName' }));
+const selectedFileMeta = selectedFileBar.appendChild(new FakeElement('span', { id: 'selectedFileMeta' }));
+const replaceSelectedFileBtn = selectedFileBar.appendChild(new FakeElement('button', { id: 'replaceSelectedFileBtn' }));
+const clearSelectedFileBtn = selectedFileBar.appendChild(new FakeElement('button', { id: 'clearSelectedFileBtn' }));
+
+uploadPanel.appendChild(new FakeElement('span', { id: 'workerValue', text: '4' }));
+makeSelect('workerSelect', [['1', '1'], ['4', '4', true], ['custom', 'Другое']]);
+uploadPanel.appendChild(new FakeElement('div', { id: 'customWorkerWrap', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'customWorkerInput' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'workerLimitText' }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'transcribeToggle', checked: true }));
+uploadPanel.appendChild(new FakeElement('span', { id: 'transcribeStateBadge', text: 'Вкл' }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
+const asrModelSelect = makeSelect('asrModelSelect', [
+    ['gigaam-v3', 'GigaAM v3 FP32', true],
+    ['breeze-asr-25', 'Breeze-ASR-25'],
+    ['turbo', 'Whisper Turbo'],
+]);
+makeSelect('languageSelect', [['ru', 'Русский (RU)', true], ['auto', 'Авто']]);
+makeSelect('computeDeviceSelect', [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']]);
+const speakerCountSelect = makeSelect('speakerCountSelect', [['auto', 'Авто', true], ['4', '4 спикера']]);
+const diarizationSensitivitySelect = makeSelect('diarizationSensitivitySelect', [['normal', 'Обычная', true], ['high', 'Высокая']]);
+makeSelect('audioTracksSelect', [['auto', 'Авто', true]]);
+uploadPanel.appendChild(new FakeElement('textarea', { id: 'customPromptInput' }));
+const llmPolishToggle = uploadPanel.appendChild(new FakeElement('input', { id: 'llmPolishToggle', checked: false }));
+uploadPanel.appendChild(new FakeElement('div', { id: 'llmConfigWrap', classes: ['hidden'] }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'llmBaseUrlInput', value: 'https://api.deepseek.com/v1' }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'llmModelInput', value: 'deepseek-flash' }));
+uploadPanel.appendChild(new FakeElement('input', { id: 'llmApiKeyInput' }));
+uploadPanel.appendChild(new FakeElement('p', { id: 'llmPrivacyHint' }));
+const startProcessingBtn = uploadPanel.appendChild(new FakeElement('button', { id: 'startProcessingBtn', disabled: true, text: 'Начать' }));
+const startProcessingHint = uploadPanel.appendChild(new FakeElement('p', { id: 'startProcessingHint' }));
+
+const statusPanel = root.appendChild(new FakeElement('div', { id: 'statusPanel', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('div', { id: 'spinner' }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'successIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('svg', { id: 'cancelIcon', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('h2', { id: 'statusText' }));
+statusPanel.appendChild(new FakeElement('p', { id: 'statusSubText' }));
+statusPanel.appendChild(new FakeElement('div', { id: 'debugLog', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'cancelBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'downloadBtn', classes: ['hidden'] }));
+statusPanel.appendChild(new FakeElement('button', { id: 'downloadTranscriptBtn', classes: ['hidden'] }));
+const downloadRawTranscriptBtn = statusPanel.appendChild(new FakeElement('button', { id: 'downloadRawTranscriptBtn', classes: ['hidden'] }));
+const resetBtn = statusPanel.appendChild(new FakeElement('button', { id: 'resetBtn', classes: ['hidden'] }));
+
+const storage = new Map();
+const localStorage = {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+    removeItem: (k) => storage.delete(k),
+};
+const sessionStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+
+const documentObj = {
+    documentElement: new FakeElement('html'),
+    getElementById: (id) => byId.get(id) || null,
+    querySelector: (sel) => (sel === '.sun-icon' ? sunIcon : sel === '.moon-icon' ? moonIcon : null),
+    querySelectorAll: () => [],
+    createElement: (tag) => new FakeElement(tag),
+    createElementNS: (_ns, tag) => new FakeElement(tag),
+    addEventListener: () => {},
+};
+
+class FakeFormData {
+    constructor() { this.entries = {}; }
+    append(k, v) { this.entries[k] = v; }
+}
+
+const uploadCalls = [];
+const alerts = [];
+const fakeFetch = async (url, opts = {}) => {
+    if (url === '/api/config') {
+        return {
+            ok: true,
+            json: async () => ({
+                version: '5.1.0',
+                build_id: '5.1.0-stage',
+                cpu_count: 8,
+                default_workers: 4,
+                max_workers: 7,
+                transcription_default: true,
+                default_asr_model: 'gigaam-v3',
+                asr_models: [
+                    { id: 'gigaam-v3', label: 'GigaAM v3 FP32', supports_cuda: true, engine: 'onnx_asr' },
+                    { id: 'breeze-asr-25', label: 'Breeze-ASR-25', supports_cuda: true, engine: 'faster_whisper' },
+                    { id: 'turbo', label: 'Whisper Turbo', supports_cuda: true, engine: 'faster_whisper' },
+                ],
+                cuda_available: true,
+                ct2_cuda_available: true,
+                onnx_cuda_available: true,
+                default_compute_device: 'cpu',
+                compute_devices: [{ id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU (CUDA)' }],
+            }),
+        };
+    }
+    if (url === '/api/recordings') return { ok: true, json: async () => ({ recordings: [] }) };
+    if (url === '/api/upload') {
+        uploadCalls.push({ ...opts.body.entries });
+        return { ok: true, json: async () => ({ task_id: `stage-${uploadCalls.length}`, status: 'queued' }) };
+    }
+    if (url.startsWith('/api/status/')) {
+        return {
+            ok: true,
+            json: async () => ({
+                status: 'completed',
+                mode: uploadCalls[uploadCalls.length - 1].mode,
+                video_ready: false,
+                transcript_ready: true,
+                raw_transcript_ready: true,
+                logs: ['Done!'],
+            }),
+        };
+    }
+    throw new Error('Unexpected URL: ' + url);
+};
+
+const ctx = vm.createContext({
+    document: documentObj,
+    window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+    localStorage,
+    sessionStorage,
+    Event: FakeEvent,
+    FormData: FakeFormData,
+    AbortController: class { constructor() { this.signal = {}; } abort() {} },
+    fetch: fakeFetch,
+    setInterval: () => 1,
+    clearInterval: () => {},
+    alert: (m) => alerts.push(m),
+    console,
+    Number, String, Boolean, Array, Map, Set, Date,
+});
+
+vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
+
+(async () => {
+    await new Promise((r) => setTimeout(r, 25));
+
+    // 1. Initial state: Start button disabled, file bar hidden
+    assert.strictEqual(startProcessingBtn.disabled, true);
+    assert.strictEqual(selectedFileBar.classList.contains('hidden'), true);
+    startProcessingBtn.click();
+    assert.strictEqual(uploadCalls.length, 0);
+
+    // 2. Select interview.mp4 -> staged ONLY, NO immediate upload!
+    fileInput.files = [{ name: 'interview.mp4', size: 50 * 1024 * 1024 }];
+    fileInput.dispatchEvent(new FakeEvent('change'));
+    await new Promise((r) => setTimeout(r, 15));
+    assert.strictEqual(uploadCalls.length, 0);
+    assert.strictEqual(selectedFileBar.classList.contains('hidden'), false);
+    assert.strictEqual(dropZone.classList.contains('has-file'), true);
+    assert.strictEqual(selectedFileName.textContent, 'interview.mp4');
+    assert.ok(selectedFileMeta.textContent.includes('50.0 МБ'));
+    assert.strictEqual(startProcessingBtn.disabled, false);
+
+    // 3. Configure settings AFTER picking the file
+    modeTranscribeOnlyBtn.click();
+    asrModelSelect.value = 'breeze-asr-25';
+    asrModelSelect.dispatchEvent(new FakeEvent('change'));
+    speakerCountSelect.value = '4';
+    speakerCountSelect.dispatchEvent(new FakeEvent('change'));
+    diarizationSensitivitySelect.value = 'high';
+    diarizationSensitivitySelect.dispatchEvent(new FakeEvent('change'));
+    llmPolishToggle.checked = true;
+    llmPolishToggle.dispatchEvent(new FakeEvent('change'));
+    assert.strictEqual(uploadCalls.length, 0);
+
+    // 4. Click 'Начать' -> uploads staged file with all newly configured settings!
+    startProcessingBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(uploadCalls.length, 1);
+    assert.strictEqual(uploadCalls[0].file.name, 'interview.mp4');
+    assert.strictEqual(uploadCalls[0].mode, 'transcribe_only');
+    assert.strictEqual(uploadCalls[0].asr_model, 'breeze-asr-25');
+    assert.strictEqual(uploadCalls[0].speakers, '4');
+    assert.strictEqual(uploadCalls[0].diarization_sensitivity, 'high');
+    assert.strictEqual(uploadCalls[0].llm_polish, 'true');
+
+    // Also verify raw ASR download button becomes visible when raw_transcript_ready=true
+    assert.strictEqual(downloadRawTranscriptBtn.classList.contains('hidden'), false);
+
+    // 5. Reset clears staged file and re-disables Start button
+    resetBtn.click();
+    assert.strictEqual(selectedFileBar.classList.contains('hidden'), true);
+    assert.strictEqual(startProcessingBtn.disabled, true);
+    assert.strictEqual(downloadRawTranscriptBtn.classList.contains('hidden'), true);
+
+    // 6. Drop .mp3 while on 'Анонимизация' -> auto-switches to 'Только транскрибация' & stages without upload
+    modeAnonymizeBtn.click();
+    fileInput.files = [{ name: 'voice_note.mp3', size: 3 * 1024 * 1024 }];
+    fileInput.dispatchEvent(new FakeEvent('change'));
+    assert.strictEqual(uploadCalls.length, 1);
+    assert.strictEqual(modeTranscribeOnlyBtn.classList.contains('is-active'), true);
+    assert.strictEqual(selectedFileName.textContent, 'voice_note.mp3');
+    assert.strictEqual(startProcessingBtn.disabled, false);
+
+    // Switching back to 'Анонимизация' with .mp3 staged disables 'Начать' with warning
+    modeAnonymizeBtn.click();
+    assert.strictEqual(startProcessingBtn.disabled, true);
+    assert.strictEqual(startProcessingHint.classList.contains('is-warning'), true);
+    assert.ok(startProcessingHint.textContent.includes('.mp4'));
+
+    // Switching back to 'Только транскрибация' re-enables 'Начать'
+    modeTranscribeOnlyBtn.click();
+    assert.strictEqual(startProcessingBtn.disabled, false);
+    assert.strictEqual(startProcessingHint.classList.contains('is-warning'), false);
+
+    // Clicking 'Убрать' clears the staged file
+    clearSelectedFileBtn.click();
+    assert.strictEqual(selectedFileBar.classList.contains('hidden'), true);
+    assert.strictEqual(startProcessingBtn.disabled, true);
+    assert.strictEqual(alerts.length, 0);
+
+    console.log('FRONTEND_STAGE_AND_START_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node staged-upload test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_STAGE_AND_START_OK" in proc.stdout
+
 

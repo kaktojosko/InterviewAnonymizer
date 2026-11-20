@@ -45,6 +45,20 @@
                     <input type="file" id="fileInput" accept=".mp4" hidden>
                 </div>
 
+                <div class="selected-file-bar hidden" id="selectedFileBar" aria-live="polite">
+                    <div class="selected-file-info">
+                        <span class="selected-file-badge" aria-hidden="true">✓</span>
+                        <div class="selected-file-text">
+                            <span class="selected-file-name" id="selectedFileName"></span>
+                            <span class="selected-file-meta" id="selectedFileMeta"></span>
+                        </div>
+                    </div>
+                    <div class="selected-file-actions">
+                        <button type="button" class="prompt-chip" id="replaceSelectedFileBtn">Заменить</button>
+                        <button type="button" class="prompt-chip prompt-chip-clear" id="clearSelectedFileBtn">Убрать</button>
+                    </div>
+                </div>
+
                 <div class="worker-settings" aria-label="Настройка потоков обработки">
                     <div class="worker-settings-header">
                         <label class="worker-settings-title" for="workerSelect">Потоки обработки</label>
@@ -197,6 +211,11 @@
                         </details>
                         <p class="worker-settings-hint" id="transcribeHintText">Sber GigaAM v3 FP32: лучшая точность на русской речи (нарезка ≤20с с Silero VAD), пунктуация и регистр.</p>
                     </div>
+                </div>
+
+                <div class="start-actions" id="startProcessingWrap">
+                    <button type="button" class="clay-btn start-processing-btn" id="startProcessingBtn" disabled>Начать</button>
+                    <p class="start-processing-hint" id="startProcessingHint">Выберите или перетащите запись выше, затем выставьте настройки и нажмите «Начать».</p>
                 </div>
 
                 <div class="recordings-section hidden" id="recordingsSection" aria-label="Созданные записи">

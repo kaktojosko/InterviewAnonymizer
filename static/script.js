@@ -2,6 +2,15 @@ const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const dropZoneTitle = document.getElementById('dropZoneTitle');
 const dropZoneHint = document.getElementById('dropZoneHint');
+const selectedFileBar = document.getElementById('selectedFileBar');
+const selectedFileName = document.getElementById('selectedFileName');
+const selectedFileMeta = document.getElementById('selectedFileMeta');
+const replaceSelectedFileBtn = document.getElementById('replaceSelectedFileBtn');
+const clearSelectedFileBtn = document.getElementById('clearSelectedFileBtn');
+const startProcessingBtn = document.getElementById('startProcessingBtn');
+const startProcessingHint = document.getElementById('startProcessingHint');
+let pendingFile = null;
+let pendingModeAutoSwitched = false;
 
 // Theme Toggle Logic
 const themeToggle = document.getElementById('themeToggle');
@@ -669,6 +678,7 @@ function renderModeControls() {
     if (fileInput) {
         fileInput.accept = isTranscribeOnly ? transcribeOnlyExtensions.join(',') : '.mp4';
     }
+    renderSelectedFileState();
 }
 
 function renderTranscriptionControls() {
@@ -907,6 +917,7 @@ function renderPostTranscribeControls() {
 
 function setJobMode(mode) {
     selectedJobMode = mode === 'transcribe_only' ? 'transcribe_only' : 'anonymize';
+    pendingModeAutoSwitched = false;
     localStorage.setItem('selectedJobMode', selectedJobMode);
     renderModeControls();
     renderTranscriptionControls();
@@ -1643,6 +1654,7 @@ setSelectedWorkers(selectedWorkers);
 renderModeControls();
 renderTranscriptionControls();
 renderPostTranscribeControls();
+renderSelectedFileState();
 loadServerConfig();
 loadRecordings();
 
@@ -1670,25 +1682,140 @@ fileInput.addEventListener('change', function() {
     if (this.files.length) handleFiles(this.files);
 });
 
+if (replaceSelectedFileBtn) {
+    replaceSelectedFileBtn.addEventListener('click', () => {
+        if (fileInput) {
+            fileInput.value = '';
+            fileInput.click();
+        }
+    });
+}
+
+if (clearSelectedFileBtn) {
+    clearSelectedFileBtn.addEventListener('click', () => {
+        clearSelectedFile();
+    });
+}
+
+if (startProcessingBtn) {
+    startProcessingBtn.addEventListener('click', () => {
+        if (!pendingFile) return;
+        if (!isAllowedFile(pendingFile.name)) {
+            renderSelectedFileState();
+            return;
+        }
+        uploadFile(pendingFile);
+    });
+}
+
 function handleDrop(e) {
     const dt = e.dataTransfer;
     const files = dt.files;
     handleFiles(files);
 }
 
+function isTranscribeOnlyAllowedFile(filename) {
+    const lower = String(filename || '').toLowerCase();
+    return transcribeOnlyExtensions.some((ext) => lower.endsWith(ext));
+}
+
 function isAllowedFile(filename) {
     const lower = String(filename || '').toLowerCase();
     if (selectedJobMode === 'transcribe_only') {
-        return transcribeOnlyExtensions.some((ext) => lower.endsWith(ext));
+        return isTranscribeOnlyAllowedFile(lower);
     }
     return lower.endsWith('.mp4');
 }
 
+function renderSelectedFileState() {
+    if (!pendingFile) {
+        if (dropZone && dropZone.classList) dropZone.classList.remove('has-file');
+        if (selectedFileBar) selectedFileBar.classList.add('hidden');
+        if (startProcessingBtn) {
+            startProcessingBtn.disabled = true;
+            startProcessingBtn.textContent = 'Начать';
+        }
+        if (startProcessingHint) {
+            startProcessingHint.classList.remove('is-warning');
+            startProcessingHint.textContent =
+                'Выберите или перетащите запись выше, затем выставьте настройки и нажмите «Начать».';
+        }
+        return;
+    }
+
+    const allowedNow = isAllowedFile(pendingFile.name);
+    const sizeLabel = formatFileSize(pendingFile.size);
+    if (dropZone && dropZone.classList) dropZone.classList.add('has-file');
+    if (selectedFileBar) selectedFileBar.classList.remove('hidden');
+    if (selectedFileName) {
+        selectedFileName.textContent = pendingFile.name || 'Выбранный файл';
+        selectedFileName.title = pendingFile.name || '';
+    }
+    if (selectedFileMeta) {
+        selectedFileMeta.textContent = sizeLabel
+            ? `${sizeLabel} • готово к запуску`
+            : 'Файл выбран • готово к запуску';
+    }
+
+    if (!allowedNow) {
+        if (startProcessingBtn) {
+            startProcessingBtn.disabled = true;
+            startProcessingBtn.textContent = 'Начать';
+        }
+        if (startProcessingHint) {
+            startProcessingHint.classList.add('is-warning');
+            startProcessingHint.textContent =
+                'Для режима «Анонимизация» нужен файл .mp4 — замените файл или переключитесь на «Только транскрибация».';
+        }
+        return;
+    }
+
+    if (startProcessingBtn) {
+        startProcessingBtn.disabled = false;
+        startProcessingBtn.textContent = 'Начать';
+    }
+    if (startProcessingHint) {
+        startProcessingHint.classList.remove('is-warning');
+        startProcessingHint.textContent = pendingModeAutoSwitched
+            ? 'Аудио/медиафайл — автоматически выбран режим «Только транскрибация». Выставьте настройки и нажмите «Начать».'
+            : 'Запись выбрана — выставьте нужные настройки и нажмите «Начать».';
+    }
+}
+
+function stageSelectedFile(file, autoSwitched = false) {
+    pendingFile = file || null;
+    pendingModeAutoSwitched = Boolean(autoSwitched);
+    renderSelectedFileState();
+}
+
+function clearSelectedFile() {
+    pendingFile = null;
+    pendingModeAutoSwitched = false;
+    if (fileInput) fileInput.value = '';
+    renderSelectedFileState();
+}
+
 function handleFiles(files) {
     const file = files[0];
-    if (file && isAllowedFile(file.name)) {
-        uploadFile(file);
-    } else if (selectedJobMode === 'transcribe_only') {
+    if (!file) return;
+    if (isAllowedFile(file.name)) {
+        if (startProcessingBtn) {
+            stageSelectedFile(file, false);
+        } else {
+            uploadFile(file);
+        }
+        return;
+    }
+    if (startProcessingBtn && selectedJobMode !== 'transcribe_only' && isTranscribeOnlyAllowedFile(file.name)) {
+        selectedJobMode = 'transcribe_only';
+        localStorage.setItem('selectedJobMode', selectedJobMode);
+        pendingFile = file;
+        pendingModeAutoSwitched = true;
+        renderModeControls();
+        renderTranscriptionControls();
+        return;
+    }
+    if (selectedJobMode === 'transcribe_only') {
         alert('Пожалуйста, выберите видео или аудио файл (.mp4, .mp3, .wav, .m4a, .mkv, .ogg...)');
     } else {
         alert('Пожалуйста, выберите файл .mp4');
@@ -1703,6 +1830,7 @@ function prepareStatusPanelForRun(titleText, subText) {
     if (cancelIcon) cancelIcon.classList.add('hidden');
     downloadBtn.classList.add('hidden');
     downloadTranscriptBtn.classList.add('hidden');
+    if (downloadRawTranscriptBtn) downloadRawTranscriptBtn.classList.add('hidden');
     if (postTranscribeSection) postTranscribeSection.classList.add('hidden');
     if (postTranscribeForm) postTranscribeForm.classList.add('hidden');
     if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');
@@ -2212,7 +2340,7 @@ resetBtn.onclick = () => {
     if (togglePostTranscribeBtn) togglePostTranscribeBtn.classList.add('hidden');
     resetBtn.classList.add('hidden');
     debugLog.classList.add('hidden');
-    fileInput.value = '';
+    clearSelectedFile();
     renderWorkerControls();
     renderModeControls();
     renderTranscriptionControls();
