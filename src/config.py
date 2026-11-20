@@ -1,9 +1,44 @@
+import hashlib
 import os
 import multiprocessing
 
 # Base paths
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_build_id(base_dir: str, version: str) -> str:
+    """Computes a lightweight deterministic cache-buster from git HEAD + static asset mtimes."""
+    git_sha = ""
+    try:
+        head_path = os.path.join(base_dir, ".git", "HEAD")
+        if os.path.isfile(head_path):
+            with open(head_path, "r", encoding="utf-8") as f:
+                ref_line = f.read().strip()
+            if ref_line.startswith("ref:"):
+                ref_rel = ref_line.split(":", 1)[1].strip()
+                ref_file = os.path.join(base_dir, ".git", ref_rel)
+                if os.path.isfile(ref_file):
+                    with open(ref_file, "r", encoding="utf-8") as rf:
+                        git_sha = rf.read().strip()[:7]
+            elif len(ref_line) >= 7:
+                git_sha = ref_line[:7]
+    except OSError:
+        git_sha = ""
+
+    h = hashlib.sha1(f"{version}:{git_sha}".encode("utf-8"))
+    for rel in ("static/index.html", "static/script.js", "static/style.css"):
+        fpath = os.path.join(base_dir, rel)
+        try:
+            st = os.stat(fpath)
+            h.update(f"{rel}:{int(st.st_mtime)}:{st.st_size}".encode("utf-8"))
+        except OSError:
+            pass
+    suffix = git_sha or h.hexdigest()[:7]
+    return f"{version}-{suffix}-{h.hexdigest()[:6]}"
+
+
+APP_BUILD_ID = _resolve_build_id(BASE_DIR, APP_VERSION)
 TMP_BASE_DIR = os.path.join(BASE_DIR, "tmp")
 AUDIO_CACHE_DIR = os.path.join(TMP_BASE_DIR, "audio_cache")
 MAX_CACHED_AUDIO_FILES = max(1, int(os.environ.get("MAX_CACHED_AUDIO_FILES", "8")))
@@ -159,95 +194,7 @@ ASR_MODEL_PROFILES = {
             "hallucination_silence_threshold": 1.5,
             "temperatures": (0.0, 0.2, 0.4),
             "max_window_sec": 28.0,
-            "use_hotwords": True,
-        },
-        "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
-        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
-        "min_total_bytes": 2_500_000_000,
-        "supports_cuda": True,
-        "default_language": "ru",
-    },
-    "canary-1b-v2": {
-        "id": "canary-1b-v2",
-        "label": "Canary 1B v2 — 25 языков + пунктуация (NVIDIA, GPU/CPU, 3.9 ГБ)",
-        "short_name": "NVIDIA Canary 1B v2 (FP32)",
-        "engine": "onnx_asr",
-        "onnx_asr_model": "nemo-canary-1b-v2",
-        "quantization": None,
-        "repo_id": "istupakov/canary-1b-v2-onnx",
-        "max_chunk_sec": 26.0,
-        "overlap_sec": 0.0,
-        "batch_size_cuda": 4,
-        "batch_size_cpu": 1,
-        "has_word_timestamps": False,
-        "passes_language": True,
-        "required_files": [
-            "config.json",
-            "encoder-model.onnx",
-            "encoder-model.onnx.data",
-            "decoder-model.onnx",
-            "vocab.txt",
-        ],
-        "allow_patterns": [
-            "config.json",
-            "encoder-model.onnx",
-            "encoder-model.onnx.data",
-            "decoder-model.onnx",
-            "vocab.txt",
-        ],
-        "min_total_bytes": 3_500_000_000,
-        "supports_cuda": True,
-        "default_language": "ru",
-    },
-    "canary-qwen-2.5b": {
-        "id": "canary-qwen-2.5b",
-        "label": "Canary-Qwen 2.5B — топ-1 для English (EN ONLY, INT8 CPU, 2.9 ГБ)",
-        "short_name": "NVIDIA Canary-Qwen 2.5B (INT8, EN)",
-        "engine": "onnx_canary_qwen",
-        "repo_id": "OpenVoiceOS/canary-qwen-2.5b-onnx",
-        "max_chunk_sec": 28.0,
-        "overlap_sec": 0.0,
-        "has_word_timestamps": False,
-        "repetition_penalty": 1.05,
-        "edge_pad_sec": 0.12,
-        "required_files": [
-            "config.json",
-            "vocab.json",
-            "encoder_int8.onnx",
-            "embed_tokens_int8.onnx",
-            "decoder_int8.onnx",
-        ],
-        "allow_patterns": [
-            "config.json",
-            "vocab.json",
-            "encoder_int8.onnx",
-            "embed_tokens_int8.onnx",
-            "decoder_int8.onnx",
-        ],
-        "min_total_bytes": 2_500_000_000,
-        "supports_cuda": False,
-        "fixed_language": "en",
-        "default_language": "en",
-    },
-    "large-v3-ru": {
-        "id": "large-v3-ru",
-        "label": "Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)",
-        "short_name": "Whisper Large v3 Russian",
-        "engine": "faster_whisper",
-        "repo_id": "bzikst/faster-whisper-large-v3-russian",
-        "decode_params": {
-            "beam_size_cpu": 3,
-            "beam_size_cuda": 5,
-            "patience": 1.1,
-            "repetition_penalty": 1.10,
-            "no_repeat_ngram_size": 4,
-            "no_speech_threshold": 0.62,
-            "compression_ratio_threshold": 2.2,
-            "log_prob_threshold": -0.90,
-            "hallucination_silence_threshold": 1.2,
-            "temperatures": (0.0, 0.2, 0.4),
-            "max_window_sec": 28.0,
-            "use_hotwords": True,
+            "use_hotwords": False,
         },
         "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
         "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
@@ -280,109 +227,30 @@ ASR_MODEL_PROFILES = {
         "min_total_bytes": 600_000_000,
         "supports_cuda": True,
     },
-    "large-v3": {
-        "id": "large-v3",
-        "label": "Whisper Large v3 — мультиязычная (99 яз., 3.1 ГБ)",
-        "short_name": "Whisper Large v3",
-        "engine": "faster_whisper",
-        "repo_id": "Systran/faster-whisper-large-v3",
-        "decode_params": {
-            "beam_size_cpu": 3,
-            "beam_size_cuda": 5,
-            "patience": 1.1,
-            "repetition_penalty": 1.10,
-            "no_repeat_ngram_size": 4,
-            "no_speech_threshold": 0.62,
-            "compression_ratio_threshold": 2.2,
-            "log_prob_threshold": -0.90,
-            "hallucination_silence_threshold": 1.2,
-            "temperatures": (0.0, 0.2, 0.4),
-            "max_window_sec": 28.0,
-            "use_hotwords": True,
-        },
-        "required_files": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"],
-        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
-        "min_total_bytes": 2_500_000_000,
-        "supports_cuda": True,
-    },
-    "gigaam-v3-int8": {
-        "id": "gigaam-v3-int8",
-        "label": "GigaAM v3 INT8 — лёгкая для русского на CPU (232 МБ)",
-        "short_name": "GigaAM v3 E2E RNN-T (INT8, CPU)",
-        "engine": "onnx_asr",
-        "onnx_asr_model": "gigaam-v3-e2e-rnnt",
-        "quantization": "int8",
-        "repo_id": "istupakov/gigaam-v3-onnx",
-        "max_chunk_sec": 18.0,
-        "overlap_sec": 1.6,
-        "batch_size_cpu": 4,
-        "required_files": [
-            "config.json",
-            "v3_e2e_rnnt_encoder.int8.onnx",
-            "v3_e2e_rnnt_decoder.int8.onnx",
-            "v3_e2e_rnnt_joint.int8.onnx",
-            "v3_e2e_rnnt_vocab.txt",
-        ],
-        "allow_patterns": [
-            "config.json",
-            "v3_e2e_rnnt.yaml",
-            "v3_e2e_rnnt_encoder.int8.onnx",
-            "v3_e2e_rnnt_decoder.int8.onnx",
-            "v3_e2e_rnnt_joint.int8.onnx",
-            "v3_e2e_rnnt_vocab.txt",
-        ],
-        "min_total_bytes": 180_000_000,
+    "deepgram-nova-3": {
+        "id": "deepgram-nova-3",
+        "label": "Deepgram Nova-3 — облачный API (RU/EN/multi + keyterms + диаризация)",
+        "short_name": "Deepgram Nova-3 (Cloud API)",
+        "engine": "deepgram_cloud",
         "supports_cuda": False,
-        "fixed_language": "ru",
-    },
-    "parakeet": {
-        "id": "parakeet",
-        "label": "Parakeet v3 — быстрая (25 яз., 600 МБ)",
-        "short_name": "NVIDIA Parakeet TDT 0.6B v3 (INT8)",
-        "engine": "sherpa_parakeet",
-        "repo_id": "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        "encoder_file": "encoder.int8.onnx",
-        "decoder_file": "decoder.int8.onnx",
-        "joiner_file": "joiner.int8.onnx",
-        "tokens_file": "tokens.txt",
-        "feature_dim": 80,
-        "max_chunk_sec": 20.0,
-        "overlap_sec": 1.5,
-        "batch_size_cpu": 4,
-        "required_files": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
-        "allow_patterns": ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"],
-        "min_total_bytes": 400_000_000,
-        "supports_cuda": False,
-    },
-    "small": {
-        "id": "small",
-        "label": "Whisper Small — лёгкая (99 яз., 245 МБ)",
-        "short_name": "Whisper Small (INT8)",
-        "engine": "faster_whisper",
-        "repo_id": "Systran/faster-whisper-small",
-        "decode_params": {
-            "beam_size_cpu": 2,
-            "beam_size_cuda": 5,
-            "patience": 1.0,
-            "repetition_penalty": 1.06,
-            "no_repeat_ngram_size": 4,
-            "no_speech_threshold": 0.60,
-            "compression_ratio_threshold": 2.4,
-            "log_prob_threshold": -1.05,
-            "hallucination_silence_threshold": 1.5,
-            "temperatures": (0.0, 0.2, 0.4),
-            "max_window_sec": 28.5,
-            "use_hotwords": True,
-        },
-        "required_files": ["model.bin", "config.json", "tokenizer.json"],
-        "allow_patterns": ["model.bin", "config.json", "tokenizer.json", "preprocessor_config.json", "vocabulary.*"],
-        "min_total_bytes": 180_000_000,
-        "supports_cuda": True,
+        "is_cloud": True,
+        "requires_api_key": True,
+        "has_native_diarization": True,
+        "required_files": [],
+        "allow_patterns": [],
+        "min_total_bytes": 0,
     },
 }
 
 if DEFAULT_ASR_MODEL not in ASR_MODEL_PROFILES:
     DEFAULT_ASR_MODEL = "gigaam-v3"
+
+# Optional Deepgram Nova-3 Cloud ASR settings (opt-in only when deepgram-nova-3 profile is chosen)
+DEFAULT_DEEPGRAM_BASE_URL = os.environ.get(
+    "DEEPGRAM_BASE_URL",
+    "https://api.deepgram.com/v1",
+).strip()
+DEFAULT_DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "").strip()
 
 # Optional lightweight GTCRN neural speech denoiser (~535 KB ONNX via sherpa-onnx)
 DENOISER_MODEL = {
@@ -392,17 +260,33 @@ DENOISER_MODEL = {
 }
 DENOISE_ENABLED_DEFAULT = os.environ.get("DENOISE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
-# Optional Stage 4 OpenAI-compatible LLM transcript post-editing (local Ollama / LM Studio OR cloud DeepSeek / Qwen)
+# Optional Stage 4 OpenAI-compatible LLM transcript post-editing (DeepSeek / Qwen Cloud OR local Ollama / LM Studio)
 _LOCAL_LLM_HOST = "host.docker.internal" if os.path.exists("/.dockerenv") else "localhost"
 LLM_POLISH_ENABLED_DEFAULT = os.environ.get("LLM_POLISH_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 DEFAULT_LLM_BASE_URL = os.environ.get(
     "LLM_BASE_URL",
-    f"http://{_LOCAL_LLM_HOST}:11434/v1",
+    "https://api.deepseek.com/v1",
 ).strip()
-DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3:8b").strip()
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-flash").strip()
 DEFAULT_LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
 
 LLM_PROVIDER_PRESETS = {
+    "deepseek_cloud": {
+        "id": "deepseek_cloud",
+        "label": "DeepSeek API (облако)",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-flash",
+        "requires_api_key": True,
+        "is_cloud": True,
+    },
+    "qwen_cloud": {
+        "id": "qwen_cloud",
+        "label": "Qwen Cloud (DashScope)",
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+        "requires_api_key": True,
+        "is_cloud": True,
+    },
     "ollama_local": {
         "id": "ollama_local",
         "label": "Ollama (локально)",
@@ -418,22 +302,6 @@ LLM_PROVIDER_PRESETS = {
         "model": "qwen3-8b",
         "requires_api_key": False,
         "is_cloud": False,
-    },
-    "deepseek_cloud": {
-        "id": "deepseek_cloud",
-        "label": "DeepSeek API (облако)",
-        "base_url": "https://api.deepseek.com/v1",
-        "model": "deepseek-chat",
-        "requires_api_key": True,
-        "is_cloud": True,
-    },
-    "qwen_cloud": {
-        "id": "qwen_cloud",
-        "label": "Qwen Cloud (DashScope)",
-        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        "model": "qwen-plus",
-        "requires_api_key": True,
-        "is_cloud": True,
     },
 }
 
@@ -463,13 +331,14 @@ DEFAULT_DIARIZATION_SENSITIVITY = os.environ.get("DIARIZATION_SENSITIVITY", "nor
 if DEFAULT_DIARIZATION_SENSITIVITY not in DIARIZATION_SENSITIVITY_OPTIONS:
     DEFAULT_DIARIZATION_SENSITIVITY = "normal"
 
-# Fine-grained turn boundary threshold (cosine distance) for initial pyannote segmentation pass.
-# Tighter 0.25 prevents Pass 1 FastClustering from fusing back-to-back similar female voices.
-DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.25"))
-# Cosine similarity thresholds for Anchor-Linkage voiceprint clustering (CAM++).
-# Tuned for same-gender / compressed Zoom-channel audio so similar speakers are not collapsed to 2.
-DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.64"))
-DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.68"))
+# Fallback segmentation clustering threshold when sherpa-onnx OfflineSpeakerDiarization is used.
+DIARIZATION_SEGMENTATION_THRESHOLD = float(os.environ.get("DIARIZATION_SEG_THRESHOLD", "0.35"))
+# Calibrated cosine similarity thresholds for CAM++ Anchor-Linkage (UPGMA) voiceprint clustering.
+# Real Zoom/conference same-speaker CAM++ similarities typically sit in 0.50-0.66; combining
+# realistic UPGMA thresholds with channel-invariant SVD splitting separates 4 similar female
+# voices without exploding long noisy recordings into 15+ ghost speakers.
+DIARIZATION_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_SIM_THRESHOLD", "0.56"))
+DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD = float(os.environ.get("DIARIZATION_MULTI_SIM_THRESHOLD", "0.60"))
 
 DIARIZATION_SENSITIVITY_PROFILES = {
     "normal": {
@@ -478,29 +347,29 @@ DIARIZATION_SENSITIVITY_PROFILES = {
         "sim_threshold": DIARIZATION_CENTROID_SIM_THRESHOLD,
         "multi_sim_threshold": DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD,
         "seg_threshold": DIARIZATION_SEGMENTATION_THRESHOLD,
-        "svd_gap_threshold": 0.085,
-        "svd_max_cent_sim": 0.84,
-        "minor_min_sec": 4.0,
+        "svd_gap_threshold": 0.095,
+        "svd_max_cent_sim": 0.82,
+        "minor_min_sec": 5.0,
     },
     "high": {
         "id": "high",
         "label": "Высокая (похожие голоса / один пол)",
-        "sim_threshold": max(DIARIZATION_CENTROID_SIM_THRESHOLD + 0.05, 0.69),
-        "multi_sim_threshold": max(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD + 0.05, 0.73),
-        "seg_threshold": min(DIARIZATION_SEGMENTATION_THRESHOLD, 0.20),
-        "svd_gap_threshold": 0.065,
-        "svd_max_cent_sim": 0.87,
-        "minor_min_sec": 2.8,
+        "sim_threshold": max(DIARIZATION_CENTROID_SIM_THRESHOLD + 0.05, 0.61),
+        "multi_sim_threshold": max(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD + 0.05, 0.65),
+        "seg_threshold": min(DIARIZATION_SEGMENTATION_THRESHOLD, 0.30),
+        "svd_gap_threshold": 0.080,
+        "svd_max_cent_sim": 0.84,
+        "minor_min_sec": 3.5,
     },
     "low": {
         "id": "low",
         "label": "Низкая (строже объединять)",
-        "sim_threshold": min(DIARIZATION_CENTROID_SIM_THRESHOLD - 0.08, 0.56),
-        "multi_sim_threshold": min(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD - 0.08, 0.60),
-        "seg_threshold": max(DIARIZATION_SEGMENTATION_THRESHOLD, 0.34),
-        "svd_gap_threshold": 0.115,
-        "svd_max_cent_sim": 0.78,
-        "minor_min_sec": 6.0,
+        "sim_threshold": min(DIARIZATION_CENTROID_SIM_THRESHOLD - 0.06, 0.50),
+        "multi_sim_threshold": min(DIARIZATION_MULTI_CENTROID_SIM_THRESHOLD - 0.06, 0.54),
+        "seg_threshold": max(DIARIZATION_SEGMENTATION_THRESHOLD, 0.42),
+        "svd_gap_threshold": 0.120,
+        "svd_max_cent_sim": 0.76,
+        "minor_min_sec": 7.0,
     },
 }
 

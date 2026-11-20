@@ -43,6 +43,41 @@ def _is_local_endpoint(url: str) -> bool:
     return False
 
 
+def _is_deepseek_endpoint(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host == "deepseek.com" or host.endswith(".deepseek.com")
+
+
+def _build_turn_batches(
+    turns: list,
+    batch_size: int = 12,
+    max_batch_chars: int = 3600,
+) -> list[tuple[int, int]]:
+    """
+    Splits turns into contextual batches bounded by BOTH turn count and character
+    budget so long consecutive monologues never overflow LLM output token limits.
+    """
+    eff_size = max(1, min(int(batch_size), 25))
+    eff_chars = max(600, int(max_batch_chars))
+    batches: list[tuple[int, int]] = []
+    n = len(turns)
+    i = 0
+    while i < n:
+        start = i
+        chars = 0
+        while i < n and (i - start) < eff_size:
+            t_len = len(getattr(turns[i], "text", "") or "")
+            if i > start and (chars + t_len) > eff_chars:
+                break
+            chars += t_len
+            i += 1
+        batches.append((start, i))
+    return batches
+
+
 def _create_httpx_client(endpoint: str, timeout_sec: float) -> httpx.Client:
     """
     Creates an httpx.Client suitable for both local (Ollama / LM Studio) and
@@ -80,19 +115,11 @@ def _build_polish_messages(
         )
 
     system_msg = (
-        "Ты — профессиональный редактор расшифровок (ASR) IT-интервью.\n"
-        "Твоя задача — аккуратно исправить ТОЛЬКО ошибки распознавания речи:\n"
-        "1. Восстанови искажённые кириллицей или созвучием английские IT-термины, протоколы и инструменты по контексту "
-        "(типичные искажения ASR: «поджирописью»/«GPC» → «по gRPC», «ристы»/«РС»/«РСТ»/«рысту» → «REST», "
-        "«Geson» → «JSON», «пользова два.0» → «HTTP/2.0», «SWAP» → «SOAP», «GPT-токены»/«джвт» → «JWT-токены», "
-        "«бирутокены» → «Bearer-токены», «ауф два»/«оауф два» → «OAuth 2», «Appi Plues» → «API-шлюз», "
-        "«в Комунде» → «в Camunda», «BPen» → «BPMN», «ARD»/«продишки» → «ERD»/«ERD-шки», «Siven»/«сиквенс» → «Sequence», "
-        "«План Юля» → «PlantUML», «дру Ио» → «draw.io», «в Джерри» → «в Jira», «UI-гид» → «UI-kit», "
-        "«user Kase» → «use cases», «только со Скотой»/«докс эз код» → «Docs as Code», «C+» → «C++»).\n"
-        "2. Если ASR «проглотила» короткую английскую аббревиатуру перед русским дефисом и смысл однозначен из контекста, "
-        "аккуратно восстанови её (например: «в нашу-систему» → «в нашу CRM-систему», «нашего-специалиста» → «нашего HR-специалиста»).\n"
-        "3. Поправь очевидные омофоны («революционных баз» → «реляционных баз», «воспитательную лабораторию» → «испытательную лабораторию»), "
-        "склейки и пунктуацию, строго сохраняя исходный язык каждой реплики "
+        "Ты — профессиональный редактор расшифровок (ASR) интервью.\n"
+        "Твоя задача — аккуратно исправить ТОЛЬКО очевидные ошибки распознавания речи:\n"
+        "1. Восстанови фонетически искажённые термины, названия инструментов и аббревиатуры, опираясь строго на контекст диалога и переданный профильный словарь (например: «GPC» → «gRPC», «оауф 2» → «OAuth 2»). НЕ подменяй осмысленные обычные слова или валидные термины (например, не превращай реальное «GPT» в «JWT», если речь действительно про GPT/LLM).\n"
+        "2. Если ASR «проглотила» короткую аббревиатуру перед дефисом и она однозначно следует из контекста или словаря, аккуратно восстанови её; если контекст неоднозначен — оставь как есть.\n"
+        "3. Поправь очевидные омофоны, склейки слов и пунктуацию, строго сохраняя исходный язык каждой реплики "
         "(не переводи английские реплики на русский и русские на английский) и разговорный стиль спикера.\n"
         "4. СТРОГО ЗАПРЕЩЕНО: переписывать реплики от себя, сжимать/сокращать смысл, добавлять пояснения, "
         "объединять или удалять элементы массива.\n"
@@ -112,31 +139,52 @@ def _build_polish_messages(
     ]
 
 
-def _parse_and_validate_batch_response(
+def _extract_turns_list(parsed) -> Optional[list]:
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("turns", "items", "results", "segments"):
+            val = parsed.get(key)
+            if isinstance(val, list):
+                return val
+        nested = parsed.get("data")
+        if isinstance(nested, dict) and isinstance(nested.get("turns"), list):
+            return nested["turns"]
+    return None
+
+
+def _validate_batch_response_detailed(
     raw_content: str,
     batch_turns: list[tuple[int, str, str]],
-) -> Optional[dict[int, str]]:
+    finish_reason: str = "",
+    has_reasoning: bool = False,
+) -> tuple[Optional[dict[int, str]], str, int]:
     """
-    Strictly validates the LLM JSON response so timestamps, speaker labels,
-    turn count, and meaning can never be corrupted or hallucinated.
-    Returns mapping {turn_id: polished_text} or None to trigger safe fallback.
+    Validates an LLM JSON batch response with per-turn guardrails so one
+    suspect turn never discards valid fixes for the rest of the batch.
+    Returns (validated_map_or_None, error_reason, fallback_turn_count).
     """
-    if not raw_content or not raw_content.strip():
-        return None
+    if not raw_content or not str(raw_content).strip():
+        if finish_reason == "length" and has_reasoning:
+            return None, "thinking исчерпал max_tokens (пустой content, finish_reason=length)", 0
+        if finish_reason == "length":
+            return None, "пустой ответ (finish_reason=length)", 0
+        return None, "пустой ответ / пробелы JSON-режима", 0
 
-    cleaned = raw_content.strip()
+    cleaned = str(raw_content).strip()
+    # Strip optional reasoning tags (e.g. Qwen3 <think>...</think>) before fence/JSON parsing
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+    if "<think>" in cleaned.lower():
+        cleaned = re.sub(r"<think>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+
     fence = _CODE_FENCE_RE.search(cleaned)
     if fence:
         cleaned = fence.group(1).strip()
-
-    # Strip optional reasoning tags (e.g. Qwen3 <think>...</think>) before JSON parsing
-    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
 
     parsed = None
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try extracting outermost JSON object or array
         obj_start = cleaned.find("{")
         obj_end = cleaned.rfind("}")
         arr_start = cleaned.find("[")
@@ -154,42 +202,78 @@ def _parse_and_validate_batch_response(
                 continue
 
     if parsed is None:
-        return None
+        if finish_reason == "length":
+            return None, "обрезанный JSON (finish_reason=length)", 0
+        return None, "невалидный JSON", 0
 
-    items = parsed.get("turns") if isinstance(parsed, dict) else parsed
-    if not isinstance(items, list) or len(items) != len(batch_turns):
-        return None
+    items = _extract_turns_list(parsed)
+    if not isinstance(items, list) or not items:
+        return None, "в JSON отсутствует список turns", 0
 
     orig_by_id = {idx: txt for idx, _, txt in batch_turns}
-    result_map: dict[int, str] = {}
+    accepted_map: dict[int, str] = {}
+    rejected_reasons: list[str] = []
+    seen_ids: set[int] = set()
 
     for item in items:
         if not isinstance(item, dict) or "id" not in item or "text" not in item:
-            return None
+            rejected_reasons.append("bad_item")
+            continue
         try:
             tid = int(item["id"])
         except (TypeError, ValueError):
-            return None
-        if tid not in orig_by_id or tid in result_map:
-            return None
+            rejected_reasons.append("bad_id")
+            continue
+        if tid not in orig_by_id or tid in seen_ids:
+            rejected_reasons.append("unknown_or_dup_id")
+            continue
+        seen_ids.add(tid)
 
         new_txt = " ".join(str(item["text"]).split()).strip()
         orig_txt = orig_by_id[tid].strip()
         if not new_txt:
-            return None
+            rejected_reasons.append("empty_turn")
+            continue
         if _META_LEAK_RE.match(new_txt):
-            return None
+            rejected_reasons.append("meta_leak")
+            continue
 
-        # Guardrail against aggressive summarization or runaway hallucination
+        # Per-turn guardrail against aggressive summarization or runaway hallucination
         if len(orig_txt) >= 24:
             ratio = len(new_txt) / float(max(1, len(orig_txt)))
-            if ratio < 0.55 or ratio > 1.55:
-                return None
+            if ratio < 0.45 or ratio > 1.75:
+                rejected_reasons.append(f"length_ratio={ratio:.2f}")
+                continue
 
-        result_map[tid] = new_txt
+        accepted_map[tid] = new_txt
 
-    if len(result_map) != len(batch_turns):
-        return None
+    if not accepted_map:
+        top_reason = ", ".join(rejected_reasons[:3]) if rejected_reasons else "нет совпавших id"
+        return None, f"все реплики отклонены проверкой ({top_reason})", 0
+
+    # Fill any omitted or individually rejected turns with their original ASR text
+    final_map: dict[int, str] = {}
+    fallback_count = 0
+    for idx, _, orig_txt in batch_turns:
+        if idx in accepted_map:
+            final_map[idx] = accepted_map[idx]
+        else:
+            final_map[idx] = orig_txt
+            fallback_count += 1
+
+    return final_map, "", fallback_count
+
+
+def _parse_and_validate_batch_response(
+    raw_content: str,
+    batch_turns: list[tuple[int, str, str]],
+) -> Optional[dict[int, str]]:
+    """
+    Strictly validates the LLM JSON response so timestamps, speaker labels,
+    turn count, and meaning can never be corrupted or hallucinated.
+    Returns mapping {turn_id: polished_text} or None to trigger safe fallback.
+    """
+    result_map, _, _ = _validate_batch_response_detailed(raw_content, batch_turns)
     return result_map
 
 
@@ -203,10 +287,11 @@ def polish_turns_with_local_llm(
     timeout_sec: float = 90.0,
     status_cb: Optional[Callable[[str], None]] = None,
     cancel_token: Optional[CancellationToken] = None,
+    max_batch_chars: int = 3600,
 ) -> tuple[list, dict]:
     """
-    Stage 4 optional LLM post-editor (local Ollama / LM Studio / vLLM OR cloud
-    DeepSeek / Qwen DashScope OpenAI-compatible API). Polishes ASR text in
+    Stage 4 optional LLM post-editor (cloud DeepSeek / Qwen DashScope OR local
+    Ollama / LM Studio / vLLM OpenAI-compatible API). Polishes ASR text in
     contextual batches while strictly preserving original timestamps, speaker
     labels, and turn structure. Any error safely preserves original turns.
     """
@@ -221,33 +306,65 @@ def polish_turns_with_local_llm(
         return turns, {"applied": False, "batches_ok": 0, "batches_total": 0, "changed_turns": 0}
 
     is_local = _is_local_endpoint(endpoint)
+    is_deepseek = _is_deepseek_endpoint(endpoint)
     mode_tag = "локально" if is_local else "облачный API"
 
     headers = {"Content-Type": "application/json"}
     if api_key and api_key.strip():
         headers["Authorization"] = f"Bearer {api_key.strip()}"
 
-    eff_batch_size = max(1, min(int(batch_size), 25))
-    total_turns = len(turns)
-    total_batches = (total_turns + eff_batch_size - 1) // eff_batch_size
+    polished_turns = list(turns)
+    batches = _build_turn_batches(
+        polished_turns,
+        batch_size=batch_size,
+        max_batch_chars=max_batch_chars,
+    )
+    total_batches = len(batches)
     batches_ok = 0
     changed_turns = 0
-    polished_turns = list(turns)
     use_json_response_format = True
+    use_deepseek_thinking_disable = is_deepseek
 
     if status_cb:
+        mode_extra = ", non-thinking" if use_deepseek_thinking_disable else ""
         status_cb(
-            f"Шаг 4: LLM-корректура ({mode_tag}: {model_name} @ {endpoint}, батчей: {total_batches})..."
+            f"Шаг 4: LLM-корректура ({mode_tag}: {model_name}{mode_extra} @ {endpoint}, батчей: {total_batches})..."
         )
+
+    def _send_completion(client: httpx.Client, req_body: dict) -> tuple[str, str, bool]:
+        nonlocal use_json_response_format, use_deepseek_thinking_disable
+        cur_body = dict(req_body)
+        try:
+            resp = client.post(endpoint, headers=headers, json=cur_body)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as rf_exc:
+            sc = rf_exc.response.status_code if rf_exc.response is not None else 0
+            if sc in (400, 422) and ("response_format" in cur_body or "thinking" in cur_body):
+                if "response_format" in cur_body:
+                    use_json_response_format = False
+                    cur_body.pop("response_format", None)
+                if "thinking" in cur_body:
+                    use_deepseek_thinking_disable = False
+                    cur_body.pop("thinking", None)
+                resp = client.post(endpoint, headers=headers, json=cur_body)
+                resp.raise_for_status()
+            else:
+                raise
+
+        data = resp.json() or {}
+        choice0 = (data.get("choices") or [{}])[0] or {}
+        msg0 = choice0.get("message") or {}
+        raw_content = msg0.get("content") or ""
+        finish_reason = str(choice0.get("finish_reason") or "").strip().lower()
+        has_reasoning = bool(msg0.get("reasoning_content"))
+        return raw_content, finish_reason, has_reasoning
 
     t0 = time.time()
     with _create_httpx_client(endpoint, timeout_sec) as client:
-        for b_idx in range(total_batches):
+        for b_idx, (start_i, end_i) in enumerate(batches):
             if cancel_token:
                 cancel_token.check()
 
-            start_i = b_idx * eff_batch_size
-            end_i = min(total_turns, start_i + eff_batch_size)
             batch_spec = [
                 (i, polished_turns[i].speaker_label, polished_turns[i].text)
                 for i in range(start_i, end_i)
@@ -260,38 +377,55 @@ def polish_turns_with_local_llm(
 
             messages = _build_polish_messages(batch_spec, prev_ctx, custom_prompt=custom_prompt)
             batch_chars = sum(len(txt) for _, _, txt in batch_spec)
+            base_max_tokens = min(16384, max(2048, batch_chars * 3))
             body: dict = {
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.05,
-                "top_p": 0.9,
-                "max_tokens": min(4096, max(1024, batch_chars * 2)),
+                "max_tokens": base_max_tokens,
                 "stream": False,
             }
+            if use_deepseek_thinking_disable:
+                # DeepSeek deepseek-flash / deepseek-v4-pro default to thinking=enabled (high),
+                # which spends max_tokens inside reasoning_content and leaves content empty/truncated.
+                body["thinking"] = {"type": "disabled"}
+            else:
+                body["top_p"] = 0.9
             if use_json_response_format:
                 body["response_format"] = {"type": "json_object"}
 
             try:
-                try:
-                    resp = client.post(endpoint, headers=headers, json=body)
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as rf_exc:
-                    sc = rf_exc.response.status_code if rf_exc.response is not None else 0
-                    if use_json_response_format and sc in (400, 422):
-                        use_json_response_format = False
-                        body.pop("response_format", None)
-                        resp = client.post(endpoint, headers=headers, json=body)
-                        resp.raise_for_status()
-                    else:
-                        raise
-
-                data = resp.json()
-                raw_content = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
+                raw_content, finish_reason, has_reasoning = _send_completion(client, body)
+                validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
+                    raw_content,
+                    batch_spec,
+                    finish_reason=finish_reason,
+                    has_reasoning=has_reasoning,
                 )
-                validated = _parse_and_validate_batch_response(raw_content, batch_spec)
+
+                # One-shot smart recovery for DeepSeek JSON-mode blank spaces OR max_tokens truncation
+                if validated is None:
+                    retry_body: Optional[dict] = None
+                    if not str(raw_content).strip() and "response_format" in body:
+                        retry_body = dict(body)
+                        retry_body.pop("response_format", None)
+                        if finish_reason == "length":
+                            retry_body["max_tokens"] = min(32768, int(body["max_tokens"]) * 2)
+                    elif finish_reason == "length":
+                        retry_body = dict(body)
+                        retry_body["max_tokens"] = min(32768, int(body["max_tokens"]) * 2)
+
+                    if retry_body is not None:
+                        if cancel_token:
+                            cancel_token.check()
+                        raw_content, finish_reason, has_reasoning = _send_completion(client, retry_body)
+                        validated, fail_reason, fallback_cnt = _validate_batch_response_detailed(
+                            raw_content,
+                            batch_spec,
+                            finish_reason=finish_reason,
+                            has_reasoning=has_reasoning,
+                        )
+
                 if validated is not None:
                     turn_cls = type(polished_turns[start_i])
                     for idx, new_text in validated.items():
@@ -305,10 +439,16 @@ def polish_turns_with_local_llm(
                             text=new_text,
                         )
                     batches_ok += 1
+                    if fallback_cnt > 0 and status_cb:
+                        status_cb(
+                            f"LLM-корректура: батч {b_idx + 1}/{total_batches} применён "
+                            f"(оставлено без правок по guard: {fallback_cnt}/{len(batch_spec)})."
+                        )
                 else:
                     if status_cb:
                         status_cb(
-                            f"LLM-корректура: батч {b_idx + 1}/{total_batches} не прошёл валидацию — оставлен исходный ASR."
+                            f"LLM-корректура: батч {b_idx + 1}/{total_batches} не прошёл валидацию "
+                            f"({fail_reason}) — оставлен исходный ASR."
                         )
             except httpx.HTTPStatusError as http_exc:
                 status_code = http_exc.response.status_code if http_exc.response is not None else 0

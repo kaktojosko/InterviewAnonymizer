@@ -189,6 +189,8 @@ class ModelManager:
             raise ValueError(f"Unknown ASR model profile: '{profile_id}'")
 
         profile = ASR_MODEL_PROFILES[profile_id]
+        if profile.get("is_cloud"):
+            return ""
         asr_rel = os.path.join("asr", profile_id)
 
         with _download_lock:
@@ -245,7 +247,9 @@ def _cli():
         print(f"[ModelManager] Ready: denoiser -> {dn_path}")
 
     if "all" in raw_items:
-        profiles_to_load = list(ASR_MODEL_PROFILES.keys())
+        profiles_to_load = [
+            pid for pid, cfg in ASR_MODEL_PROFILES.items() if not cfg.get("is_cloud")
+        ]
     else:
         profiles_to_load = [p for p in raw_items if p not in ("diarization", "denoiser")]
 
@@ -253,6 +257,9 @@ def _cli():
         if pid not in ASR_MODEL_PROFILES:
             print(f"Error: unknown ASR profile '{pid}'. Valid: {', '.join(ASR_MODEL_PROFILES)}", file=sys.stderr)
             sys.exit(1)
+        if ASR_MODEL_PROFILES[pid].get("is_cloud"):
+            print(f"[ModelManager] Skipping cloud profile '{pid}' (no local weights).")
+            continue
         path = ModelManager.ensure_asr_model(pid, status_cb=print)
         print(f"[ModelManager] Ready: {pid} -> {path}")
 

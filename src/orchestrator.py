@@ -24,6 +24,7 @@ from src.config import (
     DEFAULT_ASR_MODEL,
     DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DEEPGRAM_API_KEY,
     DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_LLM_API_KEY,
     DEFAULT_LLM_BASE_URL,
@@ -151,6 +152,7 @@ class Orchestrator:
         llm_base_url: str = DEFAULT_LLM_BASE_URL,
         llm_model: str = DEFAULT_LLM_MODEL,
         llm_api_key: str = DEFAULT_LLM_API_KEY,
+        asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
     ) -> dict:
         log_lock = threading.Lock()
 
@@ -559,10 +561,15 @@ class Orchestrator:
                         llm_base_url=llm_base_url,
                         llm_model=llm_model,
                         llm_api_key=llm_api_key,
+                        asr_api_key=asr_api_key,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
                 else:
-                    update("Запуск локальной автотранскрибации по ролям...")
+                    update(
+                        f"Запуск облачной транскрибации ({profile_info['short_name']})..."
+                        if profile_info.get("is_cloud")
+                        else "Запуск локальной автотранскрибации по ролям..."
+                    )
                     Transcriber.transcribe_audio_file(
                         wav_path=audio_16k_path,
                         output_txt_path=transcript_path,
@@ -580,6 +587,7 @@ class Orchestrator:
                         llm_base_url=llm_base_url,
                         llm_model=llm_model,
                         llm_api_key=llm_api_key,
+                        asr_api_key=asr_api_key,
                     )
                     transcript_ready = os.path.isfile(transcript_path)
             elif raw_wav_ready and cached_audio_path:
@@ -637,6 +645,7 @@ class Orchestrator:
         llm_base_url: str = DEFAULT_LLM_BASE_URL,
         llm_model: str = DEFAULT_LLM_MODEL,
         llm_api_key: str = DEFAULT_LLM_API_KEY,
+        asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
     ) -> dict:
         """
         Runs speaker-diarized transcription directly on a video/audio file (or
@@ -816,9 +825,14 @@ class Orchestrator:
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
                 llm_api_key=llm_api_key,
+                asr_api_key=asr_api_key,
             )
         else:
-            update("Запуск локальной транскрибации по ролям...")
+            update(
+                f"Запуск облачной транскрибации ({profile_info['short_name']})..."
+                if profile_info.get("is_cloud")
+                else "Запуск локальной транскрибации по ролям..."
+            )
             Transcriber.transcribe_audio_file(
                 wav_path=wav_path,
                 output_txt_path=staged_txt_path,
@@ -836,6 +850,7 @@ class Orchestrator:
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
                 llm_api_key=llm_api_key,
+                asr_api_key=asr_api_key,
             )
 
         if cancel_token is not None:

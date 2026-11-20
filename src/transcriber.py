@@ -9,6 +9,7 @@ import os
 import re
 import site
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -35,6 +36,8 @@ from src.config import (
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DEEPGRAM_API_KEY,
+    DEFAULT_DEEPGRAM_BASE_URL,
     DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_LLM_API_KEY,
     DEFAULT_LLM_BASE_URL,
@@ -49,6 +52,7 @@ from src.config import (
     LLM_POLISH_ENABLED_DEFAULT,
     TRANSCRIPT_PAUSE_BREAK_SEC,
 )
+from src.deepgram_asr import transcribe_with_deepgram_nova3
 from src.llm_postprocessor import polish_turns_with_local_llm
 from src.model_manager import ModelManager
 
@@ -301,7 +305,7 @@ def smooth_diarization_segments(
 def consolidate_minor_speakers(
     segments: list[DiarizationSegment],
     merge_gap_sec: float = DIARIZATION_MERGE_GAP_SEC,
-    minor_min_sec: float = 4.5,
+    minor_min_sec: float = 5.0,
 ) -> list[DiarizationSegment]:
     """
     Absorbs transient noise/laugh/interjection micro-clusters on long recordings
@@ -320,7 +324,12 @@ def consolidate_minor_speakers(
         return segments
 
     floor_sec = max(1.5, float(minor_min_sec))
-    min_major_dur = min(floor_sec, max(2.0, 0.008 * total_speech))
+    if total_speech >= 120.0:
+        max_cap = min(15.0, floor_sec * 3.0)
+        min_major_dur = max(floor_sec, min(max_cap, 0.010 * total_speech))
+    else:
+        min_major_dur = min(floor_sec, max(2.0, 0.010 * total_speech))
+
     major_spks = {spk for spk, dur in dur_by_spk.items() if dur >= min_major_dur}
     if not major_spks or len(major_spks) == len(dur_by_spk):
         return segments
@@ -359,7 +368,7 @@ def cluster_anchor_embeddings(
          similar same-gender voices into 2 clusters).
       2. Assigns all segments — including rapid <1.5s answers and backchannels
          ('Ну да', 'Все', 'Добрый день') — unbiasedly to their closest vocal
-         centroid, followed by centroid refinement and voiceprint export.
+         centroid, followed by coherence-aware centroid refinement and voiceprint export.
     """
     if not segments:
         return ([], {}) if return_centroids else []
@@ -376,7 +385,9 @@ def cluster_anchor_embeddings(
         if multi_sim_threshold is None
         else float(multi_sim_threshold)
     )
-    minor_min_sec = float(sens_prof.get("minor_min_sec", 4.5))
+    minor_min_sec = float(sens_prof.get("minor_min_sec", 5.0))
+    svd_gap_thr = float(sens_prof.get("svd_gap_threshold", 0.095))
+    svd_max_cent_sim = float(sens_prof.get("svd_max_cent_sim", 0.82))
 
     mode = (speaker_count or "auto").strip().lower()
     if mode.isdigit() and int(mode) >= 1:
@@ -469,14 +480,14 @@ def cluster_anchor_embeddings(
         best_avg_sim = float(avg_mat[bi, bj])
 
         if target_k is None:
-            if mode == "4+" and k_cur <= 4 and best_avg_sim < max(eff_sim_thr, 0.68):
+            if mode == "4+" and k_cur <= 4 and best_avg_sim < max(eff_sim_thr, 0.62):
                 break
             if best_avg_sim < eff_sim_thr:
                 break
             # Lower-quantile guard prevents chaining-drift merges across distinct similar voices
             sub_block = pair_sim[np.ix_(cluster_pos_lists[bi], cluster_pos_lists[bj])]
             low_q_sim = float(np.percentile(sub_block, 20)) if sub_block.size > 1 else best_avg_sim
-            if low_q_sim < (eff_sim_thr - 0.14):
+            if low_q_sim < (eff_sim_thr - 0.18):
                 blocked[bi, bj] = True
                 blocked[bj, bi] = True
                 continue
@@ -488,15 +499,16 @@ def cluster_anchor_embeddings(
         cluster_pos_lists[bi].extend(cluster_pos_lists[bj])
         cluster_pos_lists.pop(bj)
 
-        # Update weighted_sum and blocked matrices by merging row/col bj into bi and deleting bj
+        # Update weighted_sum and reset block flags for the newly grown cluster (never propagate
+        # stale single-outlier blocks virally across unrelated valid merges).
         c_weights[bi] += c_weights[bj]
         c_weights.pop(bj)
         weighted_sum[bi, :] += weighted_sum[bj, :]
         weighted_sum[:, bi] += weighted_sum[:, bj]
         weighted_sum = np.delete(weighted_sum, bj, axis=0)
         weighted_sum = np.delete(weighted_sum, bj, axis=1)
-        blocked[bi, :] |= blocked[bj, :]
-        blocked[:, bi] |= blocked[:, bj]
+        blocked[bi, :] = False
+        blocked[:, bi] = False
         blocked = np.delete(blocked, bj, axis=0)
         blocked = np.delete(blocked, bj, axis=1)
 
@@ -505,16 +517,14 @@ def cluster_anchor_embeddings(
     # interviewers on Zoom/Telemost), their shared channel+gender vector inflates raw
     # inter-speaker cosine similarity into 0.60-0.75. Subtracting the cluster mean (SVD top
     # singular direction) cancels the shared channel offset: a true single speaker is
-    # isotropic (within-between gap <= 0.04, cent_sim >= 0.92), whereas 2+ merged speakers
-    # exhibit a sharp coherence gap (>= 0.085) and clearly separated sub-centroids.
+    # isotropic (within-between gap <= 0.04, cent_sim >= 0.90), whereas 2+ merged speakers
+    # exhibit a sharp coherence gap (>= svd_gap_thr) and clearly separated sub-centroids.
     if target_k is None and clusters:
-        svd_gap_thr = float(sens_prof.get("svd_gap_threshold", 0.085))
-        svd_max_cent_sim = float(sens_prof.get("svd_max_cent_sim", 0.84))
-        min_half_anchors = 4
-        min_half_dur = 10.0
+        min_half_anchors = 5
+        min_half_dur = 12.0
         splits_done = 0
         split_changed = True
-        while split_changed and splits_done < 6:
+        while split_changed and splits_done < 4:
             split_changed = False
             next_clusters: list[list[int]] = []
             for grp in clusters:
@@ -577,17 +587,17 @@ def cluster_anchor_embeddings(
                     next_clusters.append(grp)
             clusters = next_clusters
 
-    # Absorb isolated 1-segment overlap/laugh outlier anchors on longer recordings
+    # Absorb transient overlap/laugh/crosstalk micro-clusters into their closest major voiceprint
     if target_k is None and len(clusters) > 1:
         cluster_durs = [sum(durations[i] for i in c) for c in clusters]
         total_anchor_dur = sum(cluster_durs)
         if total_anchor_dur >= 25.0:
-            min_keep_dur = min(minor_min_sec, max(2.2, 0.010 * total_anchor_dur))
-            major_ids = [
-                ci
-                for ci, c_dur in enumerate(cluster_durs)
-                if c_dur >= min_keep_dur or len(clusters[ci]) >= 2
-            ]
+            if total_anchor_dur >= 120.0:
+                max_cap = min(15.0, minor_min_sec * 3.0)
+                min_keep_dur = max(minor_min_sec, min(max_cap, 0.010 * total_anchor_dur))
+            else:
+                min_keep_dur = min(minor_min_sec, max(2.2, 0.010 * total_anchor_dur))
+            major_ids = [ci for ci, c_dur in enumerate(cluster_durs) if c_dur >= min_keep_dur]
             if major_ids and len(major_ids) < len(clusters):
                 major_cents = {ci: _compute_centroid(clusters[ci]) for ci in major_ids}
                 to_drop: set[int] = set()
@@ -597,7 +607,7 @@ def cluster_anchor_embeddings(
                     c_vec = _compute_centroid(clusters[ci])
                     best_m = max(major_ids, key=lambda m: float(np.dot(c_vec, major_cents[m])))
                     best_m_sim = float(np.dot(c_vec, major_cents[best_m]))
-                    if best_m_sim >= 0.42 or cluster_durs[ci] < 2.6:
+                    if best_m_sim >= 0.28 or cluster_durs[ci] < minor_min_sec:
                         clusters[best_m].extend(clusters[ci])
                         to_drop.add(ci)
                 if to_drop:
@@ -619,9 +629,10 @@ def cluster_anchor_embeddings(
     cent_mat = np.stack([_compute_centroid(c) for c in clusters], axis=0)
     assigned = _assign_to_centroids(cent_mat)
 
-    # Refinement pass: recompute centroids from >=1.5s assigned segments & merge ONLY
-    # near-identical duplicate clusters (never collapse distinct same-gender voices whose
-    # averaged centroids naturally sit ~0.12-0.16 higher than raw utterance similarity).
+    # Coherence-aware refinement pass: recomputes centroids from >=1.5s assigned segments and
+    # reunites noise-split shards of the SAME speaker (high averaged-centroid similarity and
+    # negligible multimodal coherence gap) while strictly refusing to re-merge distinct
+    # same-gender voices separated by UPGMA or SVD.
     if len(clusters) > 1:
         refined_groups: list[list[int]] = []
         for k in range(len(clusters)):
@@ -637,8 +648,16 @@ def cluster_anchor_embeddings(
             if strong_members:
                 refined_groups.append(strong_members)
 
+        def _within_mean(mat: np.ndarray) -> float:
+            n_m = mat.shape[0]
+            if n_m <= 1:
+                return 1.0
+            s_mat = mat @ mat.T
+            return float((s_mat.sum() - n_m) / (n_m * (n_m - 1)))
+
         if len(refined_groups) >= 2:
-            refine_merge_thr = min(0.92, max(eff_sim_thr + 0.14, 0.82))
+            refine_high_thr = max(svd_max_cent_sim + 0.02, 0.85)
+            refine_mid_thr = max(svd_max_cent_sim - 0.06, 0.72)
             ref_blocked: set[tuple[int, int]] = set()
             while target_k is None and len(refined_groups) > 1:
                 if mode == "4+" and len(refined_groups) <= 4:
@@ -652,15 +671,39 @@ def cluster_anchor_embeddings(
                         r_sim[b_i, a_i] = -2.0
                 flat_best = int(np.argmax(r_sim))
                 bi, bj = divmod(flat_best, r_sim.shape[1])
-                if float(r_sim[bi, bj]) < refine_merge_thr:
+                best_cent_sim = float(r_sim[bi, bj])
+                if best_cent_sim < refine_mid_thr:
                     break
                 if bi > bj:
                     bi, bj = bj, bi
-                # Also verify raw utterance-level cross-group similarity >= eff_sim_thr
+
                 emb_bi = np.stack([norm_embs[m] for m in refined_groups[bi] if norm_embs[m] is not None], axis=0)
                 emb_bj = np.stack([norm_embs[m] for m in refined_groups[bj] if norm_embs[m] is not None], axis=0)
                 cross_mean = float(np.mean(emb_bi @ emb_bj.T))
-                if cross_mean < eff_sim_thr:
+                both_substantive = emb_bi.shape[0] >= 3 and emb_bj.shape[0] >= 3
+                coherence_gap = (
+                    (min(_within_mean(emb_bi), _within_mean(emb_bj)) - cross_mean)
+                    if both_substantive
+                    else 0.0
+                )
+
+                should_merge = False
+                if best_cent_sim >= 0.88 and cross_mean >= max(0.35, eff_sim_thr - 0.22):
+                    should_merge = True
+                elif (
+                    best_cent_sim >= refine_high_thr
+                    and cross_mean >= max(0.38, eff_sim_thr - 0.18)
+                    and coherence_gap < svd_gap_thr
+                ):
+                    should_merge = True
+                elif (
+                    best_cent_sim >= refine_mid_thr
+                    and cross_mean >= max(0.42, eff_sim_thr - 0.12)
+                    and coherence_gap < (svd_gap_thr * 0.75)
+                ):
+                    should_merge = True
+
+                if not should_merge:
                     ref_blocked.add((bi, bj))
                     continue
                 refined_groups[bi].extend(refined_groups[bj])
@@ -2292,7 +2335,8 @@ def is_whisper_prompt_echo(
     """
     Detects when Whisper hallucinates/echoes the user's initial_prompt glossary
     on a quiet or noisy segment (e.g. repeating 'Собеседование системного аналитика:
-    REST, gRPC, HTTP 2.0, SOAP...') so user prompts never leak into transcripts.
+    REST, gRPC, HTTP 2.0, SOAP...') so user prompts never leak into transcripts,
+    while preserving genuine confident tech-stack enumerations spoken by candidates.
     """
     if not custom_prompt or not custom_prompt.strip():
         return False
@@ -2303,19 +2347,33 @@ def is_whisper_prompt_echo(
     if len(prompt_toks) < 3:
         return False
 
+    # 1. Verbatim echo of the prompt's descriptive lead-in header (text before ':')
+    if ":" in custom_prompt:
+        header_toks = _normalize_prompt_tokens(custom_prompt.split(":", 1)[0])
+        h_len = len(header_toks)
+        if h_len >= 2 and len(seg_toks) >= h_len:
+            header_tuple = tuple(header_toks)
+            for i in range(len(seg_toks) - h_len + 1):
+                if tuple(seg_toks[i : i + h_len]) == header_tuple:
+                    return True
+
     prompt_set = set(prompt_toks)
     overlap_ratio = sum(1 for t in seg_toks if t in prompt_set) / float(len(seg_toks))
+    low_confidence = no_speech_prob >= 0.25 or avg_logprob <= -0.50
 
-    # Check if a contiguous 4-word run from the prompt was echoed verbatim
+    # 2. Contiguous verbatim 4-gram run from the prompt: drop on weak acoustic confidence,
+    #    or when an entire long utterance (>=6 tokens, >=90% overlap) verbatim-echoes the list.
     if len(seg_toks) >= 4:
         prompt_ngrams = {
             tuple(prompt_toks[i : i + 4]) for i in range(max(0, len(prompt_toks) - 3))
         }
-        for i in range(len(seg_toks) - 3):
-            if tuple(seg_toks[i : i + 4]) in prompt_ngrams:
-                return True
+        has_4gram = any(
+            tuple(seg_toks[i : i + 4]) in prompt_ngrams for i in range(len(seg_toks) - 3)
+        )
+        if has_4gram and (low_confidence or (len(seg_toks) >= 6 and overlap_ratio >= 0.90)):
+            return True
 
-    if overlap_ratio >= 0.85 and len(seg_toks) >= 5:
+    if overlap_ratio >= 0.85 and len(seg_toks) >= 5 and (low_confidence or len(seg_toks) >= 8):
         return True
     if overlap_ratio >= 0.70 and (no_speech_prob >= 0.30 or avg_logprob <= -0.55):
         return True
@@ -2323,13 +2381,15 @@ def is_whisper_prompt_echo(
 
 
 # Strict opt-in phonetic-to-Latin glossary map: each entry activates ONLY when its
-# canonical Latin term is explicitly present in the user's custom_prompt.
+# canonical Latin term appears as a whole token in the user's custom_prompt.
+# Ambiguous homonyms (e.g. 'GPT-токены', 'жиры', 'редис', bare 'о аут', bare 'C+') are
+# intentionally excluded from blind regex substitution and left to contextual LLM polish.
 _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("gRPC", "по gRPC", (r"поджирописью", r"под[\s\-]?жирописью")),
     ("gRPC", "gRPC", (r"джи[\s\-]?эр[\s\-]?пи[\s\-]?си", r"гэрпэцэ", r"грпц", r"грпс", r"gpc", r"джиэрпис[ию]?")),
     ("HTTP 2.0", "HTTP 2.0", (r"эйч[\s\-]?ти[\s\-]?ти[\s\-]?пи[\s\-]+(?:2\.0|два(?:\s+ноль)?)", r"хттп[\s\-]+(?:2\.0|два(?:\s+ноль)?)")),
-    ("OAuth 2", "OAuth 2", (r"о[\s\-]?ау[фтс](?:[\s\-]+(?:2(?:\.0)?|два))?", r"оаут(?:[\s\-]+(?:2(?:\.0)?|два))?", r"оауф(?:[\s\-]+(?:2(?:\.0)?|два))?", r"ауф[\s\-]+(?:2(?:\.0)?|два)", r"аут[\s\-]+(?:2(?:\.0)?|два)")),
-    ("JWT", "JWT", (r"джей[\s\-]?дабл[\s\-]?ю[\s\-]?ти", r"джей[\s\-]?ви[\s\-]?ти", r"джвт", r"живити", r"гвт", r"gwt", r"gpt(?=[\s\-]+токен)", r"джпити(?=[\s\-]+токен)")),
+    ("OAuth 2", "OAuth 2", (r"оау[фтс](?:[\s\-]+(?:2(?:\.0)?|два))?", r"о[\s\-]+ау[фтс][\s\-]+(?:2(?:\.0)?|два)", r"ауф[\s\-]+(?:2(?:\.0)?|два)", r"аут[\s\-]+(?:2(?:\.0)?|два)")),
+    ("JWT", "JWT", (r"джей[\s\-]?дабл[\s\-]?ю[\s\-]?ти", r"джей[\s\-]?ви[\s\-]?ти", r"джвт", r"живити", r"гвт", r"gwt")),
     ("Bearer", "Bearer-токены", (r"бирутокены", r"бир[\s\-]?токены")),
     ("Bearer", "Bearer-токен", (r"бирутокен", r"бир[\s\-]?токен")),
     ("Bearer", "Bearer-токенов", (r"бирутокенов", r"бир[\s\-]?токенов")),
@@ -2341,7 +2401,7 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("REST API", "REST API", (r"рест[\s\-]+апи", r"рест[\s\-]+эй[\s\-]?пи[\s\-]?ай")),
     ("REST", "REST", (r"рест(?:а|у|ом|е)?", r"рист(?:а|у|ы|ом|е)?", r"рыст(?:а|у|ом|е)?")),
     ("PostgreSQL", "PostgreSQL", (r"постгрес[\s\-]?кью[\s\-]?эль", r"постгресс?", r"постгри")),
-    ("Redis", "Redis", (r"редис(?:а|е|ом)?", r"рэдис(?:а|е|ом)?")),
+    ("Redis", "Redis", (r"рэдис(?:а|е|ом)?",)),
     ("MongoDB", "MongoDB", (r"монго[\s\-]?дб", r"монго[\s\-]?ди[\s\-]?би", r"монга")),
     ("Kafka", "Kafka", (r"кафк[аеуи]",)),
     ("RabbitMQ", "RabbitMQ", (r"рэббит[\s\-]?эм[\s\-]?кью", r"реббит[\s\-]?эм[\s\-]?кью", r"рэббит")),
@@ -2359,12 +2419,12 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("Postman", "Postman", (r"постман(?:а|е|ом)?", r"постмэн(?:а|е|ом)?")),
     ("Confluence", "Confluence", (r"конфлю[еэ]нс(?:а|е|ом)?",)),
     ("Jira", "в Jira", (r"в\s+джерри",)),
-    ("Jira", "Jira", (r"джир[аеуы]", r"жир[аеуы]")),
+    ("Jira", "Jira", (r"джир[аеуы]",)),
     ("Jenkins", "Jenkins", (r"дженкинс(?:а|е|ом)?",)),
     ("Docs as Code", "Docs as Code", (r"докс[\s\-]+эз[\s\-]+код", r"докс[\s\-]+аз[\s\-]+код", r"докс[\s\-]+ас[\s\-]+код")),
     ("SFA", "SFA", (r"цфа(?=\-систем)",)),
     ("OTLP", "OTLP", (r"от[\s\-]+лп", r"о[\s\-]?ти[\s\-]?эл[\s\-]?пи")),
-    ("C++", "C++", (r"си[\s\-]+плюс[\s\-]+плюс", r"c\+(?!\+)")),
+    ("C++", "C++", (r"си[\s\-]+плюс[\s\-]+плюс", r"(?:(?<=на\s)|(?<=с\s)|(?<=из\s))c\+(?!\+)")),
     ("GraphQL", "GraphQL", (r"граф[\s\-]?кью[\s\-]?эль", r"графкьюэл")),
     ("OpenAPI", "OpenAPI", (r"опен[\s\-]?апи", r"оупен[\s\-]?апи")),
     ("Kubernetes", "Kubernetes", (r"кубернетес(?:а|е|ом)?", r"кубернэтес(?:а|е|ом)?", r"кубер(?:а|е|ом)?")),
@@ -2382,10 +2442,13 @@ _GLOSSARY_PHONETIC_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ("WebSocket", "WebSocket", (r"веб[\s\-]?сокет(?:а|е|ом|ы|ов)?",)),
 ]
 
-_COMPILED_GLOSSARY_RULES: list[tuple[str, str, re.Pattern]] = [
+_COMPILED_GLOSSARY_RULES: list[tuple[str, re.Pattern, re.Pattern]] = [
     (
         replacement,
-        trigger.lower(),
+        re.compile(
+            r"(?<![A-Za-zА-Яа-яЁё0-9])" + re.escape(trigger) + r"(?![A-Za-zА-Яа-яЁё0-9])",
+            re.IGNORECASE,
+        ),
         re.compile(
             r"(?<![A-Za-zА-Яа-яЁё0-9])(?:" + "|".join(variants) + r")(?![A-Za-zА-Яа-яЁё0-9])",
             re.IGNORECASE,
@@ -2399,16 +2462,15 @@ def apply_custom_glossary_terms(text: str, custom_prompt: str = "") -> str:
     """
     Strictly opt-in glossary normalization: when the user supplies a custom_prompt
     containing specific Latin/IT terms (e.g. 'gRPC, OAuth 2, PostgreSQL, Swagger'),
-    replaces unambiguous Cyrillic phonetic spellings of ONLY those requested terms.
-    100% no-op when custom_prompt is empty.
+    replaces unambiguous Cyrillic phonetic spellings of ONLY those requested terms
+    using whole-token trigger matching. 100% no-op when custom_prompt is empty.
     """
     if not text or not custom_prompt or not custom_prompt.strip():
         return text
 
-    prompt_lower = custom_prompt.lower()
     out = text
-    for canonical, key_lower, pattern in _COMPILED_GLOSSARY_RULES:
-        if key_lower in prompt_lower:
+    for canonical, trigger_pattern, pattern in _COMPILED_GLOSSARY_RULES:
+        if trigger_pattern.search(custom_prompt):
             out = pattern.sub(canonical, out)
     return out
 
@@ -2497,6 +2559,234 @@ def _resolve_whisper_language(
     return dominant_lang, True
 
 
+_PYANNOTE_POWERSET_3_2 = np.array(
+    [
+        [0, 0, 0],  # 0: non-speech
+        [1, 0, 0],  # 1: speaker #0
+        [0, 1, 0],  # 2: speaker #1
+        [0, 0, 1],  # 3: speaker #2
+        [1, 1, 0],  # 4: speakers #0 + #1
+        [1, 0, 1],  # 5: speakers #0 + #2
+        [0, 1, 1],  # 6: speakers #1 + #2
+    ],
+    dtype=np.uint8,
+)
+_PYANNOTE_PERM3 = (
+    (0, 1, 2),
+    (0, 2, 1),
+    (1, 0, 2),
+    (1, 2, 0),
+    (2, 0, 1),
+    (2, 1, 0),
+)
+
+
+def decode_pyannote_powerset_windows(
+    window_outputs: list[tuple[int, np.ndarray]],
+    hop_frames: int,
+    sample_rate: int = 16000,
+    rf_size: int = 991,
+    rf_shift: int = 270,
+    total_dur_s: float = 0.0,
+    min_duration_on: float = 0.18,
+    min_duration_off: float = 0.18,
+    max_turn_sec: float = 6.0,
+) -> list[DiarizationSegment]:
+    """
+    Decodes sliding-window 7-class powerset outputs from pyannote-segmentation-3.0
+    into clean single-speaker segments with center-slice ownership and local-speaker
+    overlap stitching across adjacent windows (eliminating Pass-1 duplicate CAM++ work).
+    """
+    if not window_outputs:
+        return []
+
+    n_win = len(window_outputs)
+    own_start = max(0, int(hop_frames) // 2)
+    next_track_id = 0
+    prev_act: Optional[np.ndarray] = None
+    prev_track_ids = [0, 1, 2]
+    intervals_by_track: dict[int, list[tuple[float, float]]] = {}
+
+    for w_idx, (win_start_sample, logits_2d) in enumerate(window_outputs):
+        arr = np.asarray(logits_2d)
+        if arr.ndim != 2 or arr.shape[1] != 7:
+            raise ValueError(f"Expected pyannote powerset logits (T, 7), got shape {arr.shape}")
+        num_frames = int(arr.shape[0])
+        if num_frames == 0:
+            continue
+
+        cls_idx = np.argmax(arr, axis=-1)
+        act = _PYANNOTE_POWERSET_3_2[cls_idx]
+
+        if prev_act is None:
+            cur_track_ids = [next_track_id, next_track_id + 1, next_track_id + 2]
+            next_track_id += 3
+        else:
+            ov_len = min(int(prev_act.shape[0]) - int(hop_frames), num_frames)
+            if ov_len > 0:
+                prev_ov = prev_act[int(hop_frames) : int(hop_frames) + ov_len].astype(np.int32)
+                cur_ov = act[:ov_len].astype(np.int32)
+                ov_mat = prev_ov.T @ cur_ov
+                best_perm = max(
+                    _PYANNOTE_PERM3,
+                    key=lambda p: int(ov_mat[0, p[0]] + ov_mat[1, p[1]] + ov_mat[2, p[2]]),
+                )
+                act = act[:, list(best_perm)]
+                cur_track_ids = []
+                for s in range(3):
+                    if int(ov_mat[s, best_perm[s]]) >= 3:
+                        cur_track_ids.append(prev_track_ids[s])
+                    else:
+                        cur_track_ids.append(next_track_id)
+                        next_track_id += 1
+            else:
+                cur_track_ids = [next_track_id, next_track_id + 1, next_track_id + 2]
+                next_track_id += 3
+
+        if n_win == 1:
+            own_s, own_e = 0, num_frames
+        elif w_idx == 0:
+            own_s, own_e = 0, min(num_frames, own_start + int(hop_frames))
+        elif w_idx == n_win - 1:
+            own_s, own_e = min(own_start, num_frames), num_frames
+        else:
+            own_s, own_e = min(own_start, num_frames), min(num_frames, own_start + int(hop_frames))
+
+        if own_e > own_s:
+            for s in range(3):
+                col = act[own_s:own_e, s]
+                if not np.any(col):
+                    continue
+                padded = np.empty(col.size + 2, dtype=np.int8)
+                padded[0] = 0
+                padded[1:-1] = col
+                padded[-1] = 0
+                diff = np.diff(padded)
+                run_starts = np.flatnonzero(diff == 1) + own_s
+                run_ends = np.flatnonzero(diff == -1) + own_s
+                tid = cur_track_ids[s]
+                track_list = intervals_by_track.setdefault(tid, [])
+                for f_s, f_e in zip(run_starts, run_ends):
+                    t_s = max(0.0, (win_start_sample + 0.5 * rf_size + int(f_s) * rf_shift) / float(sample_rate))
+                    t_e = (win_start_sample + 0.5 * rf_size + int(f_e) * rf_shift) / float(sample_rate)
+                    if total_dur_s > 0.0:
+                        t_e = min(total_dur_s, t_e)
+                    if t_e > t_s:
+                        track_list.append((t_s, t_e))
+
+        prev_act = act
+        prev_track_ids = cur_track_ids
+
+    segments: list[DiarizationSegment] = []
+    for tid, ivs in intervals_by_track.items():
+        if not ivs:
+            continue
+        ivs.sort(key=lambda pair: (pair[0], pair[1]))
+        merged: list[list[float]] = [[ivs[0][0], ivs[0][1]]]
+        for st, en in ivs[1:]:
+            if st - merged[-1][1] <= min_duration_off:
+                if en > merged[-1][1]:
+                    merged[-1][1] = en
+            else:
+                merged.append([st, en])
+
+        for st, en in merged:
+            dur = en - st
+            if dur < min_duration_on:
+                continue
+            if max_turn_sec > 0.0 and dur > max_turn_sec:
+                n_parts = int(math.ceil(dur / max_turn_sec))
+                step = dur / float(n_parts)
+                for p in range(n_parts):
+                    p_st = st + p * step
+                    p_en = en if p == n_parts - 1 else (st + (p + 1) * step)
+                    if p_en - p_st >= min_duration_on:
+                        segments.append(DiarizationSegment(start=p_st, end=p_en, speaker=tid))
+            else:
+                segments.append(DiarizationSegment(start=st, end=en, speaker=tid))
+
+    segments.sort(key=lambda seg: (seg.start, seg.end))
+    return segments
+
+
+def _run_direct_pyannote_segmentation(
+    seg_session: ort.InferenceSession,
+    samples: np.ndarray,
+    sample_rate: int = 16000,
+    status_cb: Optional[Callable[[str], None]] = None,
+    cancel_token: Optional[CancellationToken] = None,
+) -> list[DiarizationSegment]:
+    meta = {}
+    try:
+        meta = seg_session.get_modelmeta().custom_metadata_map or {}
+    except Exception:
+        meta = {}
+
+    window_size = int(meta.get("window_size", 160000) or 160000)
+    rf_size = int(meta.get("receptive_field_size", 991) or 991)
+    rf_shift = int(meta.get("receptive_field_shift", 270) or 270)
+    hop_frames = max(1, (window_size // 2) // max(1, rf_shift))
+    hop_samples = hop_frames * rf_shift
+
+    inp_info = seg_session.get_inputs()[0]
+    inp_name = inp_info.name
+    inp_rank = len(inp_info.shape or [1, 1, window_size])
+    out_name = seg_session.get_outputs()[0].name
+
+    total_samples = int(samples.size)
+    total_dur_s = total_samples / float(sample_rate)
+    starts: list[int] = [0]
+    cur_start = 0
+    while cur_start + window_size < total_samples:
+        cur_start += hop_samples
+        starts.append(cur_start)
+
+    total_windows = len(starts)
+    window_outputs: list[tuple[int, np.ndarray]] = []
+    last_pct = 0
+    last_log_t = 0.0
+    buf = np.zeros(window_size, dtype=np.float32)
+
+    for idx, win_s in enumerate(starts):
+        if cancel_token:
+            cancel_token.check()
+
+        chunk = samples[win_s : min(total_samples, win_s + window_size)]
+        if chunk.size == window_size:
+            win_arr = np.ascontiguousarray(chunk, dtype=np.float32)
+        else:
+            buf.fill(0.0)
+            buf[: chunk.size] = chunk
+            win_arr = buf
+
+        feed = win_arr.reshape(1, 1, window_size) if inp_rank == 3 else win_arr.reshape(1, window_size)
+        out = seg_session.run([out_name], {inp_name: feed})[0]
+        logits = np.asarray(out, dtype=np.float32)
+        if logits.ndim == 3:
+            logits = logits[0]
+        window_outputs.append((win_s, logits))
+
+        if status_cb and total_windows > 0:
+            pct = int(((idx + 1) * 80) / total_windows)
+            now = time.time()
+            if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
+                last_pct = pct
+                last_log_t = now
+                status_cb(f"Диаризация спикеров: {pct}%...")
+
+    return decode_pyannote_powerset_windows(
+        window_outputs=window_outputs,
+        hop_frames=hop_frames,
+        sample_rate=sample_rate,
+        rf_size=rf_size,
+        rf_shift=rf_shift,
+        total_dur_s=total_dur_s,
+        min_duration_on=0.18,
+        min_duration_off=0.18,
+        max_turn_sec=6.0,
+    )
+
+
 class Transcriber:
     """
     100% local speaker-diarized multilingual speech transcription pipeline.
@@ -2579,6 +2869,7 @@ class Transcriber:
         cancel_token: Optional[CancellationToken] = None,
         return_voiceprints: bool = False,
         sensitivity: str = DEFAULT_DIARIZATION_SENSITIVITY,
+        compute_device: str = DEFAULT_COMPUTE_DEVICE,
     ):
         if cancel_token:
             cancel_token.check()
@@ -2594,72 +2885,131 @@ class Transcriber:
             sens_key, DIARIZATION_SENSITIVITY_PROFILES[DEFAULT_DIARIZATION_SENSITIVITY]
         )
         seg_threshold = float(sens_prof.get("seg_threshold", DIARIZATION_SEGMENTATION_THRESHOLD))
+        req_dev = (compute_device or DEFAULT_COMPUTE_DEVICE).strip().lower()
 
-        # Pass 1: High-recall speaker-turn boundary detection via pyannote-segmentation-3.0.
-        # Fine min_duration_on/off (0.18s) and tight local clustering threshold preserve
-        # rapid Q&A replies ('Ну да.', 'Все.', 'Немного?') instead of fusing adjacent speakers.
-        diar_key = (
-            seg_model_path,
-            emb_model_path,
-            diar_threads,
-            emb_intra_threads,
-            seg_threshold,
-            0.18,
-            0.18,
-        )
+        raw_objs: Optional[list[DiarizationSegment]] = None
+        extractor = None
 
-        def _create_diar_engines():
-            cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
-                segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-                    pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
-                        model=seg_model_path
-                    ),
-                    num_threads=diar_threads,
-                    provider="cpu",
-                ),
-                embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                    model=emb_model_path,
-                    num_threads=diar_threads,
-                    provider="cpu",
-                ),
-                clustering=sherpa_onnx.FastClusteringConfig(
-                    num_clusters=-1,
-                    threshold=seg_threshold,
-                ),
-                min_duration_on=0.18,
-                min_duration_off=0.18,
+        # Fast single-pass path: run pyannote-segmentation-3-0/model.onnx directly via
+        # onnxruntime (5s hop, optional GPU CUDA, zero redundant Pass-1 CAM++ extraction).
+        # Falls back transparently to sherpa-onnx OfflineSpeakerDiarization on any error
+        # or when seg_model_path is a mocked path.
+        if seg_model_path and os.path.isfile(seg_model_path):
+            eff_seg_dev, seg_providers = resolve_onnx_provider(req_dev)
+            direct_key = (
+                "onnx_pyannote_v1",
+                seg_model_path,
+                emb_model_path,
+                eff_seg_dev,
+                diar_threads,
+                emb_intra_threads,
             )
-            sd_inst = sherpa_onnx.OfflineSpeakerDiarization(cfg)
-            ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
-                sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                    model=emb_model_path,
-                    num_threads=emb_intra_threads,
-                    provider="cpu",
+
+            def _create_direct_engines():
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = diar_threads
+                opts.inter_op_num_threads = 1
+                seg_sess = ort.InferenceSession(
+                    seg_model_path, sess_options=opts, providers=seg_providers
                 )
+                ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
+                    sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                        model=emb_model_path,
+                        num_threads=emb_intra_threads,
+                        provider="cpu",
+                    )
+                )
+                return seg_sess, ext_inst
+
+            try:
+                seg_session, extractor = _DiarizationCache.get_or_create(
+                    direct_key, _create_direct_engines
+                )
+                raw_objs = _run_direct_pyannote_segmentation(
+                    seg_session=seg_session,
+                    samples=samples,
+                    sample_rate=16000,
+                    status_cb=status_cb,
+                    cancel_token=cancel_token,
+                )
+            except Exception:
+                if cancel_token and cancel_token.is_cancelled():
+                    raise
+                raw_objs = None
+                extractor = None
+
+        if raw_objs is None:
+            # Safe fallback: sherpa-onnx OfflineSpeakerDiarization with 0.25 window shift ratio
+            diar_key = (
+                "sherpa_sd",
+                seg_model_path,
+                emb_model_path,
+                diar_threads,
+                emb_intra_threads,
+                seg_threshold,
+                0.18,
+                0.18,
             )
-            return sd_inst, ext_inst
 
-        sd, extractor = _DiarizationCache.get_or_create(diar_key, _create_diar_engines)
-        last_pct = 0
-        last_log_t = 0.0
+            def _create_diar_engines():
+                try:
+                    pyannote_cfg = sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                        model=seg_model_path,
+                        window_shift_ratio=0.25,
+                    )
+                except TypeError:
+                    pyannote_cfg = sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                        model=seg_model_path
+                    )
+                cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+                    segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+                        pyannote=pyannote_cfg,
+                        num_threads=diar_threads,
+                        provider="cpu",
+                    ),
+                    embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                        model=emb_model_path,
+                        num_threads=diar_threads,
+                        provider="cpu",
+                    ),
+                    clustering=sherpa_onnx.FastClusteringConfig(
+                        num_clusters=-1,
+                        threshold=seg_threshold,
+                    ),
+                    min_duration_on=0.18,
+                    min_duration_off=0.18,
+                )
+                sd_inst = sherpa_onnx.OfflineSpeakerDiarization(cfg)
+                ext_inst = sherpa_onnx.SpeakerEmbeddingExtractor(
+                    sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                        model=emb_model_path,
+                        num_threads=emb_intra_threads,
+                        provider="cpu",
+                    )
+                )
+                return sd_inst, ext_inst
 
-        def _progress_cb(done_chunks: int, total_chunks: int) -> int:
-            nonlocal last_pct, last_log_t
-            if cancel_token and cancel_token.is_cancelled():
-                return 1  # Non-zero return immediately aborts sherpa-onnx C++ diarization
-            if status_cb and total_chunks > 0:
-                pct = int((done_chunks * 85) / total_chunks)
-                now = time.time()
-                if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
-                    last_pct = pct
-                    last_log_t = now
-                    status_cb(f"Диаризация спикеров: {pct}%...")
-            return 0
+            sd, extractor = _DiarizationCache.get_or_create(diar_key, _create_diar_engines)
+            last_pct = 0
+            last_log_t = 0.0
 
-        result = sd.process(samples, callback=_progress_cb)
-        if cancel_token:
-            cancel_token.check()
-        raw_objs = result.sort_by_start_time()
+            def _progress_cb(done_chunks: int, total_chunks: int) -> int:
+                nonlocal last_pct, last_log_t
+                if cancel_token and cancel_token.is_cancelled():
+                    return 1  # Non-zero return immediately aborts sherpa-onnx C++ diarization
+                if status_cb and total_chunks > 0:
+                    pct = int((done_chunks * 85) / total_chunks)
+                    now = time.time()
+                    if pct >= last_pct + 10 and (now - last_log_t) >= 1.5:
+                        last_pct = pct
+                        last_log_t = now
+                        status_cb(f"Диаризация спикеров: {pct}%...")
+                return 0
+
+            result = sd.process(samples, callback=_progress_cb)
+            if cancel_token:
+                cancel_token.check()
+            raw_objs = result.sort_by_start_time()
 
         # Filter out synthetic call-waiting / dial-tone ringback beeps before clustering
         speech_segments: list[DiarizationSegment] = []
@@ -2791,7 +3141,7 @@ class Transcriber:
 
         if device == "cpu":
             total_threads = max(1, int(threads))
-            if profile_id in ("large-v3", "large-v3-ru", "breeze-asr-25"):
+            if profile_id == "breeze-asr-25":
                 max_workers_cap = 1
             elif profile_id == "turbo":
                 max_workers_cap = 2
@@ -2900,7 +3250,7 @@ class Transcriber:
                 else cleaned_custom_prompt
             )
             if hw_src:
-                hotwords_str = hw_src[:320]
+                hotwords_str = hw_src[:220]
 
         if status_cb:
             mode_desc = "мультиязычный авто" if use_multilingual else f"фиксированный ({resolved_lang})"
@@ -2909,7 +3259,7 @@ class Transcriber:
             )
             status_cb(f"Язык распознавания Whisper: {mode_desc}{prompt_note}")
 
-        default_cpu_beam = 3 if profile_id in ("large-v3", "large-v3-ru", "breeze-asr-25") else 2
+        default_cpu_beam = 3 if profile_id == "breeze-asr-25" else 2
         if device == "cuda":
             beam_size = int(decode_cfg.get("beam_size_cuda", 5))
         else:
@@ -3188,213 +3538,6 @@ class Transcriber:
                     custom_prompt=custom_prompt,
                 )
             raise
-
-    @staticmethod
-    def _run_sherpa_transducer(
-        samples: np.ndarray,
-        sample_rate: int,
-        model_dir: str,
-        diar_segments: Optional[list[DiarizationSegment]] = None,
-        profile_id: str = "gigaam-v3",
-        threads: int = 4,
-        status_cb: Optional[Callable[[str], None]] = None,
-        cancel_token: Optional[CancellationToken] = None,
-    ) -> list[TimedUnit]:
-        """
-        Runs offline NeMo transducer ONNX models via sherpa-onnx (GigaAM v3 e2e RNN-T
-        with feature_dim=64 and Parakeet TDT v3 with feature_dim=80) using Silero VAD
-        + diarization union longform chunking (<=20s, 1.5s sliding overlap on pauses-free
-        monologues), per-chunk quiet-speech leveling, and fault-isolated retries.
-        """
-        if cancel_token:
-            cancel_token.check()
-
-        profile = ASR_MODEL_PROFILES.get(profile_id, {})
-        encoder_file = profile.get("encoder_file", "encoder.int8.onnx")
-        decoder_file = profile.get("decoder_file", "decoder.onnx")
-        joiner_file = profile.get("joiner_file", "joiner.onnx")
-        tokens_file = profile.get("tokens_file", "tokens.txt")
-        feature_dim = int(profile.get("feature_dim", 64))
-        max_chunk_sec = float(profile.get("max_chunk_sec", 20.0))
-        overlap_sec = float(profile.get("overlap_sec", 1.5))
-        progress_tag = "Parakeet" if profile_id == "parakeet" else "GigaAM v3"
-
-        asr_threads = max(1, int(threads))
-        if profile_id == "parakeet":
-            cache_key: tuple = ("sherpa_parakeet", model_dir, asr_threads)
-        else:
-            cache_key = ("sherpa_transducer", profile_id, model_dir, asr_threads)
-
-        recognizer = _ModelCache.get_or_create(
-            cache_key,
-            lambda: sherpa_onnx.OfflineRecognizer.from_transducer(
-                encoder=os.path.join(model_dir, encoder_file),
-                decoder=os.path.join(model_dir, decoder_file),
-                joiner=os.path.join(model_dir, joiner_file),
-                tokens=os.path.join(model_dir, tokens_file),
-                num_threads=asr_threads,
-                sample_rate=16000,
-                feature_dim=feature_dim,
-                decoding_method="greedy_search",
-                model_type="nemo_transducer",
-                provider="cpu",
-            ),
-        )
-
-        chunks = build_longform_asr_chunks(
-            samples=samples,
-            sample_rate=sample_rate,
-            diar_segments=diar_segments,
-            max_chunk_sec=max_chunk_sec,
-            overlap_sec=overlap_sec,
-            use_silero_vad=True,
-        )
-        if not chunks:
-            return []
-
-        valid_chunks: list[tuple[float, float, float, float, int, int]] = []
-        for c_start, c_end, k_start, k_end in chunks:
-            s_idx = max(0, int(c_start * sample_rate))
-            e_idx = min(len(samples), int(c_end * sample_rate))
-            if e_idx - s_idx >= 800:
-                valid_chunks.append((c_start, c_end, k_start, k_end, s_idx, e_idx))
-
-        if not valid_chunks:
-            return []
-
-        def _extract_stream_units(stream, c_start: float, c_end: float) -> list[TimedUnit]:
-            res = stream.result
-            out_u: list[TimedUnit] = []
-            if res.tokens and res.timestamps and len(res.tokens) == len(res.timestamps):
-                chunk_units = group_bpe_tokens_to_units(
-                    list(res.tokens), list(res.timestamps), c_start, c_end
-                )
-                for u in chunk_units:
-                    if u.text and u.text.strip() and not is_repetitive_noise_token(u.text):
-                        out_u.append(u)
-            elif res.text and res.text.strip():
-                cleaned = clean_hallucinated_text(res.text.strip())
-                if cleaned:
-                    out_u.append(TimedUnit(start=c_start, end=c_end, text=cleaned))
-            return out_u
-
-        def _decode_single_fallback(c_start: float, c_end: float, s_idx: int, e_idx: int) -> list[TimedUnit]:
-            dur = c_end - c_start
-            if dur > 10.0:
-                mid_s = 0.5 * (c_start + c_end)
-                mid_idx = max(s_idx + 800, min(e_idx - 800, int(mid_s * sample_rate)))
-                sub_spans = [(c_start, mid_s, s_idx, mid_idx), (mid_s, c_end, mid_idx, e_idx)]
-            else:
-                sub_spans = [(c_start, c_end, s_idx, e_idx)]
-            rescued: list[TimedUnit] = []
-            for sub_s, sub_e, sub_si, sub_ei in sub_spans:
-                if cancel_token:
-                    cancel_token.check()
-                if sub_ei - sub_si < 800:
-                    continue
-                try:
-                    st = recognizer.create_stream()
-                    st.accept_waveform(sample_rate, normalize_chunk_level(samples[sub_si:sub_ei]))
-                    recognizer.decode_stream(st)
-                    rescued.extend(_extract_stream_units(st, sub_s, sub_e))
-                except Exception:
-                    continue
-            return rescued
-
-        units: list[TimedUnit] = []
-        total_chunks = len(valid_chunks)
-        batch_size = max(1, int(profile.get("batch_size_cpu", 4)))
-        last_pct = -20
-        last_log_t = time.time()
-
-        for b_start in range(0, total_chunks, batch_size):
-            if cancel_token:
-                cancel_token.check()
-
-            batch = valid_chunks[b_start : b_start + batch_size]
-            streams = []
-            chunk_wavs: list[np.ndarray] = []
-            for _, _, _, _, s_idx, e_idx in batch:
-                stream = recognizer.create_stream()
-                chunk_samples = normalize_chunk_level(samples[s_idx:e_idx])
-                chunk_wavs.append(chunk_samples)
-                stream.accept_waveform(sample_rate, chunk_samples)
-                streams.append(stream)
-
-            batch_failed = False
-            if hasattr(recognizer, "decode_streams") and len(streams) > 1:
-                try:
-                    recognizer.decode_streams(streams)
-                except Exception:
-                    batch_failed = True
-            else:
-                batch_failed = True
-
-            if batch_failed:
-                for stream in streams:
-                    if cancel_token:
-                        cancel_token.check()
-                    try:
-                        recognizer.decode_stream(stream)
-                    except Exception:
-                        pass
-
-            if cancel_token:
-                cancel_token.check()
-
-            for (c_start, c_end, k_start, k_end, s_idx, e_idx), stream, chunk_wav in zip(
-                batch, streams, chunk_wavs
-            ):
-                chunk_units = _extract_stream_units(stream, c_start, c_end)
-                # Fault-isolated retry if an energetic speech chunk returned empty output
-                if not chunk_units and (c_end - c_start) >= 1.2:
-                    chunk_rms = float(np.sqrt(np.mean(chunk_wav * chunk_wav))) if chunk_wav.size else 0.0
-                    if chunk_rms > 0.010:
-                        chunk_units = _decode_single_fallback(c_start, c_end, s_idx, e_idx)
-
-                has_left_ov = k_start > c_start + 1e-4
-                has_right_ov = k_end < c_end - 1e-4
-                for u in chunk_units:
-                    if has_left_ov or has_right_ov:
-                        mid = 0.5 * (u.start + u.end)
-                        if has_left_ov and mid < k_start:
-                            continue
-                        if has_right_ov and mid >= k_end:
-                            continue
-                    units.append(u)
-
-            done_idx = b_start + len(batch)
-            if status_cb and total_chunks > 0:
-                pct = min(99, int((done_idx * 100) / total_chunks))
-                now = time.time()
-                if pct >= last_pct + 20 and (now - last_log_t) >= 2.0:
-                    last_pct = pct
-                    last_log_t = now
-                    status_cb(f"Распознавание речи ({progress_tag}): {pct}% ({done_idx}/{total_chunks})...")
-
-        return units
-
-    @classmethod
-    def _run_sherpa_parakeet(
-        cls,
-        samples: np.ndarray,
-        sample_rate: int,
-        model_dir: str,
-        diar_segments: Optional[list[DiarizationSegment]] = None,
-        threads: int = 4,
-        status_cb: Optional[Callable[[str], None]] = None,
-        cancel_token: Optional[CancellationToken] = None,
-    ) -> list[TimedUnit]:
-        return cls._run_sherpa_transducer(
-            samples=samples,
-            sample_rate=sample_rate,
-            model_dir=model_dir,
-            diar_segments=diar_segments,
-            profile_id="parakeet",
-            threads=threads,
-            status_cb=status_cb,
-            cancel_token=cancel_token,
-        )
 
     @classmethod
     def _denoise_speech(
@@ -3761,129 +3904,6 @@ class Transcriber:
             raise
 
     @classmethod
-    def _run_onnx_canary_qwen(
-        cls,
-        samples: np.ndarray,
-        sample_rate: int,
-        model_dir: str,
-        profile_id: str = "canary-qwen-2.5b",
-        diar_segments: Optional[list[DiarizationSegment]] = None,
-        threads: int = 4,
-        status_cb: Optional[Callable[[str], None]] = None,
-        cancel_token: Optional[CancellationToken] = None,
-        language: str = "en",
-    ) -> list[TimedUnit]:
-        """
-        Runs NVIDIA Canary-Qwen 2.5B (INT8 ONNX Speech-LLM: FastConformer + Qwen3-1.7B)
-        locally via ONNX Runtime without PyTorch/NeMo. English-only SOTA (#1 Open ASR).
-        """
-        from src.canary_qwen_asr import CanaryQwenSpeechLlm
-
-        if cancel_token:
-            cancel_token.check()
-
-        profile = ASR_MODEL_PROFILES.get(profile_id, {})
-        max_chunk_sec = float(profile.get("max_chunk_sec", 28.0))
-        rep_penalty = float(profile.get("repetition_penalty", 1.05))
-        edge_pad_sec = float(profile.get("edge_pad_sec", 0.12))
-        progress_tag = profile.get("short_name", profile_id)
-
-        lang_clean = (language or "en").strip().lower()
-        if lang_clean == "ru" and status_cb:
-            status_cb(
-                "Внимание: NVIDIA Canary-Qwen 2.5B обучена только на английском языке (EN); "
-                "для русской речи рекомендуются GigaAM v3, Breeze-ASR-25 или Canary 1B v2."
-            )
-
-        if diar_segments:
-            ordered_diar = sorted(diar_segments, key=lambda s: (s.start, s.end))
-            wins = build_speaker_asr_windows(
-                ordered_diar,
-                total_dur=len(samples) / float(sample_rate) if sample_rate > 0 else 0.0,
-                max_same_speaker_sec=max_chunk_sec,
-                merge_gap_sec=1.2,
-                pad_sec=0.14,
-                split_speaker_turns=True,
-            )
-            wins = _augment_windows_with_vad(
-                wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
-            )
-            wins = subdivide_long_asr_windows(
-                wins, samples, sample_rate=sample_rate, max_window_sec=max_chunk_sec
-            )
-        else:
-            wins = build_vad_asr_windows(
-                samples,
-                sample_rate=sample_rate,
-                max_window_sec=max_chunk_sec,
-                merge_gap_sec=0.9,
-                pad_sec=0.14,
-            )
-
-        valid_chunks: list[tuple[float, float, int, int]] = []
-        for ws, we in wins:
-            s_idx = max(0, int(ws * sample_rate))
-            e_idx = min(len(samples), int(we * sample_rate))
-            if e_idx - s_idx >= 800:
-                valid_chunks.append((ws, we, s_idx, e_idx))
-        if not valid_chunks:
-            return []
-
-        asr_threads = max(1, int(threads))
-        cache_key = ("onnx_canary_qwen", profile_id, model_dir, asr_threads, rep_penalty, edge_pad_sec)
-        model: CanaryQwenSpeechLlm = _ModelCache.get_or_create(
-            cache_key,
-            lambda: CanaryQwenSpeechLlm(
-                model_dir=model_dir,
-                threads=asr_threads,
-                providers=["CPUExecutionProvider"],
-                prefer_int8=True,
-                repetition_penalty=rep_penalty,
-                edge_pad_sec=edge_pad_sec,
-            ),
-        )
-
-        def _split_sentences(text: str, c_start: float, c_end: float) -> list[TimedUnit]:
-            cleaned = clean_hallucinated_text(text.strip())
-            if not cleaned:
-                return []
-            parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", cleaned) if p.strip()]
-            if len(parts) <= 1:
-                return [TimedUnit(start=c_start, end=c_end, text=f" {cleaned}")]
-            total_chars = max(1, sum(len(p) for p in parts))
-            span = max(0.05, c_end - c_start)
-            cur = c_start
-            out_parts: list[TimedUnit] = []
-            for idx, p in enumerate(parts):
-                p_end = c_end if idx == len(parts) - 1 else min(c_end, cur + span * (len(p) / total_chars))
-                out_parts.append(TimedUnit(start=cur, end=max(cur + 0.02, p_end), text=f" {p}"))
-                cur = p_end
-            return out_parts
-
-        out_units: list[TimedUnit] = []
-        total_chunks = len(valid_chunks)
-        last_pct = -20
-        last_log_t = time.time()
-
-        for idx, (c_start, c_end, s_idx, e_idx) in enumerate(valid_chunks, start=1):
-            if cancel_token:
-                cancel_token.check()
-            chunk_wav = normalize_chunk_level(samples[s_idx:e_idx])
-            text = model.recognize_chunk(chunk_wav, sample_rate=sample_rate, cancel_token=cancel_token)
-            if text and text.strip():
-                out_units.extend(_split_sentences(text, c_start, c_end))
-
-            pct = int(idx * 100 / max(1, total_chunks))
-            now = time.time()
-            if status_cb and (pct >= last_pct + 20 or idx == total_chunks or now - last_log_t >= 5.0):
-                last_pct = pct
-                last_log_t = now
-                status_cb(f"Транскрибация ({progress_tag}, CPU): {pct}% ({idx}/{total_chunks})...")
-
-        out_units.sort(key=lambda u: (u.start, u.end))
-        return out_units
-
-    @classmethod
     def _run_asr_engine(
         cls,
         samples: np.ndarray,
@@ -3926,7 +3946,7 @@ class Transcriber:
                 if req_dev == "cuda" and status_cb:
                     status_cb(
                         f"Модель {profile['short_name']} работает на CPU; "
-                        "для GPU CUDA выберите GigaAM v3 FP32, GigaAM v3 CTC FP32, Canary 1B v2 или Whisper/Breeze."
+                        "для GPU CUDA выберите GigaAM v3 FP32, GigaAM v3 CTC FP32, Breeze-ASR-25 или Whisper Turbo."
                     )
             dev_label = "GPU CUDA" if eff_dev == "cuda" else "CPU"
             if status_cb:
@@ -3942,43 +3962,6 @@ class Transcriber:
                 status_cb=status_cb,
                 cancel_token=cancel_token,
                 language=language,
-            )
-        if profile["engine"] == "onnx_canary_qwen":
-            if req_dev == "cuda" and status_cb:
-                status_cb(
-                    f"Модель {profile['short_name']} использует динамический INT8 ONNX на CPU (~3.5× real-time); "
-                    "для GPU CUDA доступны GigaAM v3 FP32, Canary 1B v2, Breeze-ASR-25 и Whisper."
-                )
-            if status_cb:
-                status_cb(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
-            return cls._run_onnx_canary_qwen(
-                samples=samples,
-                sample_rate=sample_rate,
-                model_dir=asr_dir,
-                profile_id=profile_id,
-                diar_segments=diar_segments,
-                threads=threads,
-                status_cb=status_cb,
-                cancel_token=cancel_token,
-                language=language,
-            )
-        if profile["engine"] in ("sherpa_transducer", "sherpa_parakeet"):
-            if req_dev == "cuda" and status_cb:
-                status_cb(
-                    f"Модель {profile['short_name']} работает на CPU (ONNX INT8); "
-                    "для GPU CUDA доступны GigaAM v3 FP32, GigaAM v3 CTC FP32, Breeze-ASR-25 и Whisper."
-                )
-            if status_cb:
-                status_cb(f"Локальная транскрибация речи ({profile['short_name']}, CPU)...")
-            return cls._run_sherpa_transducer(
-                samples=samples,
-                sample_rate=sample_rate,
-                model_dir=asr_dir,
-                diar_segments=diar_segments,
-                profile_id=profile_id,
-                threads=threads,
-                status_cb=status_cb,
-                cancel_token=cancel_token,
             )
         raise ValueError(f"Unsupported engine: {profile['engine']}")
 
@@ -3999,17 +3982,6 @@ class Transcriber:
         cancel_token: Optional[CancellationToken] = None,
     ) -> dict:
         final_turns = list(turns)
-        if custom_prompt and custom_prompt.strip():
-            final_turns = [
-                SpeakerTurn(
-                    t.start,
-                    t.end,
-                    t.speaker_label,
-                    apply_custom_glossary_terms(t.text, custom_prompt),
-                )
-                for t in final_turns
-            ]
-
         notes: list[str] = []
         if base_note:
             notes.append(base_note)
@@ -4018,6 +3990,7 @@ class Transcriber:
         raw_backup_path: Optional[str] = None
 
         if llm_polish and final_turns:
+            # Pass raw ASR turns directly to the LLM (avoid blind regex corruption before context-aware editing)
             raw_text = format_transcript_txt(
                 turns=final_turns,
                 duration_sec=duration_sec,
@@ -4049,6 +4022,18 @@ class Transcriber:
                     f"# Постобработка: LLM-корректура ({llm_model}, исправлено реплик: {llm_stats.get('changed_turns', 0)})"
                 )
 
+        # Opt-in phonetic regex glossary runs ONLY when LLM polish is off or did not apply
+        if not llm_applied and custom_prompt and custom_prompt.strip():
+            final_turns = [
+                SpeakerTurn(
+                    t.start,
+                    t.end,
+                    t.speaker_label,
+                    apply_custom_glossary_terms(t.text, custom_prompt),
+                )
+                for t in final_turns
+            ]
+
         transcript_text = format_transcript_txt(
             turns=final_turns,
             duration_sec=duration_sec,
@@ -4065,6 +4050,65 @@ class Transcriber:
             "raw_transcript_path": raw_backup_path,
         }
 
+    @staticmethod
+    def _write_wav_16k_mono(path: str, samples: np.ndarray, sample_rate: int = 16000) -> None:
+        pcm = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+        pcm_i16 = (pcm * 32767.0).astype("<i2")
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(int(sample_rate))
+            wf.writeframes(pcm_i16.tobytes())
+
+    @classmethod
+    def _run_deepgram_cloud(
+        cls,
+        wav_path: str,
+        samples: np.ndarray,
+        sample_rate: int,
+        denoise: bool,
+        threads: int,
+        api_key: str,
+        language: str,
+        custom_prompt: str,
+        diarize: bool,
+        status_cb: Optional[Callable[[str], None]] = None,
+        cancel_token: Optional[CancellationToken] = None,
+    ) -> tuple[list[TimedUnit], list[DiarizationSegment]]:
+        upload_path = wav_path
+        tmp_denoised_path: Optional[str] = None
+        if denoise:
+            denoised = cls._denoise_speech(
+                samples,
+                sample_rate=sample_rate,
+                threads=threads,
+                status_cb=status_cb,
+                cancel_token=cancel_token,
+            )
+            fd, tmp_denoised_path = tempfile.mkstemp(prefix="dg_denoised_", suffix=".wav")
+            os.close(fd)
+            cls._write_wav_16k_mono(tmp_denoised_path, denoised, sample_rate=sample_rate)
+            upload_path = tmp_denoised_path
+
+        try:
+            eff_key = (api_key or "").strip() or DEFAULT_DEEPGRAM_API_KEY
+            return transcribe_with_deepgram_nova3(
+                wav_path=upload_path,
+                api_key=eff_key,
+                language=language,
+                custom_prompt=custom_prompt,
+                diarize=diarize,
+                base_url=DEFAULT_DEEPGRAM_BASE_URL,
+                cancel_token=cancel_token,
+                status_cb=status_cb,
+            )
+        finally:
+            if tmp_denoised_path:
+                try:
+                    os.remove(tmp_denoised_path)
+                except OSError:
+                    pass
+
     @classmethod
     def transcribe_units_only(
         cls,
@@ -4077,6 +4121,7 @@ class Transcriber:
         language: str = DEFAULT_ASR_LANGUAGE,
         custom_prompt: str = "",
         denoise: bool = DENOISE_ENABLED_DEFAULT,
+        asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
     ) -> dict:
         """
         Phase A of hardware-decoupled GPU mode: runs Silero VAD + GPU ASR
@@ -4111,6 +4156,33 @@ class Transcriber:
                 "profile_id": profile_id,
                 "custom_prompt": custom_prompt,
                 "elapsed_asr": time.time() - t0,
+            }
+
+        if profile["engine"] == "deepgram_cloud":
+            t_asr = time.time()
+            units, _ = cls._run_deepgram_cloud(
+                wav_path=wav_path,
+                samples=samples,
+                sample_rate=sample_rate,
+                denoise=denoise,
+                threads=max(1, min(2, threads)),
+                api_key=asr_api_key,
+                language=language,
+                custom_prompt=custom_prompt,
+                diarize=False,
+                status_cb=update,
+                cancel_token=cancel_token,
+            )
+            elapsed_asr = time.time() - t_asr
+            update(f"[Profile] Cloud ASR завершена за {elapsed_asr:.2f}s (единиц текста: {len(units)})")
+            return {
+                "samples": samples,
+                "sample_rate": sample_rate,
+                "duration_sec": duration_sec,
+                "units": units,
+                "profile_id": profile_id,
+                "custom_prompt": custom_prompt,
+                "elapsed_asr": elapsed_asr,
             }
 
         asr_samples = (
@@ -4190,6 +4262,7 @@ class Transcriber:
             "units": units,
             "profile_id": profile_id,
             "custom_prompt": custom_prompt,
+            "compute_device": req_dev,
             "elapsed_asr": elapsed_asr,
         }
 
@@ -4210,8 +4283,8 @@ class Transcriber:
         llm_api_key: str = DEFAULT_LLM_API_KEY,
     ) -> dict:
         """
-        Phase B of hardware-decoupled GPU mode: runs CPU speaker diarization
-        using uncontested CPU cores after video blurring completes, then aligns
+        Phase B of hardware-decoupled GPU mode: runs speaker diarization
+        using uncontested resources after video blurring completes, then aligns
         the pre-computed GPU ASR words to speaker turns and writes .txt.
         """
         def update(msg: str):
@@ -4230,6 +4303,7 @@ class Transcriber:
         units: list[TimedUnit] = list(asr_state.get("units", []))
         profile_id = str(asr_state.get("profile_id", DEFAULT_ASR_MODEL))
         eff_prompt = custom_prompt if custom_prompt else str(asr_state.get("custom_prompt", ""))
+        diar_device = str(asr_state.get("compute_device", DEFAULT_COMPUTE_DEVICE))
         elapsed_asr = float(asr_state.get("elapsed_asr", 0.0))
         profile = ASR_MODEL_PROFILES.get(profile_id, ASR_MODEL_PROFILES[DEFAULT_ASR_MODEL])
 
@@ -4268,6 +4342,7 @@ class Transcriber:
             cancel_token=cancel_token,
             return_voiceprints=True,
             sensitivity=diarization_sensitivity,
+            compute_device=diar_device,
         )
         if isinstance(diar_out, tuple):
             diar_segments, speaker_centroids, emb_extractor = diar_out
@@ -4339,10 +4414,11 @@ class Transcriber:
         llm_base_url: str = DEFAULT_LLM_BASE_URL,
         llm_model: str = DEFAULT_LLM_MODEL,
         llm_api_key: str = DEFAULT_LLM_API_KEY,
+        asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
     ) -> dict:
         """
-        Runs local speaker diarization + speech recognition (+ optional GTCRN
-        denoising and local LLM polish) on a 16 kHz mono WAV file and writes
+        Runs speaker diarization + speech recognition (+ optional GTCRN
+        denoising and LLM polish) on a 16 kHz mono WAV file and writes
         the formatted role-split transcript to output_txt_path.
         """
         def update(msg: str):
@@ -4377,73 +4453,121 @@ class Transcriber:
                 f.write(txt)
             return {"num_speakers": 0, "num_turns": 0, "elapsed": time.time() - t0}
 
-        # 1. Ensure local models are cached & verified
-        seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
-        if cancel_token:
-            cancel_token.check()
-        asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
-        if cancel_token:
-            cancel_token.check()
-
-        # 2. Speaker Diarization (always on original voice timbre for clean CAM++ embeddings)
-        eff_diar_threads = diar_threads if diar_threads is not None else threads
-        update(
-            f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, "
-            f"чувствительность: {diarization_sensitivity})..."
-        )
-        t_diar = time.time()
-        diar_out = cls._run_diarization(
-            samples=samples,
-            seg_model_path=seg_onnx,
-            emb_model_path=emb_onnx,
-            speaker_count=speaker_count,
-            threads=eff_diar_threads,
-            status_cb=update,
-            cancel_token=cancel_token,
-            return_voiceprints=True,
-            sensitivity=diarization_sensitivity,
-        )
-        if isinstance(diar_out, tuple):
-            diar_segments, speaker_centroids, emb_extractor = diar_out
-        else:
-            diar_segments, speaker_centroids, emb_extractor = diar_out, None, None
-
-        detected_raw_speakers = len({s.speaker for s in diar_segments})
-        update(
-            f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
-            f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
-        )
-
-        # Optional neural speech denoising before ASR (original timbre stays intact for diarization)
-        asr_samples = (
-            cls._denoise_speech(
-                samples,
+        if profile["engine"] == "deepgram_cloud":
+            want_diarize = (speaker_count or "auto").strip().lower() != "1"
+            t_cloud = time.time()
+            units, diar_segments = cls._run_deepgram_cloud(
+                wav_path=wav_path,
+                samples=samples,
                 sample_rate=sample_rate,
+                denoise=denoise,
                 threads=threads,
+                api_key=asr_api_key,
+                language=language,
+                custom_prompt=custom_prompt,
+                diarize=want_diarize,
                 status_cb=update,
                 cancel_token=cancel_token,
             )
-            if denoise
-            else samples
-        )
+            speaker_centroids, emb_extractor = None, None
+            detected_raw_speakers = len({s.speaker for s in diar_segments})
+            update(
+                f"[Profile] Deepgram Nova-3 завершена за {time.time() - t_cloud:.2f}s "
+                f"(единиц текста: {len(units)}, сегментов диаризации: {len(diar_segments)}, "
+                f"голосов: {detected_raw_speakers})"
+            )
+            # Graceful fallback to local CAM++ only if cloud returned words with zero speaker tags
+            if want_diarize and units and not diar_segments:
+                update("Deepgram не вернул метки спикеров — резервный запуск локальной диаризации...")
+                seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+                if cancel_token:
+                    cancel_token.check()
+                eff_diar_threads = diar_threads if diar_threads is not None else threads
+                diar_out = cls._run_diarization(
+                    samples=samples,
+                    seg_model_path=seg_onnx,
+                    emb_model_path=emb_onnx,
+                    speaker_count=speaker_count,
+                    threads=eff_diar_threads,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                    return_voiceprints=True,
+                    sensitivity=diarization_sensitivity,
+                    compute_device=compute_device,
+                )
+                if isinstance(diar_out, tuple):
+                    diar_segments, speaker_centroids, emb_extractor = diar_out
+                else:
+                    diar_segments, speaker_centroids, emb_extractor = diar_out, None, None
+        else:
+            # 1. Ensure local models are cached & verified
+            seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+            if cancel_token:
+                cancel_token.check()
+            asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
+            if cancel_token:
+                cancel_token.check()
 
-        # 3. Speech Recognition
-        t_asr = time.time()
-        units = cls._run_asr_engine(
-            samples=asr_samples,
-            sample_rate=sample_rate,
-            profile_id=profile_id,
-            profile=profile,
-            asr_dir=asr_dir,
-            diar_segments=diar_segments,
-            threads=threads,
-            compute_device=compute_device,
-            language=language,
-            custom_prompt=custom_prompt,
-            status_cb=update,
-            cancel_token=cancel_token,
-        )
-        update(f"[Profile] ASR завершена за {time.time() - t_asr:.2f}s (единиц текста: {len(units)})")
+            # 2. Speaker Diarization (always on original voice timbre for clean CAM++ embeddings)
+            eff_diar_threads = diar_threads if diar_threads is not None else threads
+            update(
+                f"Разделение говорящих по ролям (режим спикеров: {speaker_count}, "
+                f"чувствительность: {diarization_sensitivity})..."
+            )
+            t_diar = time.time()
+            diar_out = cls._run_diarization(
+                samples=samples,
+                seg_model_path=seg_onnx,
+                emb_model_path=emb_onnx,
+                speaker_count=speaker_count,
+                threads=eff_diar_threads,
+                status_cb=update,
+                cancel_token=cancel_token,
+                return_voiceprints=True,
+                sensitivity=diarization_sensitivity,
+                compute_device=compute_device,
+            )
+            if isinstance(diar_out, tuple):
+                diar_segments, speaker_centroids, emb_extractor = diar_out
+            else:
+                diar_segments, speaker_centroids, emb_extractor = diar_out, None, None
+
+            detected_raw_speakers = len({s.speaker for s in diar_segments})
+            update(
+                f"[Profile] Диаризация завершена за {time.time() - t_diar:.2f}s "
+                f"(сегментов: {len(diar_segments)}, голосов: {detected_raw_speakers})"
+            )
+
+            # Optional neural speech denoising before ASR (original timbre stays intact for diarization)
+            asr_samples = (
+                cls._denoise_speech(
+                    samples,
+                    sample_rate=sample_rate,
+                    threads=threads,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                )
+                if denoise
+                else samples
+            )
+
+            # 3. Speech Recognition
+            t_asr = time.time()
+            units = cls._run_asr_engine(
+                samples=asr_samples,
+                sample_rate=sample_rate,
+                profile_id=profile_id,
+                profile=profile,
+                asr_dir=asr_dir,
+                diar_segments=diar_segments,
+                threads=threads,
+                compute_device=compute_device,
+                language=language,
+                custom_prompt=custom_prompt,
+                status_cb=update,
+                cancel_token=cancel_token,
+            )
+            update(f"[Profile] ASR завершена за {time.time() - t_asr:.2f}s (единиц текста: {len(units)})")
 
         if cancel_token:
             cancel_token.check()
@@ -4506,6 +4630,7 @@ class Transcriber:
         llm_base_url: str = DEFAULT_LLM_BASE_URL,
         llm_model: str = DEFAULT_LLM_MODEL,
         llm_api_key: str = DEFAULT_LLM_API_KEY,
+        asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
     ) -> dict:
         """
         Dual-track OBS / virtual-mixer transcription pipeline:
@@ -4550,33 +4675,50 @@ class Transcriber:
                 f.write(txt)
             return {"num_speakers": 0, "num_turns": 0, "elapsed": time.time() - t0}
 
-        asr_dir = ModelManager.ensure_asr_model(profile_id, status_cb=update)
+        is_deepgram = profile["engine"] == "deepgram_cloud"
+        asr_dir = "" if is_deepgram else ModelManager.ensure_asr_model(profile_id, status_cb=update)
         if cancel_token:
             cancel_token.check()
 
         # Track 1: Deterministic Speaker 1 (Candidate Mic) — no diarization needed!
         t1_turns: list[SpeakerTurn] = []
         if samples1.size >= 1600:
-            asr_samples1 = (
-                cls._denoise_speech(samples1, sample_rate=sr1, threads=threads, status_cb=update, cancel_token=cancel_token)
-                if denoise
-                else samples1
-            )
-            update("Дорожка 1 (Спикер 1 / микрофон): распознавание речи без диаризации...")
-            t1_units = cls._run_asr_engine(
-                samples=asr_samples1,
-                sample_rate=sr1,
-                profile_id=profile_id,
-                profile=profile,
-                asr_dir=asr_dir,
-                diar_segments=None,
-                threads=threads,
-                compute_device=compute_device,
-                language=language,
-                custom_prompt=custom_prompt,
-                status_cb=update,
-                cancel_token=cancel_token,
-            )
+            if is_deepgram:
+                update("Дорожка 1 (Спикер 1 / микрофон): облачное распознавание Deepgram Nova-3...")
+                t1_units, _ = cls._run_deepgram_cloud(
+                    wav_path=track1_wav_path,
+                    samples=samples1,
+                    sample_rate=sr1,
+                    denoise=denoise,
+                    threads=threads,
+                    api_key=asr_api_key,
+                    language=language,
+                    custom_prompt=custom_prompt,
+                    diarize=False,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                )
+            else:
+                asr_samples1 = (
+                    cls._denoise_speech(samples1, sample_rate=sr1, threads=threads, status_cb=update, cancel_token=cancel_token)
+                    if denoise
+                    else samples1
+                )
+                update("Дорожка 1 (Спикер 1 / микрофон): распознавание речи без диаризации...")
+                t1_units = cls._run_asr_engine(
+                    samples=asr_samples1,
+                    sample_rate=sr1,
+                    profile_id=profile_id,
+                    profile=profile,
+                    asr_dir=asr_dir,
+                    diar_segments=None,
+                    threads=threads,
+                    compute_device=compute_device,
+                    language=language,
+                    custom_prompt=custom_prompt,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                )
             t1_turns, _ = align_units_to_speakers(t1_units, diar_segments=[])
             t1_turns = [
                 SpeakerTurn(t.start, t.end, "Спикер 1", t.text)
@@ -4597,50 +4739,93 @@ class Transcriber:
             else:
                 track2_speaker_mode = mode_clean
 
-            seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
-            if cancel_token:
-                cancel_token.check()
-
-            eff_diar_threads = diar_threads if diar_threads is not None else threads
-            update(
-                f"Дорожка 2 (собеседники): диаризация (режим спикеров: {track2_speaker_mode}, "
-                f"чувствительность: {diarization_sensitivity})..."
-            )
-            diar_out = cls._run_diarization(
-                samples=samples2,
-                seg_model_path=seg_onnx,
-                emb_model_path=emb_onnx,
-                speaker_count=track2_speaker_mode,
-                threads=eff_diar_threads,
-                status_cb=update,
-                cancel_token=cancel_token,
-                return_voiceprints=True,
-                sensitivity=diarization_sensitivity,
-            )
-            if isinstance(diar_out, tuple):
-                diar_segments2, speaker_centroids2, emb_extractor2 = diar_out
+            if is_deepgram:
+                want_diarize2 = track2_speaker_mode != "1"
+                update(
+                    f"Дорожка 2 (собеседники): облачное распознавание Deepgram Nova-3 "
+                    f"(diarize={'on' if want_diarize2 else 'off'})..."
+                )
+                t2_units, diar_segments2 = cls._run_deepgram_cloud(
+                    wav_path=track2_wav_path,
+                    samples=samples2,
+                    sample_rate=sr2,
+                    denoise=denoise,
+                    threads=threads,
+                    api_key=asr_api_key,
+                    language=language,
+                    custom_prompt=custom_prompt,
+                    diarize=want_diarize2,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                )
+                speaker_centroids2, emb_extractor2 = None, None
+                if want_diarize2 and t2_units and not diar_segments2:
+                    seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+                    if cancel_token:
+                        cancel_token.check()
+                    eff_diar_threads = diar_threads if diar_threads is not None else threads
+                    diar_out = cls._run_diarization(
+                        samples=samples2,
+                        seg_model_path=seg_onnx,
+                        emb_model_path=emb_onnx,
+                        speaker_count=track2_speaker_mode,
+                        threads=eff_diar_threads,
+                        status_cb=update,
+                        cancel_token=cancel_token,
+                        return_voiceprints=True,
+                        sensitivity=diarization_sensitivity,
+                        compute_device=compute_device,
+                    )
+                    if isinstance(diar_out, tuple):
+                        diar_segments2, speaker_centroids2, emb_extractor2 = diar_out
+                    else:
+                        diar_segments2, speaker_centroids2, emb_extractor2 = diar_out, None, None
             else:
-                diar_segments2, speaker_centroids2, emb_extractor2 = diar_out, None, None
+                seg_onnx, emb_onnx = ModelManager.ensure_diarization_models(status_cb=update)
+                if cancel_token:
+                    cancel_token.check()
 
-            asr_samples2 = (
-                cls._denoise_speech(samples2, sample_rate=sr2, threads=threads, status_cb=update, cancel_token=cancel_token)
-                if denoise
-                else samples2
-            )
-            t2_units = cls._run_asr_engine(
-                samples=asr_samples2,
-                sample_rate=sr2,
-                profile_id=profile_id,
-                profile=profile,
-                asr_dir=asr_dir,
-                diar_segments=diar_segments2,
-                threads=threads,
-                compute_device=compute_device,
-                language=language,
-                custom_prompt=custom_prompt,
-                status_cb=update,
-                cancel_token=cancel_token,
-            )
+                eff_diar_threads = diar_threads if diar_threads is not None else threads
+                update(
+                    f"Дорожка 2 (собеседники): диаризация (режим спикеров: {track2_speaker_mode}, "
+                    f"чувствительность: {diarization_sensitivity})..."
+                )
+                diar_out = cls._run_diarization(
+                    samples=samples2,
+                    seg_model_path=seg_onnx,
+                    emb_model_path=emb_onnx,
+                    speaker_count=track2_speaker_mode,
+                    threads=eff_diar_threads,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                    return_voiceprints=True,
+                    sensitivity=diarization_sensitivity,
+                    compute_device=compute_device,
+                )
+                if isinstance(diar_out, tuple):
+                    diar_segments2, speaker_centroids2, emb_extractor2 = diar_out
+                else:
+                    diar_segments2, speaker_centroids2, emb_extractor2 = diar_out, None, None
+
+                asr_samples2 = (
+                    cls._denoise_speech(samples2, sample_rate=sr2, threads=threads, status_cb=update, cancel_token=cancel_token)
+                    if denoise
+                    else samples2
+                )
+                t2_units = cls._run_asr_engine(
+                    samples=asr_samples2,
+                    sample_rate=sr2,
+                    profile_id=profile_id,
+                    profile=profile,
+                    asr_dir=asr_dir,
+                    diar_segments=diar_segments2,
+                    threads=threads,
+                    compute_device=compute_device,
+                    language=language,
+                    custom_prompt=custom_prompt,
+                    status_cb=update,
+                    cancel_token=cancel_token,
+                )
             raw_t2_turns, _ = align_units_to_speakers(
                 t2_units,
                 diar_segments2,

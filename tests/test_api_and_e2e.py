@@ -164,8 +164,11 @@ def test_api_root_and_config():
     assert "llmModelInput" in root_resp.text
     assert "llmApiKeyInput" in root_resp.text
     assert "llmPrivacyHint" in root_resp.text
-    assert "canary-1b-v2" in root_resp.text
-    assert "canary-qwen-2.5b" in root_resp.text
+    assert "gigaam-v3-ctc" in root_resp.text
+    assert "breeze-asr-25" in root_resp.text
+    assert "canary-1b-v2" not in root_resp.text
+    assert "canary-qwen-2.5b" not in root_resp.text
+    assert "parakeet" not in root_resp.text
     assert "postCustomPromptInput" in root_resp.text
     assert "postDenoiseToggle" in root_resp.text
     assert "postLlmPolishToggle" in root_resp.text
@@ -177,11 +180,25 @@ def test_api_root_and_config():
     assert "recordingsSection" in root_resp.text
     assert "cancelBtn" in root_resp.text
     assert "Прервать" in root_resp.text
+    assert "deepgram-nova-3" in root_resp.text
+    assert "asrApiKeyInput" in root_resp.text
+    assert "postAsrApiKeyInput" in root_resp.text
+    assert "appVersionFooter" in root_resp.text
+    assert "v5.1.0" in root_resp.text
+    assert "no-store" in root_resp.headers.get("cache-control", "").lower()
+
+    static_resp = client.get("/static/script.js")
+    assert static_resp.status_code == 200
+    assert "no-cache" in static_resp.headers.get("cache-control", "").lower()
 
     cfg_resp = client.get("/api/config")
     assert cfg_resp.status_code == 200
+    assert "no-store" in cfg_resp.headers.get("cache-control", "").lower()
     data = cfg_resp.json()
-    assert data["version"] == "5.0.0"
+    assert data["version"] == "5.1.0"
+    assert isinstance(data.get("build_id"), str) and data["build_id"].startswith("5.1.0-")
+    assert f"/static/script.js?v={data['build_id']}" in root_resp.text
+    assert f"/static/style.css?v={data['build_id']}" in root_resp.text
 
     assert data["default_job_mode"] == "anonymize"
     assert [m["id"] for m in data["job_modes"]] == ["anonymize", "transcribe_only"]
@@ -199,38 +216,38 @@ def test_api_root_and_config():
         "gigaam-v3",
         "gigaam-v3-ctc",
         "breeze-asr-25",
-        "canary-1b-v2",
-        "canary-qwen-2.5b",
-        "large-v3-ru",
         "turbo",
-        "large-v3",
-        "gigaam-v3-int8",
-        "parakeet",
-        "small",
+        "deepgram-nova-3",
     ]
     giga_meta = next(m for m in data["asr_models"] if m["id"] == "gigaam-v3")
     assert giga_meta["engine"] == "onnx_asr"
     assert giga_meta["supports_cuda"] is True
+    assert giga_meta["is_cloud"] is False
+    ctc_meta = next(m for m in data["asr_models"] if m["id"] == "gigaam-v3-ctc")
+    assert ctc_meta["engine"] == "onnx_asr"
+    assert ctc_meta["supports_cuda"] is True
     breeze_meta = next(m for m in data["asr_models"] if m["id"] == "breeze-asr-25")
     assert breeze_meta["engine"] == "faster_whisper"
     assert breeze_meta["supports_cuda"] is True
-    canary_meta = next(m for m in data["asr_models"] if m["id"] == "canary-1b-v2")
-    assert canary_meta["engine"] == "onnx_asr"
-    assert canary_meta["supports_cuda"] is True
-    cq_meta = next(m for m in data["asr_models"] if m["id"] == "canary-qwen-2.5b")
-    assert cq_meta["engine"] == "onnx_canary_qwen"
-    assert cq_meta["supports_cuda"] is False
-    assert cq_meta["fixed_language"] == "en"
+    turbo_meta = next(m for m in data["asr_models"] if m["id"] == "turbo")
+    assert turbo_meta["engine"] == "faster_whisper"
+    assert turbo_meta["supports_cuda"] is True
+    dg_meta = next(m for m in data["asr_models"] if m["id"] == "deepgram-nova-3")
+    assert dg_meta["engine"] == "deepgram_cloud"
+    assert dg_meta["supports_cuda"] is False
+    assert dg_meta["is_cloud"] is True
+    assert dg_meta["requires_api_key"] is True
+    assert dg_meta["has_native_diarization"] is True
     assert data["denoise_default"] is False
     assert data["llm_polish_default"] is False
-    assert "base_url" in data["llm_defaults"]
-    assert "model" in data["llm_defaults"]
+    assert data["llm_defaults"]["base_url"] == "https://api.deepseek.com/v1"
+    assert data["llm_defaults"]["model"] == "deepseek-flash"
     assert "api_key" not in data["llm_defaults"]
     llm_preset_ids = [p["id"] for p in data["llm_presets"]]
-    assert llm_preset_ids == ["ollama_local", "lmstudio_local", "deepseek_cloud", "qwen_cloud"]
+    assert llm_preset_ids == ["deepseek_cloud", "qwen_cloud", "ollama_local", "lmstudio_local"]
     ds_preset = next(p for p in data["llm_presets"] if p["id"] == "deepseek_cloud")
     assert ds_preset["base_url"] == "https://api.deepseek.com/v1"
-    assert ds_preset["model"] == "deepseek-chat"
+    assert ds_preset["model"] == "deepseek-flash"
     assert ds_preset["is_cloud"] is True
     qw_preset = next(p for p in data["llm_presets"] if p["id"] == "qwen_cloud")
     assert qw_preset["base_url"] == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -372,7 +389,7 @@ def test_orchestrator_silent_video_creates_note_transcript(tmp_path):
             worker_count=1,
             transcribe=True,
             transcript_path=out_txt,
-            asr_model="small",
+            asr_model="turbo",
             speaker_count="auto",
         )
         assert res["video_ready"] is True
@@ -1108,10 +1125,9 @@ function runScenario({ cudaAvailable }) {
     uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }));
 
     const asrGroup = makeSelect('asrModelSelect', [
-        ['turbo', 'Whisper Turbo — точная (99 яз., 810 МБ)', true],
-        ['large-v3', 'Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)'],
-        ['parakeet', 'Parakeet v3 — быстрая (25 яз., 600 МБ)'],
-        ['small', 'Whisper Small — лёгкая (99 яз., 245 МБ)'],
+        ['turbo', 'Whisper Turbo — универсальная (99 яз., 810 МБ)', true],
+        ['breeze-asr-25', 'Breeze-ASR-25 — лучший для RU+EN IT-речи (3.1 ГБ)'],
+        ['deepgram-nova-3', 'Deepgram Nova-3 — облачный API'],
     ]);
     const devGroup = makeSelect('computeDeviceSelect', [
         ['cpu', 'CPU', true],
@@ -1162,17 +1178,16 @@ function runScenario({ cudaAvailable }) {
             return {
                 ok: true,
                 json: async () => ({
-                    version: '4.4.0',
+                    version: '5.1.0',
                     cpu_count: 8,
                     default_workers: 4,
                     max_workers: 7,
                     transcription_default: true,
                     default_asr_model: 'turbo',
                     asr_models: [
-                        { id: 'turbo', label: 'Whisper Turbo — точная (99 яз., 810 МБ)' },
-                        { id: 'large-v3', label: 'Whisper Large v3 — макс. точность (99 яз., 3.1 ГБ)' },
-                        { id: 'parakeet', label: 'Parakeet v3 — быстрая (25 яз., 600 МБ)' },
-                        { id: 'small', label: 'Whisper Small — лёгкая (99 яз., 245 МБ)' },
+                        { id: 'turbo', label: 'Whisper Turbo — универсальная (99 яз., 810 МБ)', supports_cuda: true },
+                        { id: 'breeze-asr-25', label: 'Breeze-ASR-25 — лучший для RU+EN IT-речи (3.1 ГБ)', supports_cuda: true },
+                        { id: 'deepgram-nova-3', label: 'Deepgram Nova-3 — облачный API', supports_cuda: false, is_cloud: true },
                     ],
                     cuda_available: cudaAvailable,
                     default_compute_device: 'cpu',
@@ -1256,26 +1271,26 @@ function runScenario({ cudaAvailable }) {
     const devWrapper = s1.devGroup.sel.parentNode;
     const getMenuButtons = (wrapper) => wrapper.children.find((c) => c.classList.contains('clay-select-menu')).children;
 
-    // Step 1: User selects CPU-only 'Parakeet v3 — быстрая' for fast CPU job
-    const parakeetBtn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Parakeet'));
-    assert.ok(parakeetBtn, 'Parakeet option must exist in ASR dropdown');
-    parakeetBtn.click();
-    assert.strictEqual(s1.asrGroup.sel.value, 'parakeet');
+    // Step 1: User selects non-CUDA 'Deepgram Nova-3' for CPU/cloud job
+    const dgBtn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Deepgram'));
+    assert.ok(dgBtn, 'Deepgram option must exist in ASR dropdown');
+    dgBtn.click();
+    assert.strictEqual(s1.asrGroup.sel.value, 'deepgram-nova-3');
     assert.strictEqual(s1.devGroup.sel.value, 'cpu');
 
     // Verify GPU (CUDA) button in menu is STILL enabled (not locked out!) with 'Whisper' hint
     const gpuBtnBefore = getMenuButtons(devWrapper)[1];
-    assert.strictEqual(gpuBtnBefore.disabled, false, 'GPU option must NOT be disabled when Parakeet is selected');
+    assert.strictEqual(gpuBtnBefore.disabled, false, 'GPU option must NOT be disabled when non-CUDA model is selected');
     assert.ok(gpuBtnBefore.textContent.includes('Whisper'), 'GPU option should show Whisper auto-switch hint');
 
-    // Step 2: Upload & complete first video job on CPU with Parakeet
+    // Step 2: Upload & complete first video job
     const fileInput = s1.byId.get('fileInput');
     fileInput.files = [{ name: 'interview1.mp4' }];
     fileInput.dispatchEvent(new s1.ctx.Event('change'));
     await new Promise((r) => setTimeout(r, 30));
 
     assert.strictEqual(s1.uploadedPayloads.length, 1);
-    assert.strictEqual(s1.uploadedPayloads[0].asr_model, 'parakeet');
+    assert.strictEqual(s1.uploadedPayloads[0].asr_model, 'deepgram-nova-3');
     assert.strictEqual(s1.uploadedPayloads[0].compute_device, 'cpu');
     assert.strictEqual(s1.statusPanel.classList.contains('hidden'), false);
     assert.strictEqual(s1.resetBtn.classList.contains('hidden'), false);
@@ -1295,25 +1310,25 @@ function runScenario({ cudaAvailable }) {
     gpuBtnAfterReset.click();
 
     assert.strictEqual(s1.devGroup.sel.value, 'cuda', 'computeDeviceSelect must switch to cuda');
-    assert.strictEqual(s1.asrGroup.sel.value, 'turbo', 'asrModelSelect must auto-switch from parakeet to turbo');
+    assert.strictEqual(s1.asrGroup.sel.value, 'turbo', 'asrModelSelect must auto-switch from deepgram-nova-3 to turbo');
     assert.strictEqual(s1.localStorage.getItem('selectedComputeDevice'), 'cuda');
     assert.strictEqual(s1.localStorage.getItem('selectedAsrModel'), 'turbo');
 
-    // Step 5b: User can also switch to 'Whisper Large v3' while keeping GPU (CUDA) active
-    const largeV3Btn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Large v3'));
-    assert.ok(largeV3Btn, 'Whisper Large v3 option must exist in ASR dropdown');
-    largeV3Btn.click();
-    assert.strictEqual(s1.asrGroup.sel.value, 'large-v3');
-    assert.strictEqual(s1.devGroup.sel.value, 'cuda', 'GPU must remain active when Whisper Large v3 is selected');
+    // Step 5b: User can also switch to 'Breeze-ASR-25' while keeping GPU (CUDA) active
+    const breezeBtn = getMenuButtons(asrWrapper).find((b) => b.textContent.includes('Breeze'));
+    assert.ok(breezeBtn, 'Breeze-ASR-25 option must exist in ASR dropdown');
+    breezeBtn.click();
+    assert.strictEqual(s1.asrGroup.sel.value, 'breeze-asr-25');
+    assert.strictEqual(s1.devGroup.sel.value, 'cuda', 'GPU must remain active when Breeze-ASR-25 is selected');
 
-    // Step 6: Upload second video -> verify compute_device='cuda' & asr_model='large-v3' are sent!
+    // Step 6: Upload second video -> verify compute_device='cuda' & asr_model='breeze-asr-25' are sent!
     fileInput.files = [{ name: 'interview2.mp4' }];
     fileInput.dispatchEvent(new s1.ctx.Event('change'));
     await new Promise((r) => setTimeout(r, 30));
 
     assert.strictEqual(s1.uploadedPayloads.length, 2);
     assert.strictEqual(s1.uploadedPayloads[1].compute_device, 'cuda');
-    assert.strictEqual(s1.uploadedPayloads[1].asr_model, 'large-v3');
+    assert.strictEqual(s1.uploadedPayloads[1].asr_model, 'breeze-asr-25');
 
     // Step 7: Click 'Загрузить ещё' again -> GPU (CUDA) remains selected and enabled
     s1.resetBtn.click();
@@ -1441,7 +1456,7 @@ def test_post_recording_separate_transcription_cache_fallback_and_recordings_api
             f"/api/transcribe/{tid}",
             data={
                 "workers": "1",
-                "asr_model": "large-v3-ru",
+                "asr_model": "breeze-asr-25",
                 "language": "ru",
                 "speakers": "auto",
                 "compute_device": "cpu",
@@ -1455,11 +1470,11 @@ def test_post_recording_separate_transcription_cache_fallback_and_recordings_api
         assert st_after2["video_ready"] is True
         assert st_after2["transcript_ready"] is True
         assert len(calls) == 2
-        assert calls[1]["asr_model"] == "large-v3-ru"
+        assert calls[1]["asr_model"] == "breeze-asr-25"
 
         dl_txt2 = client.get(f"/api/download-transcript/{tid}")
         assert dl_txt2.status_code == 200
-        assert "Модель large-v3-ru (ru)" in dl_txt2.text
+        assert "Модель breeze-asr-25 (ru)" in dl_txt2.text
     finally:
         if tid:
             tasks.pop(tid, None)
@@ -1637,7 +1652,7 @@ def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, m
             r2 = client.post(
                 "/api/upload",
                 files={"file": ("voice_note.wav", f, "audio/wav")},
-                data={"mode": "transcribe_only", "asr_model": "large-v3-ru", "language": "ru", "workers": "1"},
+                data={"mode": "transcribe_only", "asr_model": "breeze-asr-25", "language": "ru", "workers": "1"},
             )
         assert r2.status_code == 200
         tid2 = r2.json()["task_id"]
@@ -1662,7 +1677,7 @@ def test_transcribe_only_mode_mp4_wav_and_cli_skips_video_processing(tmp_path, m
         assert cli_res["video_ready"] is False
         assert cli_res["transcript_ready"] is True
         assert os.path.isfile(cli_txt)
-        assert seen_models == [("gigaam-v3", "ru"), ("large-v3-ru", "ru"), ("gigaam-v3", "ru")]
+        assert seen_models == [("gigaam-v3", "ru"), ("breeze-asr-25", "ru"), ("gigaam-v3", "ru")]
     finally:
         for tid in created_ids:
             tasks.pop(tid, None)
@@ -1868,10 +1883,10 @@ uploadPanel.appendChild(new FakeElement('div', { id: 'transcribeOptionsWrap' }))
 uploadPanel.appendChild(new FakeElement('p', { id: 'transcribeHintText' }));
 
 const modelOpts = [
-    ['gigaam-v3', 'GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)', true],
-    ['large-v3-ru', 'Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)'],
+    ['gigaam-v3', 'GigaAM v3 FP32 — эталон для русского (RU, GPU/CPU, 892 МБ)', true],
+    ['breeze-asr-25', 'Breeze-ASR-25 — лучший для RU+EN IT-речи (3.1 ГБ)'],
     ['turbo', 'Whisper Turbo — универсальная (99 яз., 810 МБ)'],
-    ['parakeet', 'Parakeet v3 — быстрая (25 яз., 600 МБ)'],
+    ['deepgram-nova-3', 'Deepgram Nova-3 — облачный API'],
 ];
 const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто (мультиязычный)'], ['en', 'English (EN)']];
 const devOpts = [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']];
@@ -1935,7 +1950,7 @@ const fakeFetch = async (url, opts = {}) => {
         return {
             ok: true,
             json: async () => ({
-                version: '4.5.0',
+                version: '5.1.0',
                 cpu_count: 8,
                 default_workers: 4,
                 max_workers: 7,
@@ -1943,10 +1958,10 @@ const fakeFetch = async (url, opts = {}) => {
                 default_asr_model: 'gigaam-v3',
                 default_language: 'ru',
                 asr_models: [
-                    { id: 'gigaam-v3', label: 'GigaAM v3 — лучший для русского (RU, пунктуация, 232 МБ)', supports_cuda: false },
-                    { id: 'large-v3-ru', label: 'Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)', supports_cuda: true },
+                    { id: 'gigaam-v3', label: 'GigaAM v3 FP32 — эталон для русского (RU, GPU/CPU, 892 МБ)', supports_cuda: false },
+                    { id: 'breeze-asr-25', label: 'Breeze-ASR-25 — лучший для RU+EN IT-речи (3.1 ГБ)', supports_cuda: true },
                     { id: 'turbo', label: 'Whisper Turbo — универсальная (99 яз., 810 МБ)', supports_cuda: true },
-                    { id: 'parakeet', label: 'Parakeet v3 — быстрая (25 яз., 600 МБ)', supports_cuda: false },
+                    { id: 'deepgram-nova-3', label: 'Deepgram Nova-3 — облачный API', supports_cuda: false, is_cloud: true },
                 ],
                 languages: [
                     { id: 'ru', label: 'Русский (RU)' },
@@ -2081,12 +2096,12 @@ vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
     assert.strictEqual(recordingsSection.classList.contains('hidden'), false);
     assert.strictEqual(recordingsList.children.length, 1);
 
-    // 2. Selecting GPU (CUDA) while gigaam-v3 is active auto-switches to large-v3-ru!
+    // 2. Selecting GPU (CUDA) while gigaam-v3 is CPU-only (no ONNX CUDA) auto-switches to breeze-asr-25!
     const devMenuBtns = computeDeviceSelect.parentNode.children.find((c) => c.classList.contains('clay-select-menu')).children;
     assert.strictEqual(devMenuBtns[1].disabled, false);
     devMenuBtns[1].click();
     assert.strictEqual(computeDeviceSelect.value, 'cuda');
-    assert.strictEqual(asrModelSelect.value, 'large-v3-ru');
+    assert.strictEqual(asrModelSelect.value, 'breeze-asr-25');
 
     // 3. Switch to 'Только транскрибация' mode -> accepts .wav, hides video download button!
     modeTranscribeOnlyBtn.click();
@@ -2101,7 +2116,7 @@ vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
     assert.strictEqual(uploadCalls.length, 1);
     assert.strictEqual(uploadCalls[0].mode, 'transcribe_only');
     assert.strictEqual(uploadCalls[0].language, 'ru');
-    assert.strictEqual(uploadCalls[0].asr_model, 'large-v3-ru');
+    assert.strictEqual(uploadCalls[0].asr_model, 'breeze-asr-25');
     assert.strictEqual(downloadBtn.classList.contains('hidden'), true, 'Video download must stay hidden in transcribe_only');
     assert.strictEqual(downloadTranscriptBtn.classList.contains('hidden'), false);
 
@@ -2353,7 +2368,7 @@ def test_dual_track_obs_mp4_automatic_split_and_mix_e2e(tmp_path, monkeypatch):
             f"/api/transcribe/{tid1}",
             data={
                 "workers": "1",
-                "asr_model": "large-v3-ru",
+                "asr_model": "breeze-asr-25",
                 "speakers": "4",
                 "diarization_sensitivity": "high",
                 "audio_tracks": "separate",
@@ -2940,11 +2955,11 @@ def test_orchestrator_parallel_gpu_mode_for_onnx_asr_gigaam_v3(tmp_path, monkeyp
                 data={
                     "mode": "transcribe_only",
                     "workers": "1",
-                    "asr_model": "canary-1b-v2",
+                    "asr_model": "gigaam-v3-ctc",
                     "denoise": "true",
                     "llm_polish": "true",
                     "llm_base_url": "https://api.deepseek.com/v1",
-                    "llm_model": "deepseek-chat",
+                    "llm_model": "deepseek-flash",
                     "llm_api_key": secret_api_key,
                 },
             )
@@ -2952,11 +2967,11 @@ def test_orchestrator_parallel_gpu_mode_for_onnx_asr_gigaam_v3(tmp_path, monkeyp
         assert secret_api_key not in resp.text
         body = resp.json()
         tid = body["task_id"]
-        assert body["asr_model"] == "canary-1b-v2"
+        assert body["asr_model"] == "gigaam-v3-ctc"
         assert body["denoise"] is True
         assert body["llm_polish"] is True
         assert body["llm_base_url"] == "https://api.deepseek.com/v1"
-        assert body["llm_model"] == "deepseek-chat"
+        assert body["llm_model"] == "deepseek-flash"
         assert "llm_api_key" not in body
 
         st_resp = client.get(f"/api/status/{tid}")
@@ -2967,11 +2982,11 @@ def test_orchestrator_parallel_gpu_mode_for_onnx_asr_gigaam_v3(tmp_path, monkeyp
         assert secret_api_key not in str(tasks[tid])
         assert api_calls == [
             {
-                "asr_model": "canary-1b-v2",
+                "asr_model": "gigaam-v3-ctc",
                 "denoise": True,
                 "llm_polish": True,
                 "llm_base_url": "https://api.deepseek.com/v1",
-                "llm_model": "deepseek-chat",
+                "llm_model": "deepseek-flash",
                 "llm_api_key": secret_api_key,
             }
         ]
@@ -3216,10 +3231,8 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
         ['gigaam-v3', 'GigaAM v3 FP32', true],
         ['gigaam-v3-ctc', 'GigaAM v3 CTC FP32'],
         ['breeze-asr-25', 'Breeze-ASR-25'],
-        ['canary-1b-v2', 'Canary 1B v2'],
-        ['canary-qwen-2.5b', 'Canary-Qwen 2.5B'],
-        ['large-v3-ru', 'Whisper Large v3 RU'],
-        ['gigaam-v3-int8', 'GigaAM v3 INT8'],
+        ['turbo', 'Whisper Turbo'],
+        ['deepgram-nova-3', 'Deepgram Nova-3'],
     ];
     const langOpts = [['ru', 'Русский (RU)', true], ['auto', 'Авто'], ['en', 'English (EN)']];
     const devOpts = [['cpu', 'CPU', true], ['cuda', 'GPU (CUDA)']];
@@ -3309,7 +3322,7 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
             return {
                 ok: true,
                 json: async () => ({
-                    version: '5.0.0',
+                    version: '5.1.0',
                     cpu_count: 8,
                     default_workers: 4,
                     max_workers: 7,
@@ -3320,10 +3333,8 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
                         { id: 'gigaam-v3', label: 'GigaAM v3 FP32', engine: 'onnx_asr', supports_cuda: true },
                         { id: 'gigaam-v3-ctc', label: 'GigaAM v3 CTC FP32', engine: 'onnx_asr', supports_cuda: true },
                         { id: 'breeze-asr-25', label: 'Breeze-ASR-25', engine: 'faster_whisper', supports_cuda: true },
-                        { id: 'canary-1b-v2', label: 'Canary 1B v2', engine: 'onnx_asr', supports_cuda: true },
-                        { id: 'canary-qwen-2.5b', label: 'Canary-Qwen 2.5B', engine: 'onnx_canary_qwen', supports_cuda: false, fixed_language: 'en' },
-                        { id: 'large-v3-ru', label: 'Whisper Large v3 RU', engine: 'faster_whisper', supports_cuda: true },
-                        { id: 'gigaam-v3-int8', label: 'GigaAM v3 INT8', engine: 'onnx_asr', supports_cuda: false },
+                        { id: 'turbo', label: 'Whisper Turbo', engine: 'faster_whisper', supports_cuda: true },
+                        { id: 'deepgram-nova-3', label: 'Deepgram Nova-3', engine: 'deepgram_cloud', supports_cuda: false, is_cloud: true },
                     ],
                     cuda_available: Boolean(ct2CudaAvailable || onnxCudaAvailable),
                     ct2_cuda_available: ct2CudaAvailable,
@@ -3336,7 +3347,7 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
                     llm_presets: [
                         { id: 'ollama_local', base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
                         { id: 'lmstudio_local', base_url: 'http://localhost:1234/v1', model: 'qwen3-8b', is_cloud: false },
-                        { id: 'deepseek_cloud', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', is_cloud: true },
+                        { id: 'deepseek_cloud', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-flash', is_cloud: true },
                         { id: 'qwen_cloud', base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', is_cloud: true },
                     ],
                 }),
@@ -3409,33 +3420,30 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
     assert.strictEqual(a.llmConfigWrap.classList.contains('hidden'), true);
     assert.strictEqual(a.llmPrivacyHint.classList.contains('is-cloud'), false);
 
-    // Switching to GPU (CUDA) keeps gigaam-v3 (FP32) AND canary-1b-v2 selected!
+    // Switching to GPU (CUDA) keeps gigaam-v3 (FP32) AND gigaam-v3-ctc selected!
     a.computeDeviceSelect.value = 'cuda';
     a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
     assert.strictEqual(a.asrModelSelect.value, 'gigaam-v3');
     assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
 
-    a.asrModelSelect.value = 'canary-1b-v2';
+    a.asrModelSelect.value = 'gigaam-v3-ctc';
     a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
-    assert.strictEqual(a.asrModelSelect.value, 'canary-1b-v2');
+    assert.strictEqual(a.asrModelSelect.value, 'gigaam-v3-ctc');
     assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
 
-    // Selecting CPU-only English-only canary-qwen-2.5b -> switches to CPU + warns when language is RU; GPU upgrades to canary-1b-v2
-    a.asrModelSelect.value = 'canary-qwen-2.5b';
+    // Selecting cloud deepgram-nova-3 -> switches to CPU + shows cloud hint; GPU switches to turbo
+    a.asrModelSelect.value = 'deepgram-nova-3';
     a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
     assert.strictEqual(a.computeDeviceSelect.value, 'cpu');
-    assert.ok(a.transcribeHintText.textContent.includes('ТОЛЬКО на английском'));
+    assert.ok(a.transcribeHintText.textContent.includes('Deepgram Nova-3'));
     a.computeDeviceSelect.value = 'cuda';
     a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
-    assert.strictEqual(a.asrModelSelect.value, 'canary-1b-v2');
+    assert.strictEqual(a.asrModelSelect.value, 'turbo');
     assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
 
-    // Selecting CPU-only gigaam-v3-int8 -> switches to CPU; switching back to GPU upgrades to gigaam-v3!
-    a.asrModelSelect.value = 'gigaam-v3-int8';
+    // Switch back to gigaam-v3 on GPU CUDA for upload check
+    a.asrModelSelect.value = 'gigaam-v3';
     a.asrModelSelect.dispatchEvent(new a.ctx.Event('change'));
-    assert.strictEqual(a.computeDeviceSelect.value, 'cpu');
-    a.computeDeviceSelect.value = 'cuda';
-    a.computeDeviceSelect.dispatchEvent(new a.ctx.Event('change'));
     assert.strictEqual(a.asrModelSelect.value, 'gigaam-v3');
     assert.strictEqual(a.computeDeviceSelect.value, 'cuda');
 
@@ -3447,7 +3455,7 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
     assert.strictEqual(a.llmConfigWrap.classList.contains('hidden'), false);
     a.mainLlmPresets.btns.deepseek_cloud.click();
     assert.strictEqual(a.llmBaseUrlInput.value, 'https://api.deepseek.com/v1');
-    assert.strictEqual(a.llmModelInput.value, 'deepseek-chat');
+    assert.strictEqual(a.llmModelInput.value, 'deepseek-flash');
     assert.strictEqual(a.llmPrivacyHint.classList.contains('is-cloud'), true);
     assert.ok(a.llmPrivacyHint.textContent.includes('облачный API'));
 
@@ -3466,7 +3474,7 @@ function createHarness({ onnxCudaAvailable, ct2CudaAvailable }) {
     assert.strictEqual(a.uploadCalls[0].denoise, 'true');
     assert.strictEqual(a.uploadCalls[0].llm_polish, 'true');
     assert.strictEqual(a.uploadCalls[0].llm_base_url, 'https://api.deepseek.com/v1');
-    assert.strictEqual(a.uploadCalls[0].llm_model, 'deepseek-chat');
+    assert.strictEqual(a.uploadCalls[0].llm_model, 'deepseek-flash');
     assert.strictEqual(a.uploadCalls[0].llm_api_key, 'sk-deepseek-ui-secret');
 
     // Post-transcribe form inherited controls + API key; switching to Qwen Cloud preset updates URL/model & submits
@@ -3624,8 +3632,477 @@ def test_video_processor_18_frame_adaptive_bisection_window_drag_and_dropout_bri
     assert all(nbytes == frame_size for nbytes in written_frames)
 
 
+def test_api_deepgram_nova3_upload_and_post_transcribe_keep_asr_api_key_secret(tmp_path, monkeypatch):
+    """
+    Verifies that both /api/upload and /api/transcribe/{tid} accept asr_model=deepgram-nova-3
+    and asr_api_key, forward asr_api_key to Orchestrator, and NEVER leak or store the key
+    in HTTP responses, tasks[tid], or logs.
+    """
+    from src.orchestrator import Orchestrator
+    from app import _audio_cache_path
+
+    in_mp4 = str(tmp_path / "dg_api.mp4")
+    with open(in_mp4, "wb") as mf:
+        mf.write(b"\x00\x00\x00\x18ftypmp42")
+
+    secret_dg_key = "dg-api-super-secret-4242"
+    seen_calls = []
+
+    def _fake_transcribe_only(
+        input_path,
+        transcript_path,
+        job_dir,
+        status_cb=None,
+        asr_model="gigaam-v3",
+        asr_api_key="",
+        cached_audio_path=None,
+        **kwargs,
+    ):
+        seen_calls.append({"asr_model": asr_model, "asr_api_key": asr_api_key})
+        os.makedirs(os.path.dirname(os.path.abspath(transcript_path)), exist_ok=True)
+        with open(transcript_path, "w", encoding="utf-8") as tf:
+            tf.write("# Mock Deepgram Nova-3 transcript\n[00:00:00 - 00:00:01] Спикер 1: Привет!\n")
+        if cached_audio_path:
+            os.makedirs(os.path.dirname(os.path.abspath(cached_audio_path)), exist_ok=True)
+            with open(cached_audio_path, "wb") as cf:
+                cf.write(b"RIFFmockwav")
+        return {
+            "video_ready": False,
+            "transcript_ready": True,
+            "transcript_path": transcript_path,
+            "audio_cached": bool(cached_audio_path),
+            "dual_track_cached": False,
+        }
+
+    monkeypatch.setattr(Orchestrator, "process_transcription_only_job", staticmethod(_fake_transcribe_only))
+
+    client = TestClient(app)
+    tid = None
+    try:
+        with open(in_mp4, "rb") as f:
+            up_resp = client.post(
+                "/api/upload",
+                files={"file": ("dg_api.mp4", f, "video/mp4")},
+                data={
+                    "mode": "transcribe_only",
+                    "workers": "1",
+                    "asr_model": "deepgram-nova-3",
+                    "language": "ru",
+                    "asr_api_key": secret_dg_key,
+                },
+            )
+        assert up_resp.status_code == 200
+        assert secret_dg_key not in up_resp.text
+        body = up_resp.json()
+        tid = body["task_id"]
+        assert body["asr_model"] == "deepgram-nova-3"
+        assert "asr_api_key" not in body
+
+        st_resp = client.get(f"/api/status/{tid}")
+        assert st_resp.status_code == 200
+        assert secret_dg_key not in st_resp.text
+        assert "asr_api_key" not in tasks[tid]
+        assert secret_dg_key not in str(tasks[tid])
+
+        # Re-transcribe via /api/transcribe/{tid} with a new Deepgram key
+        secret_dg_key_2 = "dg-post-secret-9999"
+        post_resp = client.post(
+            f"/api/transcribe/{tid}",
+            data={
+                "workers": "1",
+                "asr_model": "deepgram-nova-3",
+                "language": "auto",
+                "asr_api_key": secret_dg_key_2,
+            },
+        )
+        assert post_resp.status_code == 200
+        assert secret_dg_key_2 not in post_resp.text
+        assert "asr_api_key" not in tasks[tid]
+        assert secret_dg_key_2 not in str(tasks[tid])
+
+        assert seen_calls == [
+            {"asr_model": "deepgram-nova-3", "asr_api_key": secret_dg_key},
+            {"asr_model": "deepgram-nova-3", "asr_api_key": secret_dg_key_2},
+        ]
+    finally:
+        if tid:
+            tasks.pop(tid, None)
+            for p in (
+                os.path.join("output", f"{tid}_transcript.txt"),
+                _audio_cache_path(tid),
+            ):
+                if os.path.exists(p):
+                    os.remove(p)
 
 
+def test_frontend_v51_deepseek_flash_deepgram_nova3_and_live_version_footer():
+    """
+    Executes real static/script.js in Node.js to verify v5.1.0 frontend behavior:
+      1. /api/config is fetched with { cache: 'no-store' } and updates #appVersionFooter dynamically.
+      2. Default LLM model is 'deepseek-flash' (https://api.deepseek.com/v1) and stale
+         localStorage 'deepseek-chat' is auto-migrated to 'deepseek-flash'.
+      3. #asrApiKeyWrap is hidden for local models, shown when 'deepgram-nova-3' is selected,
+         stores selectedAsrApiKey ONLY in sessionStorage (never localStorage), sends asr_api_key
+         for deepgram-nova-3 uploads & post-transcribe, and omits asr_api_key for local models.
+    """
+    node_test_js = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
 
+class FakeClassList {
+    constructor(init = []) { this.set = new Set(init); }
+    add(...c) { c.forEach((x) => this.set.add(x)); }
+    remove(...c) { c.forEach((x) => this.set.delete(x)); }
+    toggle(c, force) {
+        if (force === undefined) {
+            if (this.set.has(c)) { this.set.delete(c); return false; }
+            this.set.add(c); return true;
+        }
+        if (force) this.set.add(c); else this.set.delete(c);
+        return Boolean(force);
+    }
+    contains(c) { return this.set.has(c); }
+}
 
+class FakeEvent {
+    constructor(type, opts = {}) { this.type = type; this.bubbles = Boolean(opts.bubbles); }
+    preventDefault() {}
+    stopPropagation() {}
+}
 
+class FakeElement {
+    constructor(tag = 'div', id = '', classes = []) {
+        this.tagName = tag.toUpperCase();
+        this.id = id;
+        this.className = classes.join(' ');
+        this.classList = new FakeClassList(classes);
+        this.children = [];
+        this.parentNode = null;
+        this.listeners = {};
+        this.attributes = {};
+        this.dataset = {};
+        this._textContent = '';
+        this._innerHTML = '';
+        this.value = '';
+        this.checked = false;
+        this.disabled = false;
+        this.title = '';
+        this.files = [];
+    }
+    set textContent(v) { this._textContent = String(v); }
+    get textContent() { return this._textContent; }
+    set innerHTML(v) { this._innerHTML = String(v); if (v === '') this.children = []; }
+    get innerHTML() { return this._innerHTML; }
+    appendChild(child) { child.parentNode = this; this.children.push(child); return child; }
+    insertBefore(node, ref) {
+        node.parentNode = this;
+        const idx = this.children.indexOf(ref);
+        if (idx === -1) this.children.push(node); else this.children.splice(idx, 0, node);
+        return node;
+    }
+    addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+    dispatchEvent(evt) { (this.listeners[evt.type] || []).forEach((fn) => fn.call(this, evt)); }
+    click() {
+        if (this.disabled) return;
+        if (typeof this.onclick === 'function') this.onclick(new FakeEvent('click'));
+        this.dispatchEvent(new FakeEvent('click'));
+    }
+    setAttribute(k, v) { this.attributes[k] = String(v); }
+    getAttribute(k) { return this.attributes[k] || null; }
+    focus() {}
+    querySelectorAll() { return []; }
+    querySelector() { return null; }
+}
+
+class FakeSelect extends FakeElement {
+    constructor(id, options) {
+        super('select', id);
+        this.parentNode = new FakeElement('div');
+        this.parentNode.appendChild(this);
+        options.forEach((o) => {
+            const opt = new FakeElement('option');
+            opt.value = o.value;
+            opt.textContent = o.label;
+            this.appendChild(opt);
+        });
+        this.value = options[0].value;
+    }
+    get options() { return this.children; }
+    get selectedIndex() { return Math.max(0, this.children.findIndex((o) => o.value === this.value)); }
+}
+
+function runScenario({ initialLocalStorage = {} } = {}) {
+    const storage = new Map(Object.entries(initialLocalStorage));
+    const localStorage = {
+        getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+        setItem: (k, v) => storage.set(k, String(v)),
+        removeItem: (k) => storage.delete(k),
+    };
+    const sessStorage = new Map();
+    const sessionStorage = {
+        getItem: (k) => (sessStorage.has(k) ? sessStorage.get(k) : null),
+        setItem: (k, v) => sessStorage.set(k, String(v)),
+        removeItem: (k) => sessStorage.delete(k),
+    };
+
+    const byId = new Map();
+    const reg = (el) => { if (el.id) byId.set(el.id, el); return el; };
+
+    [
+        'dropZone', 'fileInput', 'dropZoneTitle', 'dropZoneHint', 'themeToggle',
+        'uploadPanel', 'statusPanel', 'statusText', 'statusSubText', 'spinner',
+        'successIcon', 'cancelIcon', 'cancelBtn', 'downloadBtn', 'downloadTranscriptBtn',
+        'resetBtn', 'debugLog', 'modeAnonymizeBtn', 'modeTranscribeOnlyBtn',
+        'workerValue', 'customWorkerWrap', 'customWorkerInput', 'workerLimitText',
+        'transcribeSwitchWrap', 'transcribeStateBadge', 'transcribeOptionsWrap',
+        'customPromptInput', 'promptPresets', 'transcribeHintText',
+        'recordingsSection', 'recordingsCount', 'recordingsList',
+        'postTranscribeSection', 'togglePostTranscribeBtn', 'postTranscribeForm',
+        'postTranscribeTitle', 'postCustomPromptInput', 'postPromptPresets',
+        'postAudioSourceHint', 'postTranscribeBtn',
+    ].forEach((id) => reg(new FakeElement('div', id)));
+
+    const appVersionFooter = reg(new FakeElement('footer', 'appVersionFooter'));
+    appVersionFooter.textContent = 'v5.0.0 (Stale Cached)';
+
+    const asrApiKeyWrap = reg(new FakeElement('div', 'asrApiKeyWrap', ['llm-config-wrap', 'hidden']));
+    const asrApiKeyInput = reg(new FakeElement('input', 'asrApiKeyInput'));
+    const postAsrApiKeyWrap = reg(new FakeElement('div', 'postAsrApiKeyWrap', ['llm-config-wrap', 'hidden']));
+    const postAsrApiKeyInput = reg(new FakeElement('input', 'postAsrApiKeyInput'));
+
+    const transcribeToggle = reg(new FakeElement('input', 'transcribeToggle'));
+    transcribeToggle.checked = true;
+    const denoiseToggle = reg(new FakeElement('input', 'denoiseToggle'));
+    const llmPolishToggle = reg(new FakeElement('input', 'llmPolishToggle'));
+    const llmConfigWrap = reg(new FakeElement('div', 'llmConfigWrap', ['hidden']));
+    const llmBaseUrlInput = reg(new FakeElement('input', 'llmBaseUrlInput'));
+    const llmModelInput = reg(new FakeElement('input', 'llmModelInput'));
+    const llmApiKeyInput = reg(new FakeElement('input', 'llmApiKeyInput'));
+    const llmPrivacyHint = reg(new FakeElement('p', 'llmPrivacyHint'));
+    const llmPresets = reg(new FakeElement('div', 'llmPresets'));
+
+    const postDenoiseToggle = reg(new FakeElement('input', 'postDenoiseToggle'));
+    const postLlmPolishToggle = reg(new FakeElement('input', 'postLlmPolishToggle'));
+    const postLlmConfigWrap = reg(new FakeElement('div', 'postLlmConfigWrap', ['hidden']));
+    const postLlmBaseUrlInput = reg(new FakeElement('input', 'postLlmBaseUrlInput'));
+    const postLlmModelInput = reg(new FakeElement('input', 'postLlmModelInput'));
+    const postLlmApiKeyInput = reg(new FakeElement('input', 'postLlmApiKeyInput'));
+    const postLlmPrivacyHint = reg(new FakeElement('p', 'postLlmPrivacyHint'));
+    const postLlmPresets = reg(new FakeElement('div', 'postLlmPresets'));
+
+    const modelOpts = [
+        { value: 'gigaam-v3', label: 'GigaAM v3 FP32' },
+        { value: 'deepgram-nova-3', label: 'Deepgram Nova-3' },
+    ];
+    reg(new FakeSelect('workerSelect', [{ value: '1', label: '1' }, { value: '4', label: '4' }, { value: 'custom', label: 'Другое' }]));
+    const asrModelSelect = reg(new FakeSelect('asrModelSelect', modelOpts));
+    const postAsrModelSelect = reg(new FakeSelect('postAsrModelSelect', modelOpts));
+    reg(new FakeSelect('languageSelect', [{ value: 'ru', label: 'RU' }, { value: 'auto', label: 'AUTO' }, { value: 'en', label: 'EN' }]));
+    reg(new FakeSelect('postLanguageSelect', [{ value: 'ru', label: 'RU' }, { value: 'auto', label: 'AUTO' }, { value: 'en', label: 'EN' }]));
+    const computeDeviceSelect = reg(new FakeSelect('computeDeviceSelect', [{ value: 'cpu', label: 'CPU' }, { value: 'cuda', label: 'GPU (CUDA)' }]));
+    reg(new FakeSelect('postComputeDeviceSelect', [{ value: 'cpu', label: 'CPU' }, { value: 'cuda', label: 'GPU (CUDA)' }]));
+    reg(new FakeSelect('speakerCountSelect', [{ value: 'auto', label: 'Авто' }, { value: '2', label: '2' }]));
+    reg(new FakeSelect('postSpeakerCountSelect', [{ value: 'auto', label: 'Авто' }, { value: '2', label: '2' }]));
+    reg(new FakeSelect('diarizationSensitivitySelect', [{ value: 'normal', label: 'Обычная' }]));
+    reg(new FakeSelect('postDiarizationSensitivitySelect', [{ value: 'normal', label: 'Обычная' }]));
+    reg(new FakeSelect('audioTracksSelect', [{ value: 'auto', label: 'Авто' }]));
+    reg(new FakeSelect('postAudioTracksSelect', [{ value: 'auto', label: 'Авто' }]));
+
+    const sunIcon = new FakeElement('svg');
+    const moonIcon = new FakeElement('svg');
+    const documentObj = {
+        documentElement: new FakeElement('html'),
+        getElementById: (id) => byId.get(id) || null,
+        querySelector: (sel) => (sel === '.sun-icon' ? sunIcon : sel === '.moon-icon' ? moonIcon : null),
+        createElement: (tag) => new FakeElement(tag),
+        createElementNS: (_ns, tag) => new FakeElement(tag),
+        addEventListener: () => {},
+        activeElement: null,
+    };
+
+    class FakeFormData {
+        constructor() { this.entries = {}; }
+        append(k, v) { this.entries[k] = v; }
+    }
+
+    const fetchCalls = [];
+    const uploadCalls = [];
+    const postCalls = [];
+    const fakeFetch = async (url, opts = {}) => {
+        fetchCalls.push({ url, opts });
+        if (url === '/api/config') {
+            return {
+                ok: true,
+                json: async () => ({
+                    version: '5.1.0',
+                    build_id: '5.1.0-abc1234-fedcba',
+                    cpu_count: 8,
+                    default_workers: 4,
+                    max_workers: 7,
+                    transcription_default: true,
+                    default_asr_model: 'gigaam-v3',
+                    default_language: 'ru',
+                    asr_models: [
+                        { id: 'gigaam-v3', label: 'GigaAM v3 FP32', engine: 'onnx_asr', supports_cuda: true, is_cloud: false, requires_api_key: false },
+                        { id: 'deepgram-nova-3', label: 'Deepgram Nova-3 — облачный API', engine: 'deepgram_cloud', supports_cuda: false, is_cloud: true, requires_api_key: true, has_native_diarization: true },
+                    ],
+                    cuda_available: true,
+                    ct2_cuda_available: true,
+                    onnx_cuda_available: true,
+                    default_compute_device: 'cpu',
+                    compute_devices: [{ id: 'cpu', label: 'CPU' }, { id: 'cuda', label: 'GPU (CUDA)' }],
+                    denoise_default: false,
+                    llm_polish_default: false,
+                    llm_defaults: { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-flash' },
+                    llm_presets: [
+                        { id: 'deepseek_cloud', base_url: 'https://api.deepseek.com/v1', model: 'deepseek-flash', is_cloud: true },
+                        { id: 'qwen_cloud', base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', is_cloud: true },
+                        { id: 'ollama_local', base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
+                    ],
+                }),
+            };
+        }
+        if (url === '/api/recordings') return { ok: true, json: async () => ({ recordings: [] }) };
+        if (url === '/api/upload') {
+            uploadCalls.push({ ...opts.body.entries });
+            return { ok: true, json: async () => ({ task_id: 'v51-task', status: 'queued', worker_count: 4 }) };
+        }
+        if (url === '/api/status/v51-task') {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: 'completed',
+                    mode: 'anonymize',
+                    video_ready: true,
+                    transcript_ready: true,
+                    can_transcribe: true,
+                    has_original_audio: true,
+                    asr_model: uploadCalls[uploadCalls.length - 1].asr_model,
+                    compute_device: uploadCalls[uploadCalls.length - 1].compute_device,
+                    logs: ['Done!'],
+                }),
+            };
+        }
+        if (url === '/api/transcribe/v51-task') {
+            postCalls.push({ ...opts.body.entries });
+            return { ok: true, json: async () => ({ task_id: 'v51-task', status: 'queued' }) };
+        }
+        throw new Error('Unexpected URL: ' + url);
+    };
+
+    const ctx = vm.createContext({
+        document: documentObj,
+        window: { location: { href: '' }, matchMedia: () => ({ matches: false }) },
+        localStorage,
+        sessionStorage,
+        Event: FakeEvent,
+        FormData: FakeFormData,
+        AbortController: class { constructor() { this.signal = {}; } abort() {} },
+        fetch: fakeFetch,
+        setInterval: () => 1,
+        clearInterval: () => {},
+        alert: (m) => { throw new Error('Unexpected alert: ' + m); },
+        console,
+        Number, String, Boolean, Array, Map, Set, Date,
+    });
+    vm.runInContext(fs.readFileSync('static/script.js', 'utf8'), ctx);
+    return {
+        ctx, storage, sessStorage, fetchCalls, uploadCalls, postCalls,
+        appVersionFooter, asrModelSelect, asrApiKeyWrap, asrApiKeyInput,
+        postAsrModelSelect, postAsrApiKeyWrap, postAsrApiKeyInput,
+        computeDeviceSelect, llmBaseUrlInput, llmModelInput, llmPrivacyHint,
+        fileInput: byId.get('fileInput'), postTranscribeBtn: byId.get('postTranscribeBtn'),
+    };
+}
+
+(async () => {
+    // 1. Fresh load: deepseek-flash default, live footer version from /api/config with cache: no-store
+    const h = runScenario();
+    await new Promise((r) => setTimeout(r, 25));
+
+    const cfgCall = h.fetchCalls.find((c) => c.url === '/api/config');
+    assert.ok(cfgCall, '/api/config must be fetched');
+    assert.strictEqual(cfgCall.opts.cache, 'no-store');
+    assert.strictEqual(h.appVersionFooter.textContent, 'v5.1.0 (Stable Edition • abc1234)');
+
+    assert.strictEqual(h.llmBaseUrlInput.value, 'https://api.deepseek.com/v1');
+    assert.strictEqual(h.llmModelInput.value, 'deepseek-flash');
+    assert.strictEqual(h.llmPrivacyHint.classList.contains('is-cloud'), true);
+
+    // 2. Local model keeps #asrApiKeyWrap hidden
+    assert.strictEqual(h.asrModelSelect.value, 'gigaam-v3');
+    assert.strictEqual(h.asrApiKeyWrap.classList.contains('hidden'), true);
+
+    // Switch to GPU first, then pick deepgram-nova-3 -> auto-switches to CPU & shows API key field
+    h.computeDeviceSelect.value = 'cuda';
+    h.computeDeviceSelect.dispatchEvent(new h.ctx.Event('change'));
+    assert.strictEqual(h.computeDeviceSelect.value, 'cuda');
+
+    h.asrModelSelect.value = 'deepgram-nova-3';
+    h.asrModelSelect.dispatchEvent(new h.ctx.Event('change'));
+    assert.strictEqual(h.computeDeviceSelect.value, 'cpu');
+    assert.strictEqual(h.asrApiKeyWrap.classList.contains('hidden'), false);
+
+    // Entering Deepgram key stores ONLY in sessionStorage, NEVER localStorage
+    h.asrApiKeyInput.value = 'dg-session-only-secret';
+    h.asrApiKeyInput.dispatchEvent(new h.ctx.Event('input'));
+    assert.strictEqual(h.sessStorage.get('selectedAsrApiKey'), 'dg-session-only-secret');
+    assert.strictEqual(h.storage.has('selectedAsrApiKey'), false);
+
+    // Upload sends asr_api_key for deepgram-nova-3
+    h.fileInput.files = [{ name: 'interview.mp4' }];
+    h.fileInput.dispatchEvent(new h.ctx.Event('change'));
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(h.uploadCalls.length, 1);
+    assert.strictEqual(h.uploadCalls[0].asr_model, 'deepgram-nova-3');
+    assert.strictEqual(h.uploadCalls[0].asr_api_key, 'dg-session-only-secret');
+
+    // Post-transcribe form inherits deepgram-nova-3 & shows #postAsrApiKeyWrap
+    assert.strictEqual(h.postAsrApiKeyWrap.classList.contains('hidden'), false);
+    assert.strictEqual(h.postAsrApiKeyInput.value, 'dg-session-only-secret');
+    h.postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(h.postCalls.length, 1);
+    assert.strictEqual(h.postCalls[0].asr_model, 'deepgram-nova-3');
+    assert.strictEqual(h.postCalls[0].asr_api_key, 'dg-session-only-secret');
+
+    // Switching back to local gigaam-v3 hides API key input and omits asr_api_key on post-transcribe
+    h.postAsrModelSelect.value = 'gigaam-v3';
+    h.postAsrModelSelect.dispatchEvent(new h.ctx.Event('change'));
+    assert.strictEqual(h.postAsrApiKeyWrap.classList.contains('hidden'), true);
+    h.postTranscribeBtn.click();
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(h.postCalls.length, 2);
+    assert.strictEqual(h.postCalls[1].asr_model, 'gigaam-v3');
+    assert.strictEqual(h.postCalls[1].asr_api_key, undefined);
+    assert.strictEqual(h.storage.has('selectedAsrApiKey'), false);
+
+    // 3. Stale localStorage 'deepseek-chat' and removed ASR model 'canary-1b-v2' are auto-migrated
+    const mig = runScenario({
+        initialLocalStorage: {
+            selectedLlmBaseUrl: 'https://api.deepseek.com/v1',
+            selectedLlmModel: 'deepseek-chat',
+            selectedAsrModel: 'canary-1b-v2',
+        },
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    assert.strictEqual(mig.llmModelInput.value, 'deepseek-flash');
+    assert.strictEqual(mig.storage.get('selectedLlmModel'), 'deepseek-flash');
+    assert.strictEqual(mig.asrModelSelect.value, 'gigaam-v3');
+    assert.strictEqual(mig.storage.get('selectedAsrModel'), 'gigaam-v3');
+
+    console.log('FRONTEND_V51_ALL_OK');
+})().catch((err) => {
+    console.error(err);
+    process.exit(1);
+});
+"""
+    proc = subprocess.run(
+        ["node", "-e", node_test_js],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Node v5.1 frontend test failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert "FRONTEND_V51_ALL_OK" in proc.stdout

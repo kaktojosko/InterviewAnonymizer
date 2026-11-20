@@ -60,6 +60,8 @@ const transcribeSwitchWrap = document.getElementById('transcribeSwitchWrap');
 const transcribeStateBadge = document.getElementById('transcribeStateBadge');
 const transcribeOptionsWrap = document.getElementById('transcribeOptionsWrap');
 const asrModelSelect = document.getElementById('asrModelSelect');
+const asrApiKeyWrap = document.getElementById('asrApiKeyWrap');
+const asrApiKeyInput = document.getElementById('asrApiKeyInput');
 const languageSelect = document.getElementById('languageSelect');
 const computeDeviceSelect = document.getElementById('computeDeviceSelect');
 const speakerCountSelect = document.getElementById('speakerCountSelect');
@@ -76,6 +78,7 @@ const llmModelInput = document.getElementById('llmModelInput');
 const llmApiKeyInput = document.getElementById('llmApiKeyInput');
 const llmPrivacyHint = document.getElementById('llmPrivacyHint');
 const transcribeHintText = document.getElementById('transcribeHintText');
+const appVersionFooter = document.getElementById('appVersionFooter');
 
 const recordingsSection = document.getElementById('recordingsSection');
 const recordingsCount = document.getElementById('recordingsCount');
@@ -86,6 +89,8 @@ const togglePostTranscribeBtn = document.getElementById('togglePostTranscribeBtn
 const postTranscribeForm = document.getElementById('postTranscribeForm');
 const postTranscribeTitle = document.getElementById('postTranscribeTitle');
 const postAsrModelSelect = document.getElementById('postAsrModelSelect');
+const postAsrApiKeyWrap = document.getElementById('postAsrApiKeyWrap');
+const postAsrApiKeyInput = document.getElementById('postAsrApiKeyInput');
 const postLanguageSelect = document.getElementById('postLanguageSelect');
 const postComputeDeviceSelect = document.getElementById('postComputeDeviceSelect');
 const postSpeakerCountSelect = document.getElementById('postSpeakerCountSelect');
@@ -127,21 +132,21 @@ let serverOnnxCudaAvailable = null;
 let serverAsrModelsMeta = new Map();
 let promptPresetMap = {
     system_analyst:
-        'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, SOAP, JWT, Bearer, OAuth 2, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, Camunda, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code',
+        'Собеседование системного аналитика: REST, gRPC, HTTP 2.0, HTTP/1.1, SOAP, JSON, JWT, Bearer, OAuth 2, API-шлюз, PostgreSQL, Redis, MongoDB, Kafka, C4, Sequence, Activity, ERD, BPMN, Camunda, PlantUML, draw.io, UI-kit, use cases, Swagger, Postman, Confluence, Jira, Git, Jenkins, Docs as Code, Spec-Driven Development, CRM, SFA, OTLP, C++',
     backend_devops:
         'Техническое собеседование: Python, Go, Java, Docker, Kubernetes, CI/CD, GitLab, PostgreSQL, Redis, Kafka, RabbitMQ, gRPC, REST API, GraphQL, OpenAPI, Prometheus, Grafana, Terraform, Linux',
     frontend_qa:
         'Техническое собеседование: JavaScript, TypeScript, React, Vue, Next.js, REST, GraphQL, WebSocket, Playwright, Cypress, Selenium, Postman, Swagger, Allure, Jira, Git',
 };
 let llmPresetMap = {
-    ollama_local: { base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
-    lmstudio_local: { base_url: 'http://localhost:1234/v1', model: 'qwen3-8b', is_cloud: false },
-    deepseek_cloud: { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', is_cloud: true },
+    deepseek_cloud: { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-flash', is_cloud: true },
     qwen_cloud: {
         base_url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
         model: 'qwen-plus',
         is_cloud: true,
     },
+    ollama_local: { base_url: 'http://localhost:11434/v1', model: 'qwen3:8b', is_cloud: false },
+    lmstudio_local: { base_url: 'http://localhost:1234/v1', model: 'qwen3-8b', is_cloud: false },
 };
 
 function readSessionSecret(key) {
@@ -232,9 +237,14 @@ let selectedAudioTracks = localStorage.getItem('selectedAudioTracks') || 'auto';
 let selectedCustomPrompt = localStorage.getItem('selectedCustomPrompt') || '';
 let selectedDenoise = localStorage.getItem('selectedDenoise') === 'true';
 let selectedLlmPolish = localStorage.getItem('selectedLlmPolish') === 'true';
-let selectedLlmBaseUrl = localStorage.getItem('selectedLlmBaseUrl') || 'http://localhost:11434/v1';
-let selectedLlmModel = localStorage.getItem('selectedLlmModel') || 'qwen3:8b';
+let selectedLlmBaseUrl = localStorage.getItem('selectedLlmBaseUrl') || 'https://api.deepseek.com/v1';
+let selectedLlmModel = localStorage.getItem('selectedLlmModel') || 'deepseek-flash';
+if (selectedLlmModel === 'deepseek-chat') {
+    selectedLlmModel = 'deepseek-flash';
+    localStorage.setItem('selectedLlmModel', selectedLlmModel);
+}
 let selectedLlmApiKey = readSessionSecret('selectedLlmApiKey');
+let selectedAsrApiKey = readSessionSecret('selectedAsrApiKey');
 
 // Post-recording separate transcription form state (initialized from main settings)
 let postAsrModel = selectedAsrModel;
@@ -249,6 +259,14 @@ let postLlmPolish = selectedLlmPolish;
 let postLlmBaseUrl = selectedLlmBaseUrl;
 let postLlmModel = selectedLlmModel;
 let postLlmApiKey = selectedLlmApiKey;
+let postAsrApiKey = selectedAsrApiKey;
+
+function isCloudAsrModel(modelId) {
+    if (serverAsrModelsMeta.has(modelId)) {
+        return Boolean(serverAsrModelsMeta.get(modelId).is_cloud);
+    }
+    return modelId === 'deepgram-nova-3';
+}
 
 function isCpuOnlyAsrModel(modelId) {
     if (serverAsrModelsMeta.has(modelId)) {
@@ -258,9 +276,11 @@ function isCpuOnlyAsrModel(modelId) {
         if (meta.engine === 'faster_whisper' && serverCt2CudaAvailable === false) return true;
         return false;
     }
-    if (modelId === 'gigaam-v3-int8' || modelId === 'parakeet' || modelId === 'canary-qwen-2.5b') return true;
+    if (modelId === 'deepgram-nova-3') {
+        return true;
+    }
     if (
-        (modelId === 'gigaam-v3' || modelId === 'gigaam-v3-ctc' || modelId === 'canary-1b-v2') &&
+        (modelId === 'gigaam-v3' || modelId === 'gigaam-v3-ctc') &&
         serverOnnxCudaAvailable === false
     ) {
         return true;
@@ -273,15 +293,9 @@ function getGpuFallbackModel(currentModelId, selectEl) {
     if (String(currentModelId || '').startsWith('gigaam-v3')) {
         if (serverOnnxCudaAvailable === true && hasOpt('gigaam-v3')) return 'gigaam-v3';
         if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
-        if (hasOpt('large-v3-ru')) return 'large-v3-ru';
-    }
-    if (currentModelId === 'canary-qwen-2.5b') {
-        if (serverOnnxCudaAvailable === true && hasOpt('canary-1b-v2')) return 'canary-1b-v2';
-        if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
     }
     if (hasOpt('turbo')) return 'turbo';
     if (hasOpt('breeze-asr-25')) return 'breeze-asr-25';
-    if (hasOpt('large-v3-ru')) return 'large-v3-ru';
     return 'turbo';
 }
 
@@ -568,11 +582,7 @@ function applyComputeDeviceAvailabilityToPair(deviceSelectEl, modelId, currentDe
             opt.dataset.infoHint =
                 fallbackId === 'gigaam-v3'
                     ? 'GigaAM FP32'
-                    : (fallbackId === 'canary-1b-v2'
-                        ? 'Canary 1B v2'
-                        : (fallbackId === 'breeze-asr-25'
-                            ? 'Breeze-ASR'
-                            : (fallbackId === 'large-v3-ru' ? 'Whisper RU' : 'Whisper')));
+                    : (fallbackId === 'breeze-asr-25' ? 'Breeze-ASR' : 'Whisper Turbo');
             opt.title = `При выборе GPU модель автоматически переключится на ${opt.dataset.infoHint}`;
         } else {
             opt.dataset.limitHint = '';
@@ -606,19 +616,16 @@ function hasLatinTerms(text) {
 
 function updateTranscribeHint() {
     if (!transcribeHintText) return;
-    if (selectedAsrModel === 'gigaam-v3' || selectedAsrModel === 'gigaam-v3-ctc' || selectedAsrModel === 'gigaam-v3-int8') {
+    if (selectedAsrModel === 'gigaam-v3' || selectedAsrModel === 'gigaam-v3-ctc') {
         if (selectedLanguage === 'en') {
             transcribeHintText.textContent =
-                'GigaAM v3 специализирована на русском языке; для английской или смешанной RU+EN речи выберите Breeze-ASR-25, Canary 1B v2 или Whisper.';
+                'GigaAM v3 специализирована на русском языке; для английской или смешанной RU+EN речи выберите Breeze-ASR-25, Whisper Turbo или Deepgram Nova-3.';
         } else if (hasLatinTerms(selectedCustomPrompt)) {
             transcribeHintText.textContent =
-                'В словаре есть латинские термины — для нативной латиницы подойдёт Breeze-ASR-25 или включение LLM-корректуры (локальной или облачной; для GigaAM v3 также сработает автозамена по словарю).';
+                'В словаре есть латинские термины — для нативной латиницы подойдёт Breeze-ASR-25 или включение LLM-корректуры (локальной или облачной; при выключенной LLM для GigaAM v3 сработает автозамена по словарю).';
         } else if (selectedAsrModel === 'gigaam-v3-ctc') {
             transcribeHintText.textContent =
                 'Sber GigaAM v3 CTC FP32: сверхбыстрая русская модель (до 240× на GPU CUDA), нарезка ≤20с с Silero VAD, пунктуация и регистр.';
-        } else if (selectedAsrModel === 'gigaam-v3-int8') {
-            transcribeHintText.textContent =
-                'Sber GigaAM v3 INT8 (232 МБ): облегчённая CPU-версия для машин без GPU или с малым объёмом RAM.';
         } else if (selectedComputeDevice === 'cuda' && serverOnnxCudaAvailable === true) {
             transcribeHintText.textContent =
                 'Sber GigaAM v3 FP32 (GPU CUDA): максимальная точность на русской речи (до ~60× ускорения на GPU), нарезка ≤20с с Silero VAD.';
@@ -629,23 +636,12 @@ function updateTranscribeHint() {
     } else if (selectedAsrModel === 'breeze-asr-25') {
         transcribeHintText.textContent =
             'MediaTek Breeze-ASR-25: лучшая локальная модель для смешанной RU+EN речи и IT-терминов (gRPC, OAuth 2, Kubernetes), без галлюцинаций Whisper v3 (CPU/GPU).';
-    } else if (selectedAsrModel === 'canary-1b-v2') {
+    } else if (selectedAsrModel === 'deepgram-nova-3') {
         transcribeHintText.textContent =
-            'NVIDIA Canary 1B v2 (FP32): 25 европейских языков (RU/EN и др.), пунктуация и регистр, 1B параметров. Поддерживает GPU (CUDA) и CPU.';
-    } else if (selectedAsrModel === 'canary-qwen-2.5b') {
-        if (selectedLanguage === 'ru') {
-            transcribeHintText.textContent =
-                'Внимание: NVIDIA Canary-Qwen 2.5B обучена ТОЛЬКО на английском языке (EN, #1 Open ASR Leaderboard, 5.63% WER)! Для русской речи выберите GigaAM v3, Breeze-ASR-25 или Canary 1B v2.';
-        } else {
-            transcribeHintText.textContent =
-                'NVIDIA Canary-Qwen 2.5B (INT8 CPU, 2.9 ГБ): мировой #1 для английской речи (5.63% WER) с пунктуацией и регистром (FastConformer + Qwen3-1.7B, только English).';
-        }
-    } else if (selectedAsrModel === 'large-v3-ru') {
-        transcribeHintText.textContent =
-            'Русский файнтюн Whisper Large v3: высокая точность на русской речи и IT-терминах с поддержкой словаря (CPU/GPU).';
+            'Deepgram Nova-3 (облачный API): мультиязычное RU/EN распознавание, словарь терминов (keyterms) и встроенная диаризация в облаке. Нужен Deepgram API-ключ.';
     } else {
         transcribeHintText.textContent =
-            'Отдельный .txt с таймкодами и ролями. Словарь терминов передаётся напрямую в initial_prompt Whisper.';
+            'Whisper Large v3 Turbo (99 языков): быстрая универсальная модель. Словарь терминов передаётся напрямую в initial_prompt Whisper.';
     }
 }
 
@@ -698,8 +694,16 @@ function renderTranscriptionControls() {
     } else if (asrModelSelect.options.length > 0) {
         selectedAsrModel = asrModelSelect.options[0].value;
         asrModelSelect.value = selectedAsrModel;
+        localStorage.setItem('selectedAsrModel', selectedAsrModel);
     }
     syncClaySelect(asrModelSelect);
+
+    if (asrApiKeyWrap) {
+        asrApiKeyWrap.classList.toggle('hidden', !isCloudAsrModel(selectedAsrModel));
+    }
+    if (asrApiKeyInput && asrApiKeyInput.value !== selectedAsrApiKey) {
+        asrApiKeyInput.value = selectedAsrApiKey;
+    }
 
     if (languageSelect) {
         if (Array.from(languageSelect.options).some((opt) => opt.value === selectedLanguage)) {
@@ -784,18 +788,13 @@ function updatePostAudioSourceHint() {
     const isGiga = String(postAsrModel || '').startsWith('gigaam-v3');
     if (isGiga && postLanguage === 'en') {
         postAudioSourceHint.textContent =
-            `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Canary-Qwen 2.5B, Breeze-ASR-25 или Canary 1B v2.`;
+            `${sourceText} GigaAM v3 специализирована на русском; для английской речи выберите Breeze-ASR-25, Whisper Turbo или Deepgram Nova-3.`;
     } else if (isGiga && hasLatinTerms(postCustomPrompt)) {
         postAudioSourceHint.textContent =
-            `${sourceText} Для латинских IT-терминов подойдёт Breeze-ASR-25 или LLM-корректура (локальная или облачная; для GigaAM v3 также сработает автозамена).`;
-    } else if (postAsrModel === 'canary-1b-v2') {
+            `${sourceText} Для латинских IT-терминов подойдёт Breeze-ASR-25 или LLM-корректура (при выключенной LLM для GigaAM v3 сработает автозамена).`;
+    } else if (postAsrModel === 'deepgram-nova-3') {
         postAudioSourceHint.textContent =
-            `${sourceText} Canary 1B v2 поддерживает 25 языков, пунктуацию и ускорение на GPU (CUDA).`;
-    } else if (postAsrModel === 'canary-qwen-2.5b') {
-        postAudioSourceHint.textContent =
-            postLanguage === 'ru'
-                ? `${sourceText} Внимание: Canary-Qwen 2.5B обучена ТОЛЬКО на английском языке (EN)! Для русской речи выберите GigaAM v3 или Breeze-ASR-25.`
-                : `${sourceText} Canary-Qwen 2.5B (INT8 CPU): топ-1 для английской речи (EN ONLY) с пунктуацией и регистром.`;
+            `${sourceText} Deepgram Nova-3 (облачный API): аудиодорожка отправляется в Deepgram с keyterms и нативной диаризацией.`;
     } else {
         postAudioSourceHint.textContent = sourceText;
     }
@@ -820,6 +819,13 @@ function renderPostTranscribeControls() {
         postAsrModelSelect.value = postAsrModel;
     }
     syncClaySelect(postAsrModelSelect);
+
+    if (postAsrApiKeyWrap) {
+        postAsrApiKeyWrap.classList.toggle('hidden', !isCloudAsrModel(postAsrModel));
+    }
+    if (postAsrApiKeyInput && postAsrApiKeyInput.value !== postAsrApiKey) {
+        postAsrApiKeyInput.value = postAsrApiKey;
+    }
 
     if (postLanguageSelect) {
         if (Array.from(postLanguageSelect.options).some((opt) => opt.value === postLanguage)) {
@@ -1075,6 +1081,7 @@ function renderRecordingsList(recordings) {
                     llmBaseUrl: selectedLlmBaseUrl,
                     llmModel: selectedLlmModel,
                     llmApiKey: selectedLlmApiKey,
+                    asrApiKey: selectedAsrApiKey,
                 });
             });
             actions.appendChild(trBtn);
@@ -1147,7 +1154,7 @@ function openRecordingPanel(rec) {
 async function loadRecordings() {
     if (!recordingsSection) return;
     try {
-        const response = await fetch('/api/recordings');
+        const response = await fetch('/api/recordings', { cache: 'no-store' });
         if (!response || !response.ok) return;
         const data = await response.json();
         renderRecordingsList(data.recordings || []);
@@ -1158,9 +1165,16 @@ async function loadRecordings() {
 
 async function loadServerConfig() {
     try {
-        const response = await fetch('/api/config');
+        const response = await fetch('/api/config', { cache: 'no-store' });
         if (!response.ok) return;
         const data = await response.json();
+        if (appVersionFooter && data.version) {
+            const buildParts = typeof data.build_id === 'string' ? data.build_id.split('-') : [];
+            const shortSha = buildParts.length >= 2 && buildParts[1] ? buildParts[1] : '';
+            appVersionFooter.textContent = shortSha
+                ? `v${data.version} (Stable Edition • ${shortSha})`
+                : `v${data.version} (Stable Edition)`;
+        }
         serverCpuCount = Number(data.cpu_count) || null;
         serverMaxWorkers = Number(data.max_workers) || null;
         if (typeof data.cuda_available === 'boolean') {
@@ -1184,28 +1198,28 @@ async function loadServerConfig() {
             serverAsrModelsMeta = new Map();
             data.asr_models.forEach((m) => {
                 const fallbackEngine =
-                    m.id === 'canary-qwen-2.5b'
-                        ? 'onnx_canary_qwen'
-                        : (
-                            m.id === 'gigaam-v3' ||
-                            m.id === 'gigaam-v3-ctc' ||
-                            m.id === 'gigaam-v3-int8' ||
-                            m.id === 'canary-1b-v2'
-                        )
+                    m.id === 'deepgram-nova-3'
+                        ? 'deepgram_cloud'
+                        : (m.id === 'gigaam-v3' || m.id === 'gigaam-v3-ctc')
                             ? 'onnx_asr'
-                            : (m.id === 'parakeet' ? 'sherpa_parakeet' : 'faster_whisper');
-                const fallbackSupportsCuda =
-                    m.id !== 'gigaam-v3-int8' && m.id !== 'parakeet' && m.id !== 'canary-qwen-2.5b';
+                            : 'faster_whisper';
+                const fallbackSupportsCuda = m.id !== 'deepgram-nova-3';
                 serverAsrModelsMeta.set(m.id, {
                     engine: m.engine || fallbackEngine,
                     supports_cuda: m.supports_cuda !== undefined ? Boolean(m.supports_cuda) : fallbackSupportsCuda,
                     fixed_language: m.fixed_language || null,
+                    is_cloud: m.is_cloud !== undefined ? Boolean(m.is_cloud) : m.id === 'deepgram-nova-3',
+                    requires_api_key: m.requires_api_key !== undefined ? Boolean(m.requires_api_key) : m.id === 'deepgram-nova-3',
+                    has_native_diarization: Boolean(m.has_native_diarization),
                 });
             });
             syncSelectOptionsIfChanged(asrModelSelect, data.asr_models);
             syncSelectOptionsIfChanged(postAsrModelSelect, data.asr_models);
             if (!localStorage.getItem('selectedAsrModel') && data.default_asr_model) {
                 selectedAsrModel = data.default_asr_model;
+            } else if (!serverAsrModelsMeta.has(selectedAsrModel) && data.default_asr_model) {
+                selectedAsrModel = data.default_asr_model;
+                localStorage.setItem('selectedAsrModel', selectedAsrModel);
             }
         }
 
@@ -1291,6 +1305,7 @@ async function loadServerConfig() {
         postLlmBaseUrl = selectedLlmBaseUrl;
         postLlmModel = selectedLlmModel;
         postLlmApiKey = selectedLlmApiKey;
+        postAsrApiKey = selectedAsrApiKey;
 
         applyWorkerAvailability();
         renderModeControls();
@@ -1361,6 +1376,13 @@ asrModelSelect.addEventListener('change', () => {
     }
     renderTranscriptionControls();
 });
+
+if (asrApiKeyInput) {
+    asrApiKeyInput.addEventListener('input', () => {
+        selectedAsrApiKey = asrApiKeyInput.value.trim();
+        writeSessionSecret('selectedAsrApiKey', selectedAsrApiKey);
+    });
+}
 
 if (languageSelect) {
     languageSelect.addEventListener('change', () => {
@@ -1478,6 +1500,13 @@ if (postAsrModelSelect) {
             postComputeDevice = 'cpu';
         }
         renderPostTranscribeControls();
+    });
+}
+
+if (postAsrApiKeyInput) {
+    postAsrApiKeyInput.addEventListener('input', () => {
+        postAsrApiKey = postAsrApiKeyInput.value.trim();
+        writeSessionSecret('selectedAsrApiKey', postAsrApiKey);
     });
 }
 
@@ -1604,6 +1633,7 @@ if (postTranscribeBtn) {
             llmBaseUrl: postLlmBaseUrl,
             llmModel: postLlmModel,
             llmApiKey: postLlmApiKey,
+            asrApiKey: postAsrApiKey,
         });
     });
 }
@@ -1734,6 +1764,9 @@ async function uploadFile(file) {
     if (selectedLlmBaseUrl) formData.append('llm_base_url', selectedLlmBaseUrl);
     if (selectedLlmModel) formData.append('llm_model', selectedLlmModel);
     if (selectedLlmApiKey) formData.append('llm_api_key', selectedLlmApiKey);
+    if (selectedAsrApiKey && isCloudAsrModel(selectedAsrModel)) {
+        formData.append('asr_api_key', selectedAsrApiKey);
+    }
 
     uploadAbortController = new AbortController();
 
@@ -1808,8 +1841,9 @@ async function startPostTranscription(taskId, opts = {}) {
     const chosenLlmUrl = opts.llmBaseUrl !== undefined ? String(opts.llmBaseUrl).trim() : selectedLlmBaseUrl;
     const chosenLlmModel = opts.llmModel !== undefined ? String(opts.llmModel).trim() : selectedLlmModel;
     const chosenLlmKey = opts.llmApiKey !== undefined ? String(opts.llmApiKey).trim() : selectedLlmApiKey;
+    const chosenAsrKey = opts.asrApiKey !== undefined ? String(opts.asrApiKey).trim() : selectedAsrApiKey;
 
-    // Remember user's latest transcription choices (API key stays in sessionStorage only, never localStorage)
+    // Remember user's latest transcription choices (API keys stay in sessionStorage only, never localStorage)
     selectedAsrModel = chosenModel;
     selectedLanguage = chosenLang;
     selectedComputeDevice = chosenDev;
@@ -1823,6 +1857,8 @@ async function startPostTranscription(taskId, opts = {}) {
     if (chosenLlmModel) selectedLlmModel = chosenLlmModel;
     selectedLlmApiKey = chosenLlmKey;
     writeSessionSecret('selectedLlmApiKey', selectedLlmApiKey);
+    selectedAsrApiKey = chosenAsrKey;
+    writeSessionSecret('selectedAsrApiKey', selectedAsrApiKey);
     postAsrModel = chosenModel;
     postLanguage = chosenLang;
     postComputeDevice = chosenDev;
@@ -1835,6 +1871,7 @@ async function startPostTranscription(taskId, opts = {}) {
     postLlmBaseUrl = selectedLlmBaseUrl;
     postLlmModel = selectedLlmModel;
     postLlmApiKey = selectedLlmApiKey;
+    postAsrApiKey = selectedAsrApiKey;
     localStorage.setItem('selectedAsrModel', selectedAsrModel);
     localStorage.setItem('selectedLanguage', selectedLanguage);
     localStorage.setItem('selectedComputeDevice', selectedComputeDevice);
@@ -1863,6 +1900,9 @@ async function startPostTranscription(taskId, opts = {}) {
     if (selectedLlmBaseUrl) formData.append('llm_base_url', selectedLlmBaseUrl);
     if (selectedLlmModel) formData.append('llm_model', selectedLlmModel);
     if (chosenLlmKey) formData.append('llm_api_key', chosenLlmKey);
+    if (chosenAsrKey && isCloudAsrModel(chosenModel)) {
+        formData.append('asr_api_key', chosenAsrKey);
+    }
 
     try {
         const response = await fetch(`/api/transcribe/${taskId}`, {
@@ -1975,6 +2015,7 @@ function renderPostTranscribeSection(data = {}, opts = {}) {
     postLlmBaseUrl = data.llm_base_url ? String(data.llm_base_url) : selectedLlmBaseUrl;
     postLlmModel = data.llm_model ? String(data.llm_model) : selectedLlmModel;
     postLlmApiKey = selectedLlmApiKey;
+    postAsrApiKey = selectedAsrApiKey;
     renderPostTranscribeControls();
 
     postTranscribeSection.classList.remove('hidden');

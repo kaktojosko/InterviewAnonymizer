@@ -3,13 +3,14 @@ import os
 import re
 import shutil
 import uuid
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from src.orchestrator import Orchestrator
 from src.io_manager import IOManager
 from src.config import (
     ANONYMIZE_ALLOWED_EXTENSIONS,
+    APP_BUILD_ID,
     APP_VERSION,
     ASR_LANGUAGE_LABELS,
     ASR_LANGUAGE_OPTIONS,
@@ -18,12 +19,14 @@ from src.config import (
     AUDIO_CACHE_DIR,
     AUDIO_TRACK_MODE_LABELS,
     AUDIO_TRACK_MODE_OPTIONS,
+    BASE_DIR,
     COMPUTE_DEVICE_OPTIONS,
     CPU_COUNT,
     DEFAULT_ASR_LANGUAGE,
     DEFAULT_ASR_MODEL,
     DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DEEPGRAM_API_KEY,
     DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_JOB_MODE,
     DEFAULT_LLM_API_KEY,
@@ -43,6 +46,7 @@ from src.config import (
     TMP_BASE_DIR,
     TRANSCRIBE_ONLY_ALLOWED_EXTENSIONS,
     TRANSCRIPTION_ENABLED_DEFAULT,
+    _resolve_build_id,
 )
 from src.cancellation import CancellationToken, TaskCancelledError
 from src.transcriber import probe_cuda_available, probe_onnx_cuda_available
@@ -51,6 +55,25 @@ app = FastAPI(title="Interview Anonymizer", version=APP_VERSION)
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.middleware("http")
+async def add_cache_control_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if (
+        path == "/"
+        or path == "/api/config"
+        or path.startswith("/api/recordings")
+        or path.startswith("/api/status/")
+    ):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    elif path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
 
 # In-memory status store & cancellation tokens
 tasks = {}
@@ -257,6 +280,11 @@ def parse_llm_api_key(raw_key: str | None) -> str:
     return cleaned or DEFAULT_LLM_API_KEY
 
 
+def parse_asr_api_key(raw_key: str | None) -> str:
+    cleaned = (raw_key or "").strip()[:300]
+    return cleaned or DEFAULT_DEEPGRAM_API_KEY
+
+
 def _safe_remove(path: str | None) -> None:
     if path and os.path.exists(path):
         try:
@@ -285,6 +313,7 @@ def background_process(
     llm_base_url: str = DEFAULT_LLM_BASE_URL,
     llm_model: str = DEFAULT_LLM_MODEL,
     llm_api_key: str = "",
+    asr_api_key: str = "",
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -351,6 +380,7 @@ def background_process(
     cached_audio_path = _audio_cache_path(task_id)
     cached_track2_path = _audio_cache_track2_path(task_id)
     eff_api_key = (llm_api_key or "").strip() or DEFAULT_LLM_API_KEY
+    eff_asr_api_key = (asr_api_key or "").strip() or DEFAULT_DEEPGRAM_API_KEY
 
     try:
         result = Orchestrator.process_video_job(
@@ -376,6 +406,7 @@ def background_process(
             llm_base_url=llm_base_url,
             llm_model=llm_model,
             llm_api_key=eff_api_key,
+            asr_api_key=eff_asr_api_key,
         )
         cancel_token.check()
         video_ready = bool(result.get("video_ready"))
@@ -450,6 +481,7 @@ def background_transcribe_only(
     llm_base_url: str = DEFAULT_LLM_BASE_URL,
     llm_model: str = DEFAULT_LLM_MODEL,
     llm_api_key: str = "",
+    asr_api_key: str = "",
 ):
     cancel_token = cancel_tokens.get(task_id)
     if cancel_token is None:
@@ -527,6 +559,7 @@ def background_transcribe_only(
     cache_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_audio_path
     cache_track2_target = None if (is_post_transcribe and not input_is_wav_16k) else cached_track2_path
     eff_api_key = (llm_api_key or "").strip() or DEFAULT_LLM_API_KEY
+    eff_asr_api_key = (asr_api_key or "").strip() or DEFAULT_DEEPGRAM_API_KEY
 
     try:
         result = Orchestrator.process_transcription_only_job(
@@ -553,6 +586,7 @@ def background_transcribe_only(
             llm_base_url=llm_base_url,
             llm_model=llm_model,
             llm_api_key=eff_api_key,
+            asr_api_key=eff_asr_api_key,
         )
         cancel_token.check()
         has_orig_audio = os.path.isfile(cached_audio_path)
@@ -609,9 +643,43 @@ def background_transcribe_only(
             _safe_remove(cached_track2_path)
 
 
+_INDEX_HTML_PATH = os.path.join(BASE_DIR, "static", "index.html")
+_CSS_HREF_RE = re.compile(r'/static/style\.css(?:\?v=[^"\']+)?')
+_JS_SRC_RE = re.compile(r'/static/script\.js(?:\?v=[^"\']+)?')
+_FOOTER_VER_RE = re.compile(r'(<footer[^>]*\bid="appVersionFooter"[^>]*>)(.*?)(</footer>)', re.DOTALL)
+
+
+def _current_build_id() -> str:
+    return _resolve_build_id(BASE_DIR, APP_VERSION) or APP_BUILD_ID
+
+
+def _render_index_html() -> str:
+    with open(_INDEX_HTML_PATH, "r", encoding="utf-8") as f:
+        html = f.read()
+    build_id = _current_build_id()
+    html = _CSS_HREF_RE.sub(f"/static/style.css?v={build_id}", html)
+    html = _JS_SRC_RE.sub(f"/static/script.js?v={build_id}", html)
+    parts = build_id.split("-")
+    short_sha = parts[1] if len(parts) >= 2 and parts[1] else ""
+    footer_text = (
+        f"v{APP_VERSION} (Stable Edition • {short_sha})"
+        if short_sha
+        else f"v{APP_VERSION} (Stable Edition)"
+    )
+    html = _FOOTER_VER_RE.sub(rf"\g<1>\n            {footer_text}\n        \g<3>", html)
+    return html
+
+
 @app.get("/")
 async def root():
-    return FileResponse("static/index.html")
+    return HTMLResponse(
+        content=_render_index_html(),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/config")
@@ -620,6 +688,7 @@ async def get_config():
     onnx_cuda_ok = probe_onnx_cuda_available()
     return {
         "version": APP_VERSION,
+        "build_id": _current_build_id(),
         "cpu_count": CPU_COUNT,
         "default_workers": MAX_WORKERS,
         "max_workers": MAX_ALLOWED_WORKERS,
@@ -640,6 +709,9 @@ async def get_config():
                 "engine": p["engine"],
                 "supports_cuda": bool(p.get("supports_cuda", False)),
                 "fixed_language": p.get("fixed_language"),
+                "is_cloud": bool(p.get("is_cloud", False)),
+                "requires_api_key": bool(p.get("requires_api_key", False)),
+                "has_native_diarization": bool(p.get("has_native_diarization", False)),
             }
             for p in ASR_MODEL_PROFILES.values()
         ],
@@ -700,6 +772,7 @@ async def upload_video(
     llm_base_url: str = Form(DEFAULT_LLM_BASE_URL),
     llm_model: str = Form(DEFAULT_LLM_MODEL),
     llm_api_key: str = Form(""),
+    asr_api_key: str = Form(""),
 ):
     job_mode = parse_job_mode(mode)
     filename = file.filename or ""
@@ -734,6 +807,7 @@ async def upload_video(
     llm_url_clean = parse_llm_base_url(llm_base_url)
     llm_model_clean = parse_llm_model(llm_model)
     llm_key_clean = parse_llm_api_key(llm_api_key)
+    asr_key_clean = parse_asr_api_key(asr_api_key)
 
     task_id = str(uuid.uuid4())
     input_path = os.path.join("uploads", f"{task_id}{ext}")
@@ -805,6 +879,7 @@ async def upload_video(
             llm_url_clean,
             llm_model_clean,
             llm_key_clean,
+            asr_key_clean,
         )
     else:
         background_tasks.add_task(
@@ -828,6 +903,7 @@ async def upload_video(
             llm_url_clean,
             llm_model_clean,
             llm_key_clean,
+            asr_key_clean,
         )
 
     return {
@@ -868,6 +944,7 @@ async def transcribe_existing_recording(
     llm_base_url: str = Form(DEFAULT_LLM_BASE_URL),
     llm_model: str = Form(DEFAULT_LLM_MODEL),
     llm_api_key: str = Form(""),
+    asr_api_key: str = Form(""),
 ):
     """
     Creates (or re-creates) a speaker-diarized .txt transcript separately for
@@ -896,6 +973,7 @@ async def transcribe_existing_recording(
     llm_url_clean = parse_llm_base_url(llm_base_url)
     llm_model_clean = parse_llm_model(llm_model)
     llm_key_clean = parse_llm_api_key(llm_api_key)
+    asr_key_clean = parse_asr_api_key(asr_api_key)
 
     cached_wav = _audio_cache_path(task_id)
     cached_track2_wav = _audio_cache_track2_path(task_id)
@@ -979,6 +1057,7 @@ async def transcribe_existing_recording(
         llm_url_clean,
         llm_model_clean,
         llm_key_clean,
+        asr_key_clean,
     )
 
     return {

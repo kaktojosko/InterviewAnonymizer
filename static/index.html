@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=23">
+    <link rel="stylesheet" href="/static/style.css?v=24">
 </head>
 <body>
     <div class="container">
@@ -85,15 +85,16 @@
                                 <option value="gigaam-v3" selected>GigaAM v3 FP32 — эталон для русского (RU, GPU/CPU, 892 МБ)</option>
                                 <option value="gigaam-v3-ctc">GigaAM v3 CTC FP32 — турбо для русского (до 240× GPU, 886 МБ)</option>
                                 <option value="breeze-asr-25">Breeze-ASR-25 — лучший для RU+EN IT-речи с латиницей (3.1 ГБ)</option>
-                                <option value="canary-1b-v2">Canary 1B v2 — 25 языков + пунктуация (NVIDIA, GPU/CPU, 3.9 ГБ)</option>
-                                <option value="canary-qwen-2.5b">Canary-Qwen 2.5B — топ-1 для English (EN ONLY, INT8 CPU, 2.9 ГБ)</option>
-                                <option value="large-v3-ru">Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)</option>
                                 <option value="turbo">Whisper Turbo — универсальная (99 яз., 810 МБ)</option>
-                                <option value="large-v3">Whisper Large v3 — мультиязычная (99 яз., 3.1 ГБ)</option>
-                                <option value="gigaam-v3-int8">GigaAM v3 INT8 — лёгкая для русского на CPU (232 МБ)</option>
-                                <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
-                                <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
+                                <option value="deepgram-nova-3">Deepgram Nova-3 — облачный API (RU/EN/multi + keyterms + диаризация)</option>
                             </select>
+                        </div>
+                        <div class="llm-config-wrap hidden" id="asrApiKeyWrap">
+                            <div class="transcribe-field">
+                                <label class="custom-worker-label" for="asrApiKeyInput">Deepgram API-ключ (или переменная окружения DEEPGRAM_API_KEY)</label>
+                                <input type="password" id="asrApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="Вставьте Deepgram API-ключ (хранится только в сессии вкладки)" maxlength="300">
+                            </div>
+                            <p class="extra-check-hint llm-privacy-hint is-cloud" id="asrPrivacyHint">Облачный API (api.deepgram.com): аудиодорожка отправляется в Deepgram Nova-3 с нативной диаризацией и словарём keyterms. Ключ не сохраняется на диск и не попадает в логи.</p>
                         </div>
                         <div class="transcribe-grid-2">
                             <div class="transcribe-field">
@@ -165,32 +166,32 @@
                                 <label class="extra-check-row" for="llmPolishToggle">
                                     <input type="checkbox" id="llmPolishToggle" class="extra-checkbox">
                                     <span class="extra-check-text">
-                                        <span class="extra-check-title">LLM-корректура (OpenAI-compatible API: локальный или облачный Qwen / DeepSeek)</span>
+                                        <span class="extra-check-title">LLM-корректура (OpenAI-compatible API: DeepSeek / Qwen Cloud или локальный Ollama)</span>
                                         <span class="extra-check-hint">Восстанавливает IT-термины и пунктуацию без изменения таймкодов и ролей; сохраняет сырой бэкап.</span>
                                     </span>
                                 </label>
                                 <div class="llm-config-wrap hidden" id="llmConfigWrap">
                                     <div class="prompt-presets" id="llmPresets">
-                                        <button type="button" class="prompt-chip" data-llm-preset="ollama_local">Ollama (локально)</button>
-                                        <button type="button" class="prompt-chip" data-llm-preset="lmstudio_local">LM Studio</button>
                                         <button type="button" class="prompt-chip" data-llm-preset="deepseek_cloud">DeepSeek API</button>
                                         <button type="button" class="prompt-chip" data-llm-preset="qwen_cloud">Qwen Cloud</button>
+                                        <button type="button" class="prompt-chip" data-llm-preset="ollama_local">Ollama (локально)</button>
+                                        <button type="button" class="prompt-chip" data-llm-preset="lmstudio_local">LM Studio</button>
                                     </div>
                                     <div class="transcribe-grid-2">
                                         <div class="transcribe-field">
                                             <label class="custom-worker-label" for="llmBaseUrlInput">URL OpenAI-compatible API</label>
-                                            <input type="url" id="llmBaseUrlInput" class="llm-text-input" placeholder="http://localhost:11434/v1" maxlength="300">
+                                            <input type="url" id="llmBaseUrlInput" class="llm-text-input" placeholder="https://api.deepseek.com/v1" maxlength="300">
                                         </div>
                                         <div class="transcribe-field">
                                             <label class="custom-worker-label" for="llmModelInput">Модель LLM</label>
-                                            <input type="text" id="llmModelInput" class="llm-text-input" placeholder="qwen3:8b / deepseek-chat / qwen-plus" maxlength="120">
+                                            <input type="text" id="llmModelInput" class="llm-text-input" placeholder="deepseek-flash / qwen-plus / qwen3:8b" maxlength="120">
                                         </div>
                                     </div>
                                     <div class="transcribe-field">
                                         <label class="custom-worker-label" for="llmApiKeyInput">API-ключ (для облачных DeepSeek / Qwen; пусто для локального Ollama)</label>
-                                        <input type="password" id="llmApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="Не нужен для Ollama / LM Studio; sk-... для облачного API" maxlength="300">
+                                        <input type="password" id="llmApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="sk-... для DeepSeek / Qwen; пусто для Ollama / LM Studio" maxlength="300">
                                     </div>
-                                    <p class="extra-check-hint llm-privacy-hint" id="llmPrivacyHint">Режим: локальный сервер — 100% данных остаются на вашем компьютере.</p>
+                                    <p class="extra-check-hint llm-privacy-hint is-cloud" id="llmPrivacyHint">Режим: облачный API — текст реплик отправляется во внешний сервис (DeepSeek / Qwen). API-ключ не сохраняется на диск и не попадает в логи.</p>
                                 </div>
                             </div>
                         </details>
@@ -238,15 +239,16 @@
                                         <option value="gigaam-v3" selected>GigaAM v3 FP32 — эталон для русского (RU, GPU/CPU, 892 МБ)</option>
                                         <option value="gigaam-v3-ctc">GigaAM v3 CTC FP32 — турбо для русского (до 240× GPU, 886 МБ)</option>
                                         <option value="breeze-asr-25">Breeze-ASR-25 — лучший для RU+EN IT-речи с латиницей (3.1 ГБ)</option>
-                                        <option value="canary-1b-v2">Canary 1B v2 — 25 языков + пунктуация (NVIDIA, GPU/CPU, 3.9 ГБ)</option>
-                                        <option value="canary-qwen-2.5b">Canary-Qwen 2.5B — топ-1 для English (EN ONLY, INT8 CPU, 2.9 ГБ)</option>
-                                        <option value="large-v3-ru">Whisper Large v3 RU — русский файнтюн (RU/EN, 3.1 ГБ)</option>
                                         <option value="turbo">Whisper Turbo — универсальная (99 яз., 810 МБ)</option>
-                                        <option value="large-v3">Whisper Large v3 — мультиязычная (99 яз., 3.1 ГБ)</option>
-                                        <option value="gigaam-v3-int8">GigaAM v3 INT8 — лёгкая для русского на CPU (232 МБ)</option>
-                                        <option value="parakeet">Parakeet v3 — быстрая (25 яз., 600 МБ)</option>
-                                        <option value="small">Whisper Small — лёгкая (99 яз., 245 МБ)</option>
+                                        <option value="deepgram-nova-3">Deepgram Nova-3 — облачный API (RU/EN/multi + keyterms + диаризация)</option>
                                     </select>
+                                </div>
+                                <div class="llm-config-wrap hidden" id="postAsrApiKeyWrap">
+                                    <div class="transcribe-field">
+                                        <label class="custom-worker-label" for="postAsrApiKeyInput">Deepgram API-ключ (или env DEEPGRAM_API_KEY)</label>
+                                        <input type="password" id="postAsrApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="Вставьте Deepgram API-ключ (хранится только в сессии вкладки)" maxlength="300">
+                                    </div>
+                                    <p class="extra-check-hint llm-privacy-hint is-cloud" id="postAsrPrivacyHint">Облачный API (api.deepgram.com): аудиодорожка отправляется в Deepgram Nova-3 с нативной диаризацией и словарём keyterms.</p>
                                 </div>
                                 <div class="transcribe-grid-2">
                                     <div class="transcribe-field">
@@ -318,32 +320,32 @@
                                         <label class="extra-check-row" for="postLlmPolishToggle">
                                             <input type="checkbox" id="postLlmPolishToggle" class="extra-checkbox">
                                             <span class="extra-check-text">
-                                                <span class="extra-check-title">LLM-корректура (OpenAI-compatible API: локальный или облачный Qwen / DeepSeek)</span>
+                                                <span class="extra-check-title">LLM-корректура (OpenAI-compatible API: DeepSeek / Qwen Cloud или локальный Ollama)</span>
                                                 <span class="extra-check-hint">Восстанавливает IT-термины и пунктуацию без изменения таймкодов и ролей.</span>
                                             </span>
                                         </label>
                                         <div class="llm-config-wrap hidden" id="postLlmConfigWrap">
                                             <div class="prompt-presets" id="postLlmPresets">
-                                                <button type="button" class="prompt-chip" data-llm-preset="ollama_local">Ollama (локально)</button>
-                                                <button type="button" class="prompt-chip" data-llm-preset="lmstudio_local">LM Studio</button>
                                                 <button type="button" class="prompt-chip" data-llm-preset="deepseek_cloud">DeepSeek API</button>
                                                 <button type="button" class="prompt-chip" data-llm-preset="qwen_cloud">Qwen Cloud</button>
+                                                <button type="button" class="prompt-chip" data-llm-preset="ollama_local">Ollama (локально)</button>
+                                                <button type="button" class="prompt-chip" data-llm-preset="lmstudio_local">LM Studio</button>
                                             </div>
                                             <div class="transcribe-grid-2">
                                                 <div class="transcribe-field">
                                                     <label class="custom-worker-label" for="postLlmBaseUrlInput">URL OpenAI-compatible API</label>
-                                                    <input type="url" id="postLlmBaseUrlInput" class="llm-text-input" placeholder="http://localhost:11434/v1" maxlength="300">
+                                                    <input type="url" id="postLlmBaseUrlInput" class="llm-text-input" placeholder="https://api.deepseek.com/v1" maxlength="300">
                                                 </div>
                                                 <div class="transcribe-field">
                                                     <label class="custom-worker-label" for="postLlmModelInput">Модель LLM</label>
-                                                    <input type="text" id="postLlmModelInput" class="llm-text-input" placeholder="qwen3:8b / deepseek-chat / qwen-plus" maxlength="120">
+                                                    <input type="text" id="postLlmModelInput" class="llm-text-input" placeholder="deepseek-flash / qwen-plus / qwen3:8b" maxlength="120">
                                                 </div>
                                             </div>
                                             <div class="transcribe-field">
                                                 <label class="custom-worker-label" for="postLlmApiKeyInput">API-ключ (для облачных DeepSeek / Qwen; пусто для локального Ollama)</label>
-                                                <input type="password" id="postLlmApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="Не нужен для Ollama / LM Studio; sk-... для облачного API" maxlength="300">
+                                                <input type="password" id="postLlmApiKeyInput" class="llm-text-input" autocomplete="off" placeholder="sk-... для DeepSeek / Qwen; пусто для Ollama / LM Studio" maxlength="300">
                                             </div>
-                                            <p class="extra-check-hint llm-privacy-hint" id="postLlmPrivacyHint">Режим: локальный сервер — 100% данных остаются на вашем компьютере.</p>
+                                            <p class="extra-check-hint llm-privacy-hint is-cloud" id="postLlmPrivacyHint">Режим: облачный API — текст реплик отправляется во внешний сервис (DeepSeek / Qwen). API-ключ не сохраняется на диск и не попадает в логи.</p>
                                         </div>
                                     </div>
                                 </details>
@@ -358,11 +360,11 @@
             </div>
         </main>
         
-        <footer style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
-            v5.0.0 (Stable Edition)
+        <footer id="appVersionFooter" style="text-align: center; margin-top: 2rem; color: var(--text-primary); opacity: 0.5; font-size: 0.85rem; font-weight: 500;">
+            v5.1.0 (Stable Edition)
         </footer>
     </div>
-    <script src="/static/script.js?v=24"></script>
+    <script src="/static/script.js?v=25"></script>
 </body>
 </html>
 

@@ -12,6 +12,7 @@ from src.config import (
     DEFAULT_ASR_MODEL,
     DEFAULT_AUDIO_TRACK_MODE,
     DEFAULT_COMPUTE_DEVICE,
+    DEFAULT_DEEPGRAM_API_KEY,
     DEFAULT_DIARIZATION_SENSITIVITY,
     DEFAULT_LLM_API_KEY,
     DEFAULT_LLM_BASE_URL,
@@ -30,7 +31,7 @@ from src.orchestrator import Orchestrator
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=f"Interview Anonymizer v{APP_VERSION} (Blur faces, pitch shift audio, and local role-split transcription)"
+        description=f"Interview Anonymizer v{APP_VERSION} (Blur faces, pitch shift audio, and role-split transcription)"
     )
     parser.add_argument("-i", "--input", required=True, help="Path to input video/audio file")
     parser.add_argument(
@@ -59,7 +60,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--asr-model",
         choices=list(ASR_MODEL_PROFILES.keys()),
         default=DEFAULT_ASR_MODEL,
-        help=f"Local ASR model profile (default: {DEFAULT_ASR_MODEL})",
+        help=f"ASR model profile — local or optional cloud deepgram-nova-3 (default: {DEFAULT_ASR_MODEL})",
+    )
+    parser.add_argument(
+        "--asr-api-key",
+        default=DEFAULT_DEEPGRAM_API_KEY,
+        help="Optional API key for cloud ASR profiles such as deepgram-nova-3 (or set DEEPGRAM_API_KEY env var)",
     )
     parser.add_argument(
         "--language",
@@ -106,22 +112,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--llm-polish",
         action="store_true",
         default=LLM_POLISH_ENABLED_DEFAULT,
-        help="Enable optional Stage 4 local LLM post-editing via Ollama / LM Studio (default: off)",
+        help="Enable optional Stage 4 OpenAI-compatible LLM post-editing (DeepSeek / Qwen Cloud or local Ollama / LM Studio; default: off)",
     )
     parser.add_argument(
         "--llm-url",
         default=DEFAULT_LLM_BASE_URL,
-        help=f"Local OpenAI-compatible LLM base URL for --llm-polish (default: {DEFAULT_LLM_BASE_URL})",
+        help=f"OpenAI-compatible LLM base URL for --llm-polish (default: {DEFAULT_LLM_BASE_URL})",
     )
     parser.add_argument(
         "--llm-model",
         default=DEFAULT_LLM_MODEL,
-        help=f"Local LLM model name for --llm-polish (default: {DEFAULT_LLM_MODEL})",
+        help=f"LLM model name for --llm-polish (default: {DEFAULT_LLM_MODEL})",
     )
     parser.add_argument(
         "--llm-api-key",
         default=DEFAULT_LLM_API_KEY,
-        help="Optional Bearer API key for local OpenAI-compatible LLM server",
+        help="Optional Bearer API key for cloud OpenAI-compatible LLM API (or set LLM_API_KEY env var)",
     )
     parser.add_argument(
         "-w",
@@ -152,6 +158,7 @@ def process_video(
     llm_base_url: str = DEFAULT_LLM_BASE_URL,
     llm_model: str = DEFAULT_LLM_MODEL,
     llm_api_key: str = DEFAULT_LLM_API_KEY,
+    asr_api_key: str = DEFAULT_DEEPGRAM_API_KEY,
 ) -> dict:
     io_manager = IOManager()
     job_dir = io_manager.create_job_dir()
@@ -184,6 +191,7 @@ def process_video(
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
                 llm_api_key=llm_api_key,
+                asr_api_key=asr_api_key,
             )
         else:
             if not output_path:
@@ -207,6 +215,7 @@ def process_video(
                 llm_base_url=llm_base_url,
                 llm_model=llm_model,
                 llm_api_key=llm_api_key,
+                asr_api_key=asr_api_key,
             )
         if result.get("transcript_ready") and result.get("transcript_path"):
             print(f"Transcript saved to: {result['transcript_path']}")
@@ -252,6 +261,7 @@ def main():
         llm_base_url=args.llm_url,
         llm_model=args.llm_model,
         llm_api_key=args.llm_api_key,
+        asr_api_key=args.asr_api_key,
     )
 
 
